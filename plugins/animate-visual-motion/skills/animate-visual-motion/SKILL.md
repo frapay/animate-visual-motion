@@ -21,7 +21,7 @@ All paths below are relative to this skill's base directory. Pieces live in the 
 5. **Deterministic:** seeded randomness only (`RNG(...)`), the boil index `B` for per-step variation. Never `Math.random()` or wall-clock time.
 6. **Reference media stays local.** Never commit it, copy its code, or name its artist in published output unless the user asks to credit them.
 7. **"Done" is measured:** `tools/review.mjs` passes and you have looked at the contact sheets. Report the numbers, not "looks good".
-8. **Ask with options.** Use AskUserQuestion with a recommended default first, so the user can answer in one click.
+8. **Ask with options.** If your agent has a structured question tool (Claude Code: `AskUserQuestion`; others name it differently), use it with a recommended default first, so the user can answer in one click. Without one, write the options as a short numbered list, mark the recommended one, and wait for the answer.
 
 ## The flow
 
@@ -67,7 +67,7 @@ Ask at intake (question 3). With a voice, **the voice is the clock**: each beat 
 1. Write the script to `pieces/<name>/voice/script.json`: `{ "lead": 1.2, "tail": 1.8, "lines": [{ "id": "open", "text": "As it is spoken.", "after": 0.45 }, ...] }`. Write numbers and names the way they should be said. Keep it ≤ 3.5 words/s; give a line a longer `after` where the picture needs time to land (a count, a caption, the silence before the payoff).
 2. **Build before the voice exists:** `node tools/voice.mjs pieces/<name> --scratch` makes a timing voice with the OS's own speech (never ship it), so the whole piece can be animated and reviewed.
 3. **The takes:** one file per line, saved as `voice/<id>.mp3` with `"file"` set on the line.
-   - **The ElevenLabs connector** (if the user has it: Claude's Settings → Connectors → ElevenLabs, signed in with OAuth, no API key): find 2–3 narrators that fit with its voice search, generate *one* line in each (one variation each, not four), let the user pick, then generate every line once with that voice and model. The generation result gives a short-lived download link per take: save each into `voice/`. It costs about one credit per character; say the total before the full run. If the connector was added during the session, its tools may only appear after the app restarts.
+   - **ElevenLabs through your agent** (in Claude: Settings → Connectors → ElevenLabs, signed in with OAuth, no API key; in other agents: an ElevenLabs MCP server or tool, if the user has set one up). Never ask the user to paste an API key into the chat: find 2–3 narrators that fit with its voice search, generate *one* line in each (one variation each, not four), let the user pick, then generate every line once with that voice and model. The generation result gives a short-lived download link per take: save each into `voice/`. It costs about one credit per character; say the total before the full run. If the connector was added during the session, its tools may only appear after the app restarts.
    - **The user's own recording,** one file per line (or cut from one take).
    - Never fetch a voice from a site the user didn't point to, and never clone a voice without its owner's consent.
 4. `node tools/voice.mjs pieces/<name>` → `voice/voice.wav` (the lines with their pauses) and `voice.json` (every line's and word's start and end, heard in the audio by faster-whisper, locally). The build injects it as `VOICE`.
@@ -106,7 +106,7 @@ Ask at intake (question 2, multi-select). List them in `piece.json` `"formats": 
 
 ## Parallel agents (long pieces)
 
-A 45–60s piece has 10–15 scenes; split the drawing across agents once the storyboard is approved:
+A 45–60s piece has 10–15 scenes; split the drawing across agents once the storyboard is approved. This needs an agent that can start subagents; without that, draw the same per-era files yourself one at a time, in the same structure:
 - **One `src/` file per section or era, owned by one agent** (`src/era-01.js`, `src/era-02.js`, …). List them in `piece.json` `"scenes": [...]`; they take the place of `src/scenes.js` in the build order.
 - **The shared parts stay with you:** `src/head.html` (TIMELINE, eras, shots, cues), `src/bridges.js`, the score, and the kit. Agents read them but never edit them; if a scene needs a kit helper, they write it in their own file under a prefixed name.
 - **Brief each agent** with the approved board panel(s), the style's `STYLE.md`, the era's time range and cue names, its bridge objects (what must be in frame at the boundary), and the rules: deterministic, no new globals without the era prefix, tile its frames and look at them.

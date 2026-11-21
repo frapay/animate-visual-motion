@@ -1,6 +1,6 @@
 # animate-visual-motion
 
-**Procedural animated videos, made entirely in code, in 50 styles — a skill for Claude Code.**
+**Procedural animated videos, made entirely in code, in 50 styles — an Agent Skill for Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot and more.**
 
 Ask Claude for an explainer, a history, a little story or a product launch reel. It walks you through a few questions and three quick check-ins (story → look → storyboard), then draws every frame on one `<canvas>`, composes a synthesized score, and renders an MP4 with a headless browser and ffmpeg. Every piece is deterministic, so the same piece always renders the same video.
 
@@ -14,7 +14,7 @@ Ask Claude for an explainer, a history, a little story or a product launch reel.
 
 - [Quick start](#quick-start)
 - [Requirements](#requirements)
-- [Install](#install): [plugin](#option-a--claude-code-plugin-recommended) · [script](#option-b--install-script) · [manual](#option-c--manual-copy) · [claude.ai](#option-d--claudeai-upload-experimental)
+- [Install](#install): [plugin](#option-a--claude-code-plugin-recommended) · [script](#option-b--install-script) · [manual](#option-c--manual-copy) · [claude.ai](#option-d--claudeai-upload-experimental) · [other agents](#option-e--opencode-codex-gemini-cli-cursor-copilot-and-other-agents)
 - [Use](#use)
 - [Styles](#styles)
 - [How it works](#how-it-works)
@@ -109,6 +109,8 @@ bash install.sh            # add --deps to also install Playwright + Chromium
 | `--project` | installs into `./.claude/skills/` of the current folder (shared with everyone who works in that project) instead of your home folder |
 | `--deps` | also runs `npm i -g playwright && npx playwright install chromium` |
 | `--uninstall` | removes the installed skill |
+| `--agent <name>` | installs for another agent instead of Claude Code (`opencode`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `amp`, `goose`, or `agents` for the shared `~/.agents/skills`) |
+| `--list` | shows every agent and the folder the skill goes into |
 
 ### Option C — manual copy
 
@@ -134,6 +136,17 @@ bash scripts/package-claude-ai.sh --no-samples # smaller zip, without the style 
 ```
 
 Upload the zip in claude.ai → Settings → Capabilities → Skills. Rendering needs Node, Playwright, Chromium and ffmpeg inside Claude's code-execution sandbox, and the sandbox needs network access to install them. Claude Code on your own machine is the tested setup.
+
+### Option E — OpenCode, Codex, Gemini CLI, Cursor, Copilot and other agents
+
+The skill uses the open Agent Skills format, so other coding agents can load it too:
+
+```bash
+bash install.sh --agent agents      # shared ~/.agents/skills, read by most agents
+bash install.sh --agent opencode    # or codex, gemini, cursor, copilot, windsurf, amp, goose
+```
+
+Folders, how to call the skill in each agent, and what works differently are covered in **[docs/OTHER-AGENTS.md](docs/OTHER-AGENTS.md)**.
 
 ---
 

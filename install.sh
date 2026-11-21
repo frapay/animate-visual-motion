@@ -1,31 +1,63 @@
 #!/usr/bin/env bash
-# Install animate-visual-motion as a Claude Code skill (macOS / Linux / WSL / Git Bash).
+# Install animate-visual-motion as an Agent Skill (macOS / Linux / WSL / Git Bash).
 #
-#   bash install.sh              # personal skill  → ~/.claude/skills/animate-visual-motion
-#   bash install.sh --project    # project skill   → ./.claude/skills/animate-visual-motion
-#   bash install.sh --deps       # also install Playwright + Chromium (npm, global)
-#   bash install.sh --uninstall  # remove the personal skill (add --project for the project one)
+#   bash install.sh                    # Claude Code, personal → ~/.claude/skills/animate-visual-motion
+#   bash install.sh --agent opencode   # another agent (see the list below)
+#   bash install.sh --project          # project skill (inside the current folder) instead of personal
+#   bash install.sh --deps             # also install Playwright + Chromium (npm, global)
+#   bash install.sh --uninstall        # remove it again (same --agent / --project as when installing)
+#   bash install.sh --list             # show every agent and where the skill goes
+#
+#   --agent  claude (default) · agents (the shared ~/.agents/skills, read by most agents)
+#            opencode · codex · gemini · cursor · copilot · windsurf · amp · goose
 #
 # One-liner (no clone needed):
-#   curl -fsSL https://raw.githubusercontent.com/frapay/animate-visual-motion/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/frapay/animate-visual-motion/main/install.sh | bash -s -- --agent opencode
 set -euo pipefail
 
 NAME="animate-visual-motion"
 REPO_URL="https://github.com/frapay/animate-visual-motion.git"
 SKILL_SUBDIR="plugins/$NAME/skills/$NAME"
 
-SCOPE="personal"; DEPS=0; UNINSTALL=0
-for arg in "$@"; do
-  case "$arg" in
+# agent → "personal dir|project dir|how to call it"  (paths from each agent's official skills docs, Nov 2026)
+agent_info() {
+  case "$1" in
+    claude)   echo "$HOME/.claude/skills|.claude/skills|/$NAME in Claude Code" ;;
+    agents)   echo "$HOME/.agents/skills|.agents/skills|any agent that reads ~/.agents/skills (Codex, Gemini CLI, Cursor, Copilot, Windsurf, Amp, Goose, OpenCode)" ;;
+    opencode) echo "$HOME/.config/opencode/skills|.opencode/skills|ask for an animation (OpenCode loads it with its skill tool)" ;;
+    codex)    echo "$HOME/.agents/skills|.agents/skills|\$$NAME or /skills in Codex" ;;
+    gemini)   echo "$HOME/.gemini/skills|.gemini/skills|ask for an animation in Gemini CLI (or /skills reload in a running session)" ;;
+    cursor)   echo "$HOME/.cursor/skills|.cursor/skills|/$NAME in Cursor Agent chat (restart Cursor first)" ;;
+    copilot)  echo "$HOME/.copilot/skills|.github/skills|/$NAME in Copilot (CLI: /skills reload)" ;;
+    windsurf) echo "$HOME/.config/devin/skills|.devin/skills|/$NAME in Windsurf / Devin Desktop" ;;
+    amp)      echo "$HOME/.config/amp/skills|.agents/skills|ask for an animation in Amp (new thread)" ;;
+    goose)    echo "$HOME/.agents/skills|.agents/skills|/skills $NAME in goose (new session)" ;;
+    *) return 1 ;;
+  esac
+}
+AGENTS="claude agents opencode codex gemini cursor copilot windsurf amp goose"
+
+AGENT="claude"; SCOPE="personal"; DEPS=0; UNINSTALL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent)     shift; AGENT="${1:-}" ;;
+    --agent=*)   AGENT="${1#--agent=}" ;;
     --project)   SCOPE="project" ;;
     --deps)      DEPS=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help)   sed -n '2,10p' "$0" 2>/dev/null || true; exit 0 ;;
-    *) echo "Unknown option: $arg (try --help)"; exit 2 ;;
+    --list)
+      printf "%-9s %-34s %s\n" agent personal project
+      for a in $AGENTS; do IFS='|' read -r g p _ <<< "$(agent_info "$a")"; printf "%-9s %-34s %s\n" "$a" "${g/#$HOME/~}" "$p"; done
+      exit 0 ;;
+    -h|--help)   sed -n '2,16p' "$0" 2>/dev/null || true; exit 0 ;;
+    *) echo "Unknown option: $1 (try --help)"; exit 2 ;;
   esac
+  shift
 done
 
-if [ "$SCOPE" = "project" ]; then BASE="$PWD/.claude/skills"; else BASE="$HOME/.claude/skills"; fi
+INFO="$(agent_info "$AGENT")" || { echo "Unknown agent: '$AGENT'. Choose one of: $AGENTS"; exit 2; }
+IFS='|' read -r G_DIR P_DIR HOWTO <<< "$INFO"
+if [ "$SCOPE" = "project" ]; then BASE="$PWD/$P_DIR"; else BASE="$G_DIR"; fi
 DEST="$BASE/$NAME"
 
 if [ "$UNINSTALL" -eq 1 ]; then
@@ -74,5 +106,5 @@ else
 fi
 
 echo
-echo "Done. Start a new Claude Code session and try:"
-echo "  /$NAME a 20-second history of the bicycle, cut paper"
+echo "Done ($AGENT, $SCOPE). Start a new session, then: $HOWTO"
+echo "  e.g. \"make a 20-second history of the bicycle, cut paper style\""

@@ -1,6 +1,6 @@
 # animate-visual-motion
 
-**Video animasi prosedural yang dibuat sepenuhnya dengan kode, dalam 50 gaya. Skill untuk Claude Code.**
+**Video animasi prosedural yang dibuat sepenuhnya dengan kode, dalam 50 gaya. Agent Skill untuk Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot, dan lainnya.**
 
 Minta Claude membuat video penjelasan, sejarah, cerita pendek, atau reel peluncuran produk. Claude akan bertanya beberapa hal dan meminta persetujuanmu tiga kali (cerita → tampilan → storyboard). Setelah itu ia menggambar setiap frame di satu `<canvas>`, menyusun musik sintesis, lalu merender MP4 dengan browser headless dan ffmpeg. Hasilnya deterministik: piece yang sama selalu menghasilkan video yang sama.
 
@@ -95,6 +95,8 @@ bash install.sh            # tambah --deps untuk sekalian memasang Playwright + 
 | `--project` | memasang ke `./.claude/skills/` di folder saat ini (ikut terbagi ke semua yang bekerja di proyek itu) |
 | `--deps` | sekalian menjalankan `npm i -g playwright && npx playwright install chromium` |
 | `--uninstall` | menghapus skill yang terpasang |
+| `--agent <nama>` | memasang untuk agent lain, bukan Claude Code (`opencode`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `amp`, `goose`, atau `agents` untuk folder bersama `~/.agents/skills`) |
+| `--list` | menampilkan semua agent beserta folder tujuannya |
 
 ### C. Salin manual
 
@@ -120,6 +122,17 @@ bash scripts/package-claude-ai.sh --no-samples # zip lebih kecil, tanpa gambar c
 ```
 
 Upload zip-nya di claude.ai → Settings → Capabilities → Skills. Proses render butuh Node, Playwright, Chromium, dan ffmpeg di sandbox eksekusi kode Claude, dan sandbox itu perlu akses internet untuk memasangnya. Setup yang sudah teruji adalah Claude Code di komputer sendiri.
+
+### E. OpenCode, Codex, Gemini CLI, Cursor, Copilot, dan agent lain
+
+Skill ini memakai format terbuka Agent Skills, jadi coding agent lain juga bisa memuatnya:
+
+```bash
+bash install.sh --agent agents      # folder bersama ~/.agents/skills, dibaca kebanyakan agent
+bash install.sh --agent opencode    # atau codex, gemini, cursor, copilot, windsurf, amp, goose
+```
+
+Lokasi folder, cara memanggil skill di tiap agent, dan apa saja yang berbeda dijelaskan di **[docs/OTHER-AGENTS.id.md](docs/OTHER-AGENTS.id.md)**.
 
 ---
 
