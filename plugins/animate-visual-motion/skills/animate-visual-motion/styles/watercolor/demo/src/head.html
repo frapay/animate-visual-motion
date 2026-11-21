@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watercolor demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2c3158; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  WATERCOLOR DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a sheet of cold-press paper rain clouds bloom over the hills;
+//  rain falls, three big drops land in a puddle and it spreads with each one, while Pipit, a small vermilion bird,
+//  shelters under a taro leaf. At 3.0s the puddle is re-wetted and runs into a lake under a clearing sky: the sun
+//  comes out, a rainbow is pulled across band by band, and Pipit flies up under it and sings.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/watercolor/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneHujan()], [3, 6, () => scenePelangi()]];
+const SHOTS = [
+  ['hujan',   0, 0.0, 3.0, 'rain clouds bloom over the hills; rain falls, three drops spread a puddle; the bird shelters under a leaf'],
+  ['pelangi', 1, 3.0, 6.0, 'the puddle runs into a lake under a clearing sky; the sun and a rainbow bloom; the bird flies up and sings'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { c1: 0.0, c2: 0.25, c3: 0.5, rain: 1.0, d1: 1.0, d2: 1.5, d3: 2.0, stop: 2.25, peek: 2.5, sun: 3.5, bow: 3.75, fly: 4.0, land: 5.0, sing: 5.0, sing2: 5.5 },
+  acts: [
+    { name: '1 Hujan',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Pelangi', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'rain falls', sound: 'soft minor pad, rain hiss, plinks as drops land', next: 'the puddle runs into a lake' },
+    { t: 5.25, title: 'then a rainbow', sound: 'warm major pad, a rising chime per band, bird chirps', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

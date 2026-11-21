@@ -1,0 +1,1639 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI mockup demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #e6e8ee; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  UI MOCKUP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A feature launch for an invented to-do app, shown being used.
+//  Era 1, a phone on a light studio ground: the list loads out of skeletons, a touch dot taps the field, "Call the lab"
+//  is typed key by key, a tap on the add button drops a new row into the list and a banner confirms it. At 3.0s the
+//  app-icon tile becomes the accent card of era 2: the same app in a browser window on graphite, where a cursor
+//  switches the view (the chart and the count answer), the page scrolls, a lens magnifies the peak, a toggle flips
+//  and a banner drops in.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/ui-mockup/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+const HAND = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+const ERA_LIST = [[0, 3, () => scenePhone()], [3, 6, () => sceneBrowser()]];
+const SHOTS = [
+  ['phone',   0, 0.0, 3.0, 'a phone drifts in: the list loads out of skeletons, a tap focuses the field, a task is typed, a tap adds it as a new row, a banner confirms'],
+  ['browser', 1, 3.0, 6.0, 'the app icon becomes the count card in a browser window: a click switches the view and the chart answers, the page scrolls, a lens magnifies the peak, a toggle flips, a banner drops in'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { load: 0.2, tap: 0.5, type: 0.625, add: 1.75, toast: 1.875, kick: 2.0, seg: 4.0, scroll: 4.25, lens: 4.625, toggle: 5.0, toast2: 5.125 },
+  acts: [
+    { name: '1 Phone',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Browser', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'add it in one tap', sound: 'a light pluck pulse, a soft tap, key ticks while it types, a pop and a two-note chime', next: 'the app icon becomes the count card' },
+    { t: 5.0, title: 'watch it add up', sound: 'the pulse opens up; a mouse click, bars rising as plucks, a toggle blip, a chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/ui-mockup/kit.js — the app demo film: a product shown being USED inside device frames. Built on kit/core.js.
+//  A calm studio ground, a phone and a browser window drawn in code, and inside each a clipped screen with its own
+//  logical coordinate system (a phone screen is 280 units wide, a browser page 480, whatever the device's size or tilt),
+//  built from clean UI parts: rows, cards, buttons, toggles, a typed field, charts, skeleton loaders. Over the device:
+//  a cursor or a touch dot that travels on eased arcs and clicks (the UI answers on the click frame), notification
+//  banners that drop in on a spring, a magnifier lens, label chips with leaders.
+//  Everything is an invented, unbranded app: no real names, logos or OS glyphs.
+//  Optional piece constants (declare before the kit, e.g. in the head): UI_ACCENT = '#rrggbb' (the one brand colour),
+//  UI_DARK = true (captions and ground default to the graphite variant).
+//  Needs from the piece head: CX (caption centre x).
+// =====================================================================
+const UI_DARKMODE = typeof UI_DARK !== 'undefined' && !!UI_DARK;
+const UI = {
+  ground: '#f4f5f7', groundD: '#17191e',                 // the studio: soft off-white, or graphite
+  light: '#ffffff', lightD: '#2c303a',                   // the middle of the large radial light on each
+  surface: '#ffffff', fill: '#f0f1f4', fill2: '#e1e4ea', line: '#e3e5ea',   // screens and cards, wells, tracks, 1px hairlines
+  ink: '#15171c', ink2: '#5f6672', ink3: '#a2a8b3',      // text: primary, secondary, placeholder
+  accent: typeof UI_ACCENT !== 'undefined' ? UI_ACCENT : '#4a5cff',          // the ONE brand colour
+  body: '#1c1e24', bodyHi: '#474b57', bodyD: '#0b0c0f',  // the phone's shell, its rim light, the camera pill
+  chrome: '#eceef2', dots: '#cdd1d9',                    // the browser's title bar and its three dots
+  shadow: [18, 22, 38],
+};
+const UI_SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", "Liberation Sans", Arial, sans-serif';
+// avatars are plain tinted circles with initials: [background, initials]
+const UI_TINTS = [['#ffe1d2', '#b4532a'], ['#d8efdf', '#2f7a4d'], ['#e0defc', '#4a3fb0'], ['#fdebb8', '#8a6410'], ['#d5e8f8', '#2a6496']];
+// soft layered drop shadows, by level: [offset y, blur, alpha] in px at zoom 1
+const UI_SH = [[], [[2, 7, 0.09]], [[3, 9, 0.1], [14, 34, 0.12]], [[6, 16, 0.13], [34, 84, 0.2]]];
+
+function uiRGB(c) { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); return c.match(/[\d.]+/g).slice(0, 3).map(Number); }
+const uiA = (c, a) => { const [r, g, b] = uiRGB(c); return `rgba(${r},${g},${b},${clamp(a)})`; };
+const uiMix = (a, b, u) => { const x = uiRGB(a), y = uiRGB(b); return '#' + x.map((v, i) => Math.round(lerp(v, y[i], clamp(u))).toString(16).padStart(2, '0')).join(''); };
+const uiLum = (c) => { const v = uiRGB(c); return (0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2]) / 255; };
+const uiZ = () => { const m = ctx.getTransform(); return Math.hypot(m.a, m.b) || 1; };   // the current zoom (camera x device x lens)
+const uiHair = (px = 1.5) => px / uiZ();                                                 // a hairline that stays px wide on screen
+const uiAlpha = (a, fn) => { if (a <= 0.004) return; ctx.save(); ctx.globalAlpha *= clamp(a); fn(); ctx.restore(); };
+function uiRR(x, y, w, h, r) {   // a rounded-rectangle path
+  r = Math.max(0, Math.min(r, w / 2, h / 2)); ctx.beginPath(); ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function uiPath(P) { ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); }
+const uiCirc = (x, y, r) => { ctx.beginPath(); ctx.arc(x, y, Math.max(0, r), 0, TAU); };
+// the shadow under whatever path() traces (the path is filled with o.fill so nothing shows through)
+function uiShadow(path, level = 2, o = {}) {
+  const z = uiZ(), k = o.k ?? 1; if (k <= 0) return;
+  for (const [dy, blur, a] of UI_SH[level] || []) { ctx.save(); ctx.shadowColor = `rgba(${UI.shadow},${a * k})`; ctx.shadowBlur = blur * z; ctx.shadowOffsetY = dy * z; ctx.fillStyle = o.fill ?? UI.surface; path(); ctx.fill(); ctx.restore(); }
+}
+// a surface: rounded box, optional shadow level and hairline
+function uiBox(x, y, w, h, r, fill, o = {}) {
+  if (o.shadow) uiShadow(() => uiRR(x, y, w, h, r), o.shadow, { fill, k: o.shadowK });
+  uiRR(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (o.line) { ctx.strokeStyle = o.line; ctx.lineWidth = uiHair(o.lw); ctx.stroke(); }
+}
+
+// ---------------------------------------------------------------------
+//  type: one system UI sans. Sizes are in the current coordinate system (logical units inside a screen).
+// ---------------------------------------------------------------------
+let UI_LENS = false;  // true while a magnifier redraws its region (no lens inside a lens)
+let UI_CULL = null;   // the screen-space box of the innermost viewport (a screen, a scroll region, a lens): text outside it is not drawn
+// run fn with text culled to the box (x, y, w, h) of the current coordinate system
+function uiCull(x, y, w, h, fn) {
+  const b = bbox([[x, y], [x + w, y], [x + w, y + h], [x, y + h]].map(([px, py]) => toScreen(px, py))), keep = UI_CULL;
+  UI_CULL = keep ? { x0: Math.max(b.x0, keep.x0), y0: Math.max(b.y0, keep.y0), x1: Math.min(b.x1, keep.x1), y1: Math.min(b.y1, keep.y1) } : b;
+  try { fn(); } finally { UI_CULL = keep; }
+}
+function uiFont(size, weight = 500) { ctx.font = `${weight} ${size}px ${UI_SANS}`; }
+function uiTextW(str, size, weight = 500) { ctx.save(); uiFont(size, weight); const w = ctx.measureText(str).width; ctx.restore(); return w; }
+// o: weight, align, base ('alphabetic' | 'middle'), a (alpha)
+function uiText(str, x, y, size, color, o = {}) {
+  const s = String(str); if (!s) return 0;
+  ctx.save(); uiFont(size, o.weight ?? 500); const w = ctx.measureText(s).width;
+  if (UI_CULL) {   // inside a viewport: text that is scrolled or magnified out of it is skipped, not just clipped
+    const al = o.align ?? 'left', x0 = al === 'center' ? x - w / 2 : al === 'right' ? x - w : x, yt = y - size * (o.base === 'middle' ? 0.5 : 0.78), yb = yt + size;
+    const b = bbox([[x0, yt], [x0 + w, yt], [x0 + w, yb], [x0, yb]].map(([px, py]) => toScreen(px, py)));
+    if (b.x1 < UI_CULL.x0 || b.x0 > UI_CULL.x1 || Math.min(b.y1, UI_CULL.y1) - Math.max(b.y0, UI_CULL.y0) < (b.y1 - b.y0) * 0.45) { ctx.restore(); return w; }   // less than half a line showing: gone
+  }
+  ctx.fillStyle = color; ctx.textAlign = o.align ?? 'left'; ctx.textBaseline = o.base ?? 'alphabetic'; if (o.a != null) ctx.globalAlpha *= clamp(o.a);
+  ctx.fillText(s, x, y); ctx.restore(); return w;
+}
+// monoline icons in a unit box (-1..1): check, plus, up, chev, search, home, chart, bell, user, lock, list, clock
+function uiGlyph(name, x, y, s, c, o = {}) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.lineWidth = o.w ?? 0.22; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = c; ctx.beginPath();
+  const L = (...p) => { ctx.moveTo(p[0], p[1]); for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i], p[i + 1]); };
+  if (name === 'check') L(-0.62, 0.04, -0.2, 0.46, 0.64, -0.42);
+  else if (name === 'plus') { L(-0.68, 0, 0.68, 0); L(0, -0.68, 0, 0.68); }
+  else if (name === 'up') { L(0, 0.7, 0, -0.66); L(-0.52, -0.14, 0, -0.68, 0.52, -0.14); }
+  else if (name === 'chev') L(-0.28, -0.56, 0.28, 0, -0.28, 0.56);
+  else if (name === 'search') { ctx.moveTo(0.4, -0.15); ctx.arc(-0.15, -0.15, 0.55, 0, TAU); L(0.26, 0.26, 0.74, 0.74); }
+  else if (name === 'home') { L(-0.76, -0.04, 0, -0.74, 0.76, -0.04); L(-0.52, -0.2, -0.52, 0.7, 0.52, 0.7, 0.52, -0.2); }
+  else if (name === 'chart') { L(-0.6, 0.7, -0.6, 0.12); L(0, 0.7, 0, -0.7); L(0.6, 0.7, 0.6, -0.24); }
+  else if (name === 'bell') { L(-0.68, 0.42, 0.68, 0.42); ctx.moveTo(-0.48, 0.42); ctx.lineTo(-0.48, -0.12); ctx.arc(0, -0.12, 0.48, Math.PI, 0); ctx.lineTo(0.48, 0.42); L(-0.12, 0.74, 0.12, 0.74); }
+  else if (name === 'user') { ctx.moveTo(0.36, -0.32); ctx.arc(0, -0.32, 0.36, 0, TAU); ctx.moveTo(-0.68, 0.76); ctx.arc(0, 0.76, 0.68, Math.PI, 0); }
+  else if (name === 'lock') { ctx.rect(-0.5, -0.06, 1, 0.8); ctx.moveTo(-0.3, -0.06); ctx.lineTo(-0.3, -0.36); ctx.arc(0, -0.36, 0.3, Math.PI, 0); ctx.lineTo(0.3, -0.06); }
+  else if (name === 'list') { L(-0.7, -0.5, 0.7, -0.5); L(-0.7, 0, 0.7, 0); L(-0.7, 0.5, 0.3, 0.5); }
+  else if (name === 'clock') { ctx.moveTo(0.74, 0); ctx.arc(0, 0, 0.74, 0, TAU); L(0, -0.4, 0, 0, 0.3, 0.2); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  timing: everything is a closed-form function of TT, so any frame draws on its own
+// ---------------------------------------------------------------------
+const uiAt = (t) => TT >= t - 1e-6;                                                          // has the cue's frame arrived?
+// 0 -> 1 on a spring with a small overshoot; it has already moved on its cue's frame (the UI answers on the click frame)
+const uiSpring = (t0, p = SPRING.snappy) => (uiAt(t0) ? springEase(TT - t0 + 1 / FPS, p.k, p.d) : 0);
+// a press: fully down ON the click frame, held a moment, released on an ease
+const uiPress = (t0, hold = 0.09, rel = 0.16) => (!uiAt(t0) ? 0 : TT - t0 < hold ? 1 : 1 - EZ.o2(seg(TT - t0, hold, hold + rel)));
+// how many characters of str are typed at a steady rate from t0 (the first lands on t0's frame)
+const uiTyped = (str, t0, cps = 12) => (uiAt(t0) ? Math.min(str.length, Math.floor((TT - t0) * cps + 1e-6) + 1) : 0);
+const uiCount = (t0, d, a, b) => Math.round(lerp(a, b, EZ.o3(seg(TT, t0, t0 + d))));           // a number counting from a to b
+const uiBlink = (rate = 2.2) => Math.floor(TT * rate * 2) % 2 === 0;                           // the caret
+
+// ---------------------------------------------------------------------
+//  the studio
+// ---------------------------------------------------------------------
+// the ground: colour c, a large faint radial light, optionally one soft brand-tinted glow. o: lx, ly, lr, glow [x, y, r], glowA
+function uiGround(c = UI_DARKMODE ? UI.groundD : UI.ground, o = {}) {
+  const dark = uiLum(c) < 0.4, lx = o.lx ?? W * 0.5, ly = o.ly ?? H * 0.4, lr = o.lr ?? H * 0.6, hi = dark ? UI.lightD : UI.light;
+  ctx.save(); ctx.fillStyle = c; ctx.fillRect(-W, -H, W * 3, H * 3);
+  let g = ctx.createRadialGradient(lx, ly, 0, lx, ly, lr); g.addColorStop(0, uiA(hi, dark ? 0.85 : 0.95)); g.addColorStop(0.5, uiA(hi, dark ? 0.3 : 0.4)); g.addColorStop(1, uiA(hi, 0));
+  ctx.fillStyle = g; ctx.fillRect(lx - lr, ly - lr, lr * 2, lr * 2);
+  if (o.glow) {
+    const [gx, gy, gr] = o.glow, a = o.glowA ?? (dark ? 0.34 : 0.2); g = ctx.createRadialGradient(gx, gy, 0, gx, gy, gr);
+    g.addColorStop(0, uiA(UI.accent, a)); g.addColorStop(0.55, uiA(UI.accent, a * 0.35)); g.addColorStop(1, uiA(UI.accent, 0)); ctx.fillStyle = g; ctx.fillRect(gx - gr, gy - gr, gr * 2, gr * 2);
+  }
+  ctx.restore();
+}
+// background life: faint wireframe UI tiles (an outline, a dot, two bars) rising slowly behind the device. o: dark, speed, a
+function uiDrift(key, n = 7, o = {}) {
+  const c = o.dark ? uiMix(UI.groundD, '#ffffff', 0.1) : uiMix(UI.ground, UI.ink, 0.085), span = H + 500;
+  ctx.save(); ctx.strokeStyle = c; ctx.fillStyle = c; ctx.lineWidth = uiHair(2);
+  for (let i = 0; i < n; i++) {
+    const R = RNG('uidrift', key, i), w = R.r(130, 250), h = w * R.r(0.5, 0.8), x = R.r(-40, W - w + 40), y = mod(R.r(0, span) - TT * R.r(16, 34) * (o.speed ?? 1), span) - 300;
+    ctx.globalAlpha = (o.a ?? 1) * smooth(-300, 0, y) * (1 - smooth(H - 200, H + 100, y));
+    uiRR(x, y, w, h, 22); ctx.stroke(); uiCirc(x + 30, y + 32, 11); ctx.fill();
+    uiRR(x + 52, y + 25, w * 0.42, 13, 6.5); ctx.fill(); uiRR(x + 20, y + h - 34, w * R.r(0.4, 0.7), 13, 6.5); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  device frames. Each returns its geometry g: g.at(lx, ly) turns a logical screen point into a world point
+//  (for cursors, lenses, call-outs, bridge shapes); uiPhoneGeo / uiBrowserGeo give the same g without drawing.
+//  Pose options (o): tilt (resting angle), in (the time it drifts in: rises, turns from tilt0 and settles), from [dx, dy],
+//  float (idle bob in px), k (scale).
+// ---------------------------------------------------------------------
+function uiPose(o = {}) {
+  const tilt = o.tilt ?? 0, bob = Math.sin(TT * 1.3 + (o.ph ?? 0)) * (o.float ?? 0);
+  if (o.in == null) return { dx: 0, dy: bob, rot: tilt, k: o.k ?? 1, a: 1 };
+  const t = TT - o.in, s = t <= 0 ? 0 : springEase(t, 110, 19), s2 = t <= 0 ? 0 : springEase(t, 60, 9.5), from = o.from ?? [0, 110];   // the turn settles later than the rise
+  return { dx: (1 - s) * from[0], dy: (1 - s) * from[1] + bob, rot: tilt + (1 - s2) * (o.tilt0 ?? 0.07), k: (o.k ?? 1) * lerp(0.93, 1, s), a: clamp(t / 0.12) };
+}
+function uiGeo(x, y, w, h, o, ox, oy, s, vw, vh) {
+  const p = uiPose(o), cx = x + p.dx, cy = y + p.dy, c = Math.cos(p.rot) * p.k, sn = Math.sin(p.rot) * p.k;
+  const dev = (ux, uy) => [cx + ux * c - uy * sn, cy + ux * sn + uy * c];
+  return { x: cx, y: cy, w, h, rot: p.rot, k: p.k, a: p.a, s, vw, vh, scale: s * p.k, dev, at: (lx, ly) => dev(ox + lx * s, oy + ly * s) };
+}
+// a phone, centre (x, y), height h. Its screen is o.vw (280) logical units wide. o: + body, bg, status, bezel, ratio
+function uiPhoneGeo(x, y, h, o = {}) {
+  const w = h * (o.ratio ?? 0.49), bz = o.bezel ?? h * 0.0132, vw = o.vw ?? 280, s = (w - bz * 2) / vw;
+  const g = uiGeo(x, y, w, h, o, -w / 2 + bz, -h / 2 + bz, s, vw, (h - bz * 2) / s); g.bz = bz; g.R = w * 0.16;
+  g.pts = () => rrectPts(-w / 2, -h / 2, w, h, g.R, 8).map(([ux, uy]) => g.dev(ux, uy));
+  return g;
+}
+function uiPhone(x, y, h, o = {}, drawScreen) {
+  const g = uiPhoneGeo(x, y, h, o), { w, bz, R } = g, body = o.body ?? UI.body;
+  ctx.save(); ctx.translate(g.x, g.y); ctx.rotate(g.rot); ctx.scale(g.k, g.k); ctx.globalAlpha *= g.a;
+  uiShadow(() => uiRR(-w / 2, -h / 2, w, h, R), 3, { fill: body, k: o.shadowK });
+  ctx.fillStyle = uiMix(body, '#000000', 0.3);                                                // side buttons
+  for (const [bx, by, bh] of [[w / 2 - 3, -h * 0.2, h * 0.1], [-w / 2 - 4, -h * 0.26, h * 0.055], [-w / 2 - 4, -h * 0.19, h * 0.055]]) { uiRR(bx, by, 7, bh, 3); ctx.fill(); }
+  uiRR(-w / 2, -h / 2, w, h, R); ctx.fillStyle = body; ctx.fill();
+  const rim = ctx.createLinearGradient(-w / 2, -h / 2, w / 2, h / 2); rim.addColorStop(0, UI.bodyHi); rim.addColorStop(0.45, body); rim.addColorStop(1, UI.bodyHi);
+  uiRR(-w / 2 + 1.5, -h / 2 + 1.5, w - 3, h - 3, R - 1.5); ctx.strokeStyle = rim; ctx.lineWidth = 3; ctx.stroke();   // a thin rim light
+  ctx.save(); uiRR(-w / 2 + bz, -h / 2 + bz, w - bz * 2, h - bz * 2, R - bz); ctx.clip(); ctx.fillStyle = o.bg ?? UI.surface; ctx.fill();
+  ctx.translate(-w / 2 + bz, -h / 2 + bz); ctx.scale(g.s, g.s);
+  const v = { w: g.vw, h: g.vh, s: g.s, scroll: o.scroll ?? 0, top: 42, bottom: 18 };
+  if (drawScreen) uiCull(0, 0, v.w, v.h, () => drawScreen(v, g));
+  if (o.status !== false) {   // a generic status row: signal bars left, a battery right (no clock: no tiny type)
+    ctx.fillStyle = o.statusC ?? UI.ink;
+    for (let i = 0; i < 4; i++) { uiRR(22 + i * 6, 26 - i * 2.6, 4, 4 + i * 2.6, 1.2); ctx.fill(); }
+    uiRR(v.w - 46, 16.5, 24, 12, 3.5); ctx.strokeStyle = uiA(o.statusC ?? UI.ink, 0.45); ctx.lineWidth = 1.2; ctx.stroke(); uiRR(v.w - 44, 18.5, 15, 8, 2); ctx.fill();
+  }
+  ctx.fillStyle = UI.bodyD; uiRR(v.w / 2 - 33, 11, 66, 21, 10.5); ctx.fill();                 // the camera pill
+  ctx.fillStyle = uiA(o.statusC ?? UI.ink, 0.88); uiRR(v.w / 2 - 46, v.h - 10, 92, 4.4, 2.2); ctx.fill();   // the home indicator
+  ctx.restore(); ctx.restore(); return g;
+}
+// a browser window, centre (x, y), size w x h. Its page is o.vw (480) logical units wide. o: + bar (title bar height), url, bg
+function uiBrowserGeo(x, y, w, h, o = {}) {
+  const bar = o.bar ?? 72, vw = o.vw ?? 480, s = w / vw, g = uiGeo(x, y, w, h, o, -w / 2, -h / 2 + bar, s, vw, (h - bar) / s); g.bar = bar; g.R = o.r ?? 24;
+  g.pts = () => rrectPts(-w / 2, -h / 2, w, h, g.R, 8).map(([ux, uy]) => g.dev(ux, uy));
+  return g;
+}
+function uiBrowser(x, y, w, h, o = {}, drawScreen) {
+  const g = uiBrowserGeo(x, y, w, h, o), { bar, R } = g, x0 = -w / 2, y0 = -h / 2;
+  ctx.save(); ctx.translate(g.x, g.y); ctx.rotate(g.rot); ctx.scale(g.k, g.k); ctx.globalAlpha *= g.a;
+  uiShadow(() => uiRR(x0, y0, w, h, R), 3, { fill: UI.surface, k: o.shadowK });
+  ctx.save(); uiRR(x0, y0, w, h, R); ctx.clip();
+  ctx.fillStyle = UI.chrome; ctx.fillRect(x0, y0, w, bar);                                    // the title bar: three dots and a rounded address field
+  ctx.fillStyle = UI.dots; for (let i = 0; i < 3; i++) { uiCirc(x0 + 34 + i * 27, y0 + bar / 2, 8.5); ctx.fill(); }
+  const fx = x0 + 122, fw = w - 122 - 64, fh = bar * 0.6, fy = y0 + (bar - fh) / 2;
+  uiBox(fx, fy, fw, fh, fh / 2, UI.surface, { line: UI.line });
+  uiGlyph('lock', fx + 30, fy + fh / 2 - 1, fh * 0.2, UI.ink3, { w: 0.26 });
+  if (o.url) uiText(o.url, fx + 50, fy + fh / 2 + 1, fh * 0.54, UI.ink2, { base: 'middle' });
+  uiGlyph('plus', x0 + w - 32, y0 + bar / 2, 10, UI.ink3);
+  ctx.fillStyle = UI.line; ctx.fillRect(x0, y0 + bar - 1.5, w, 1.5);
+  ctx.beginPath(); ctx.rect(x0, y0 + bar, w, h - bar); ctx.clip(); ctx.fillStyle = o.bg ?? UI.surface; ctx.fill();
+  ctx.translate(x0, y0 + bar); ctx.scale(g.s, g.s);
+  if (drawScreen) uiCull(0, 0, g.vw, g.vh, () => drawScreen({ w: g.vw, h: g.vh, s: g.s, scroll: o.scroll ?? 0, top: 0, bottom: 0 }, g));
+  ctx.restore();
+  uiRR(x0, y0, w, h, R); ctx.strokeStyle = uiA(UI.ink, 0.1); ctx.lineWidth = uiHair(); ctx.stroke();
+  ctx.restore(); return g;
+}
+// a scrolling region of a screen: clipped to (x, y, w, h), its content moved up by scroll
+function uiScroll(x, y, w, h, scroll, fn) { ctx.save(); ctx.beginPath(); ctx.rect(x, y, w, h); ctx.clip(); uiCull(x, y, w, h, () => { ctx.translate(0, -scroll); fn(); }); ctx.restore(); }
+
+// ---------------------------------------------------------------------
+//  UI parts. Coordinates are the current system's: logical units inside a screen, world px when floating.
+// ---------------------------------------------------------------------
+function uiAvatar(x, y, r, initials, o = {}) {
+  const [bg, fg] = UI_TINTS[(o.tint ?? hash('uiav', initials)) % UI_TINTS.length];
+  uiCirc(x, y, r); ctx.fillStyle = bg; ctx.fill(); uiText(initials, x, y + r * 0.05, r * 0.82, fg, { weight: 700, align: 'center', base: 'middle' });
+}
+// a large-title navigation bar under the status row. o: chip (a count pill on the right), size, y
+function uiNav(v, title, o = {}) {
+  const y = o.y ?? v.top + 46, size = o.size ?? 30;
+  uiText(title, 16, y, size, UI.ink, { weight: 700 });
+  if (o.chip) uiChip(o.chip, v.w - 16, y - size * 0.34, { size: o.chipSize ?? 14, align: 'right', on: o.chipOn ?? 0 });
+}
+// a bottom tab bar: icons only, the active one in the accent with a dot under it
+function uiTabBar(v, glyphs, active = 0, o = {}) {
+  const h = o.h ?? 58, y = v.h - h, n = glyphs.length;
+  ctx.fillStyle = UI.surface; ctx.fillRect(0, y, v.w, h); ctx.fillStyle = UI.line; ctx.fillRect(0, y, v.w, uiHair());
+  glyphs.forEach((gl, i) => { const x = v.w * (i + 0.5) / n, on = i === active; uiGlyph(gl, x, y + h * 0.38, 10.5, on ? UI.accent : UI.ink3); if (on) { uiCirc(x, y + h * 0.7, 2.2); ctx.fillStyle = UI.accent; ctx.fill(); } });
+}
+// a list row. o: initials (an avatar), tint, title, sub, right ('check' | 'chev' | a short string), on (0..1: the check fills),
+// k (0..1: the row opens), hi (0..1: an accent wash, for a row that was just added), sep (false = no hairline), size
+function uiRow(x, y, w, h, o = {}) {
+  const k = clamp(o.k ?? 1); if (k <= 0.01) return;
+  const pad = o.pad ?? 16, r = o.ar ?? h * 0.3, cy = y + h / 2, size = o.size ?? 17; let tx = x + pad;
+  ctx.save(); if (k < 1) { ctx.beginPath(); ctx.rect(x, y, w, h * k); ctx.clip(); }
+  if (o.hi > 0.01) { uiRR(x + 6, y + 3, w - 12, h - 6, 14); ctx.fillStyle = uiA(UI.accent, 0.1 * o.hi); ctx.fill(); }
+  if (k < 1) { ctx.globalAlpha *= smooth(0.55, 1, k); ctx.translate(0, -(1 - k) * h * 0.25); }   // the space opens first, then its content arrives
+  if (o.initials) { uiAvatar(tx + r, cy, r, o.initials, { tint: o.tint }); tx += r * 2 + 12; }
+  uiText(o.title ?? '', tx, o.sub ? cy - 4 : cy + size * 0.36, size, UI.ink, { weight: 600 });
+  if (o.sub) uiText(o.sub, tx, cy + size * 0.96, size * 0.82, UI.ink2);
+  const rx = x + w - pad, on = clamp(o.on ?? 0);
+  if (o.right === 'check') { uiCirc(rx - 11, cy, 11); ctx.fillStyle = uiMix(UI.surface, UI.accent, on); ctx.fill(); ctx.strokeStyle = uiMix(UI.ink3, UI.accent, on); ctx.lineWidth = 1.6; ctx.stroke(); if (on > 0.3) uiGlyph('check', rx - 11, cy, 6.5 * Math.min(1, on * 1.2), '#ffffff', { w: 0.3 }); }
+  else if (o.right === 'chev') uiGlyph('chev', rx - 6, cy, 8, UI.ink3);
+  else if (o.right) uiText(o.right, rx, cy + size * 0.3, size * 0.82, UI.ink3, { align: 'right' });
+  if (o.sep !== false) { ctx.fillStyle = UI.line; ctx.fillRect(tx, y + h - uiHair(), x + w - tx, uiHair()); }
+  ctx.restore();
+}
+// a card: a white rounded surface with a hairline and a soft shadow; draw(x, y, w, h) runs clipped to it.
+// o: r, fill, line (null = none), shadow (level), k (pop scale), press (0..1), a
+function uiCard(x, y, w, h, o = {}, draw) {
+  const k = o.k ?? 1; if (k <= 0.002) return;
+  const r = o.r ?? 16, sc = k * (1 - 0.035 * clamp(o.press ?? 0)), fill = o.fill ?? UI.surface;
+  ctx.save(); ctx.translate(x + w / 2, y + h / 2); ctx.scale(sc, sc); ctx.translate(-x - w / 2, -y - h / 2); ctx.globalAlpha *= clamp(o.a ?? Math.min(1, k * 1.5));
+  uiBox(x, y, w, h, r, fill, { shadow: o.shadow ?? 1, line: o.line === undefined ? UI.line : o.line });
+  if (draw) { ctx.save(); uiRR(x, y, w, h, r); ctx.clip(); draw(x, y, w, h); ctx.restore(); }
+  ctx.restore();
+}
+// a button. o: press (0..1: it sinks and darkens), kind ('primary' | 'soft' | 'plain'), glyph, r, size
+function uiButton(x, y, w, h, label, o = {}) {
+  const pr = clamp(o.press ?? 0), kind = o.kind ?? 'primary', sc = 1 - 0.07 * pr, size = o.size ?? h * 0.38;
+  const fill = kind === 'primary' ? uiMix(UI.accent, '#000000', 0.2 * pr) : kind === 'soft' ? uiMix(uiMix(UI.surface, UI.accent, 0.12), UI.accent, 0.14 * pr) : uiMix(UI.fill, UI.fill2, pr);
+  const fg = kind === 'primary' ? '#ffffff' : kind === 'soft' ? UI.accent : UI.ink;
+  ctx.save(); ctx.translate(x + w / 2, y + h / 2); ctx.scale(sc, sc); ctx.translate(-x - w / 2, -y - h / 2);
+  uiBox(x, y, w, h, o.r ?? h / 2, fill, { shadow: kind === 'primary' && pr < 0.5 ? 1 : 0 });
+  const tw = label ? uiTextW(label, size, 600) : 0, gs = o.glyph ? size * 0.5 : 0, total = tw + (gs ? gs * 2 + (label ? size * 0.4 : 0) : 0); let cx = x + (w - total) / 2;
+  if (o.glyph) { uiGlyph(o.glyph, cx + gs, y + h / 2, gs, fg, { w: 0.28 }); cx += gs * 2 + size * 0.4; }
+  if (label) uiText(label, cx, y + h / 2 + size * 0.04, size, fg, { weight: 600, base: 'middle' });
+  ctx.restore();
+}
+// a toggle of width w: on = 0..1 (pass a spring; the knob may overshoot a little)
+function uiToggle(x, y, w, on) {
+  const h = w * 0.6, u = clamp(on, -0.08, 1.08), r = h / 2 - 2.5;
+  uiRR(x, y, w, h, h / 2); ctx.fillStyle = uiMix(UI.fill2, UI.accent, clamp(on)); ctx.fill();
+  const kx = lerp(x + h / 2, x + w - h / 2, u);
+  uiShadow(() => uiCirc(kx, y + h / 2, r), 1); uiCirc(kx, y + h / 2, r); ctx.fillStyle = '#ffffff'; ctx.fill();
+}
+// a segmented control: pos = which item the white thumb sits on (fractional while it slides)
+function uiSeg(x, y, w, h, items, pos, o = {}) {
+  const n = items.length, iw = (w - 6) / n, size = o.size ?? h * 0.4;
+  uiRR(x, y, w, h, h / 2); ctx.fillStyle = UI.fill; ctx.fill();
+  const tx = x + 3 + clamp(pos, -0.1, n - 0.9) * iw; uiBox(tx, y + 3, iw, h - 6, (h - 6) / 2, UI.surface, { shadow: 1 });
+  items.forEach((s, i) => uiText(s, x + 3 + (i + 0.5) * iw, y + h / 2 + size * 0.04, size, Math.abs(pos - i) < 0.5 ? UI.ink : UI.ink2, { weight: 600, align: 'center', base: 'middle' }));
+}
+// a text field: o.text typed up to o.n characters, a caret, an accent ring as o.focus goes 0..1.
+// o: placeholder, size, r, pad, right (px kept free at the right end), typing (the caret holds solid while keys land)
+function uiField(x, y, w, h, o = {}) {
+  const f = clamp(o.focus ?? 0), size = o.size ?? h * 0.34, pad = o.pad ?? h * 0.36, str = String(o.text ?? '').slice(0, o.n ?? 1e9);
+  uiBox(x, y, w, h, o.r ?? h / 2, uiMix(UI.fill, UI.surface, f), { line: uiMix(UI.line, UI.accent, f), lw: lerp(1.5, 3.2, f) });
+  if (f > 0.02) { uiRR(x - 3, y - 3, w + 6, h + 6, (o.r ?? h / 2) + 3); ctx.strokeStyle = uiA(UI.accent, 0.2 * f); ctx.lineWidth = 3; ctx.stroke(); }
+  let tw = 0;
+  if (str) tw = uiText(str, x + pad, y + h / 2 + size * 0.04, size, UI.ink, { base: 'middle' });
+  else if (o.placeholder) uiText(o.placeholder, x + pad, y + h / 2 + size * 0.04, size, UI.ink3, { base: 'middle', a: 1 - 0.35 * f });
+  if (f > 0.5 && (o.typing || uiBlink())) { ctx.fillStyle = UI.accent; ctx.fillRect(x + pad + tw + (str ? 2 : 0), y + h / 2 - size * 0.62, Math.max(1.6, size * 0.1), size * 1.24); }
+  return { caret: x + pad + tw, tw };
+}
+// bar tops / line points of a chart: [{ x, y, w, base, v }] (for lenses, call-outs and cursors)
+function uiChartPts(x, y, w, h, vals, o = {}) {
+  const n = vals.length, max = o.max ?? Math.max(...vals), lab = o.labels ? (o.size ?? 13) * 1.75 : 0, base = y + h - lab, top = y + (o.head ?? 0), slot = w / n, bw = slot * (1 - (o.gap ?? 0.4));
+  return vals.map((v, i) => ({ x: x + (i + 0.5) * slot, y: base - (base - top) * clamp(v / max, 0, 1.2) * clamp(typeof o.grow === 'function' ? o.grow(i) : o.grow ?? 1, 0, 1.2), w: bw, base, v }));
+}
+// a chart. o: kind ('bars' | 'line'), grow (0..1 or i => 0..1), hi (the bar in the full accent), value (a label on the hi bar),
+// labels, size, max, grid (how many hairlines), gap, head (px kept free above the tallest bar)
+function uiChart(x, y, w, h, vals, o = {}) {
+  const P = uiChartPts(x, y, w, h, vals, o), base = P[0].base, top = y + (o.head ?? 0), size = o.size ?? 13, soft = o.c ?? uiMix(UI.accent, '#ffffff', 0.74);
+  ctx.save(); ctx.fillStyle = UI.line; for (let i = 0; i <= (o.grid ?? 3); i++) ctx.fillRect(x, lerp(base, top, i / (o.grid ?? 3)) - uiHair() / 2, w, uiHair());
+  if (o.kind === 'line') {
+    const g = clamp(typeof o.grow === 'number' ? o.grow : 1), Q = P.map((p) => [p.x, p.y]), S = subPath(resample(Q, false, 4), g), e = S[S.length - 1];
+    ctx.beginPath(); ctx.moveTo(S[0][0], base); S.forEach(([px, py]) => ctx.lineTo(px, py)); ctx.lineTo(e[0], base); ctx.closePath(); ctx.fillStyle = uiA(UI.accent, 0.12); ctx.fill();
+    ctx.beginPath(); S.forEach(([px, py], i) => (i ? ctx.lineTo(px, py) : ctx.moveTo(px, py))); ctx.strokeStyle = UI.accent; ctx.lineWidth = o.lw ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+    uiCirc(e[0], e[1], (o.lw ?? 3) * 1.9); ctx.fillStyle = UI.surface; ctx.fill(); ctx.strokeStyle = UI.accent; ctx.stroke();
+  } else P.forEach((p, i) => { const bh = Math.max(2, p.base - p.y), r = Math.min(p.w / 2, o.r ?? 7); ctx.beginPath(); ctx.moveTo(p.x - p.w / 2, p.base); ctx.lineTo(p.x - p.w / 2, p.base - bh + r); ctx.arcTo(p.x - p.w / 2, p.base - bh, p.x, p.base - bh, Math.min(r, bh)); ctx.arcTo(p.x + p.w / 2, p.base - bh, p.x + p.w / 2, p.base, Math.min(r, bh)); ctx.lineTo(p.x + p.w / 2, p.base); ctx.closePath(); ctx.fillStyle = i === o.hi ? UI.accent : soft; ctx.fill(); });
+  if (o.labels) o.labels.forEach((s, i) => uiText(s, P[i].x, y + h - size * 0.2, size, i === o.hi ? UI.ink : UI.ink3, { align: 'center', weight: i === o.hi ? 700 : 500 }));
+  if (o.value != null && o.hi != null) { const p = P[o.hi], s = String(o.value), vs = o.valueSize ?? size, tw = uiTextW(s, vs, 700), bw = tw + vs * 1.1, by = p.y - vs * 1.9 - 4; uiBox(p.x - bw / 2, by, bw, vs * 1.7, vs * 0.6, UI.ink); uiText(s, p.x, by + vs * 0.88, vs, '#ffffff', { align: 'center', weight: 700, base: 'middle' }); }
+  ctx.restore(); return P;
+}
+// a skeleton loader bar with a shimmer that sweeps across o.sweep = [x0, x1] (share it between bars so they shimmer as one)
+function uiSkeleton(x, y, w, h, o = {}) {
+  const sw = o.sweep ?? [x, x + w], band = (sw[1] - sw[0]) * 0.45, bx = lerp(sw[0] - band, sw[1] + band, mod(TT * (o.speed ?? 0.85) + (o.ph ?? 0), 1));
+  ctx.save(); uiRR(x, y, w, h, o.r ?? h / 2); ctx.fillStyle = o.c ?? uiMix(UI.fill, UI.fill2, 0.45); ctx.fill(); ctx.clip();
+  const g = ctx.createLinearGradient(bx - band, 0, bx + band, 0); g.addColorStop(0, uiA('#ffffff', 0)); g.addColorStop(0.5, uiA('#ffffff', 0.85)); g.addColorStop(1, uiA('#ffffff', 0));
+  ctx.fillStyle = g; ctx.fillRect(x, y, w, h); ctx.restore();
+}
+// a skeleton list row (avatar disc, two bars), the placeholder of uiRow
+function uiSkelRow(x, y, w, h, o = {}) {
+  const r = h * 0.3, pad = 16, sweep = o.sweep ?? [x, x + w], R = RNG('uiskel', o.key ?? y);
+  uiSkeleton(x + pad, y + h / 2 - r, r * 2, r * 2, { r, sweep }); uiSkeleton(x + pad + r * 2 + 12, y + h / 2 - 13, w * R.r(0.3, 0.42), 11, { sweep }); uiSkeleton(x + pad + r * 2 + 12, y + h / 2 + 6, w * R.r(0.2, 0.28), 9, { sweep });
+}
+// a skeleton that resolves into content as k goes 0..1: skel() fades out, content() fades in with a short rise
+function uiResolve(k, skel, content, rise = 6) { k = clamp(k); uiAlpha(1 - k, skel); if (k > 0.004) { ctx.save(); ctx.globalAlpha *= k; ctx.translate(0, (1 - k) * rise); content(); ctx.restore(); } }
+// a pill chip, centred on (x, y) (o.align 'left' / 'right': that end sits on x). o: on (0..1 selected), size, dot, glyph, k (pop), shadow, fill, c
+function uiChip(str, x, y, o = {}) {
+  const size = o.size ?? 15, h = o.h ?? size * 2.05, pad = o.pad ?? size * 0.82, on = clamp(o.on ?? 0), lead = o.dot ? size * 0.85 : o.glyph ? size * 1.2 : 0, w = uiTextW(str, size, 600) + pad * 2 + lead, k = o.k ?? 1;
+  const x0 = o.align === 'left' ? x : o.align === 'right' ? x - w : x - w / 2; if (k <= 0.01) return w;
+  ctx.save(); ctx.translate(x0 + w / 2, y); ctx.scale(k, k); ctx.translate(-x0 - w / 2, -y); ctx.globalAlpha *= clamp(k * 1.6);
+  uiBox(x0, y - h / 2, w, h, h / 2, o.fill ?? uiMix(UI.fill, UI.accent, on), { shadow: o.shadow ?? 0, line: o.line });
+  if (o.dot) { uiCirc(x0 + pad + size * 0.2, y, size * 0.26); ctx.fillStyle = UI.accent; ctx.fill(); }
+  if (o.glyph) uiGlyph(o.glyph, x0 + pad + size * 0.4, y, size * 0.42, on > 0.5 ? '#ffffff' : UI.accent, { w: 0.28 });
+  uiText(str, x0 + pad + lead, y + size * 0.04, size, on > 0.5 ? '#ffffff' : o.c ?? UI.ink, { weight: 600, base: 'middle' });
+  ctx.restore(); return w;
+}
+// a floating label chip at (x, y) with a leader to the feature at (tx, ty). o: k (0..1+ pop), size, glyph
+function uiCallout(str, x, y, tx, ty, o = {}) {
+  const k = o.k ?? 1; if (k <= 0.01) return;
+  const u = clamp(k), ex = lerp(x, tx, u), ey = lerp(y, ty, u);
+  ctx.save(); ctx.globalAlpha *= clamp(k * 2); ctx.lineCap = 'round';
+  for (const [c, lw] of [['#ffffff', 6], [UI.ink, 2.2]]) { ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.strokeStyle = c; ctx.lineWidth = uiHair(lw); ctx.stroke(); }
+  uiCirc(ex, ey, uiHair(9)); ctx.fillStyle = '#ffffff'; ctx.fill(); uiCirc(ex, ey, uiHair(5.5)); ctx.fillStyle = UI.accent; ctx.fill();
+  ctx.restore();
+  uiChip(str, x, y, { size: o.size ?? 28, shadow: 2, fill: UI.surface, dot: !o.glyph, glyph: o.glyph, k, align: o.align });
+}
+// a notification banner that drops in from above on a spring; (x, y) = its resting top-left corner.
+// o: t0 (when it drops), out (when it leaves), h, title, sub, glyph, drop (px it falls), size. Returns { x, y, w, h, k }
+function uiToast(x, y, w, o = {}) {
+  const h = o.h ?? 100, t0 = o.t0 ?? 0; if (!uiAt(t0)) return null;
+  const s = springEase(TT - t0 + 1 / FPS, 230, 19), leave = o.out != null ? EZ.i2(seg(TT, o.out, o.out + 0.22)) : 0, drop = o.drop ?? h * 0.5;
+  const yy = y - (1 - s) * drop - leave * drop, al = clamp((TT - t0 + 1 / FPS) / 0.1) * (1 - leave), size = o.size ?? h * 0.3, ic = h - 36; if (al <= 0.004) return null;
+  ctx.save(); ctx.globalAlpha *= al; ctx.translate(x + w / 2, yy); ctx.scale(lerp(0.9, 1, clamp(s)), lerp(0.9, 1, clamp(s))); ctx.translate(-x - w / 2, -yy);
+  uiBox(x, yy, w, h, o.r ?? h * 0.27, UI.surface, { shadow: 3, line: UI.line });
+  uiBox(x + 18, yy + 18, ic, ic, ic * 0.27, UI.accent); uiGlyph(o.glyph ?? 'check', x + 18 + ic / 2, yy + 18 + ic / 2, ic * 0.27 * clamp(uiSpring(t0 + 0.12) * 1.02), '#ffffff', { w: 0.26 });
+  const tx = x + 18 + ic + 18;
+  uiText(o.title ?? '', tx, o.sub ? yy + h / 2 - size * 0.14 : yy + h / 2 + size * 0.34, size, UI.ink, { weight: 700 });
+  if (o.sub) uiText(o.sub, tx, yy + h / 2 + size * 0.86, size * 0.76, UI.ink2);
+  ctx.restore(); return { x, y: yy, w, h, k: s };
+}
+
+// ---------------------------------------------------------------------
+//  the pointer: a cursor (browser) or a touch dot (phone) that follows waypoints
+//  keys = [[t, x, y, 'click'?], ...] in world coords, sorted by t. It rests on a key until the next leg starts, travels
+//  an eased arc, and arrives o.pause (0.12 s) before a click key's time, so it hovers before it clicks.
+// ---------------------------------------------------------------------
+function uiPathAt(keys, t, o = {}) {
+  const pause = o.pause ?? 0.12; let p = keys[0];
+  for (let i = 1; i < keys.length; i++) {
+    const a = keys[i - 1], b = keys[i], d = Math.hypot(b[1] - a[1], b[2] - a[2]), t1 = b[0] - (b[3] === 'click' ? pause : 0), t0 = Math.max(a[0] + (a[3] === 'click' ? 0.1 : 0), t1 - (o.travel ?? clamp(0.22 + d / 1500, 0.26, 0.6)));
+    if (t <= t0) break;
+    if (t < t1) {
+      const u = EZ.io(seg(t, t0, t1)), side = (i % 2 ? 1 : -1) * (o.bend ?? 0.16), mx = (a[1] + b[1]) / 2 - (b[2] - a[2]) * side, my = (a[2] + b[2]) / 2 + (b[1] - a[1]) * side, q = 1 - u;
+      return [q * q * a[1] + 2 * q * u * mx + u * u * b[1], q * q * a[2] + 2 * q * u * my + u * u * b[2], 1];
+    }
+    p = b;
+  }
+  return [p[1], p[2], 0];
+}
+// the click state at time t: n (clicks so far), since (seconds since the last one), at (where), down (0..1: pressed)
+function uiClicks(keys, t = TT) {
+  let n = 0, since = 1e9, at = null;
+  for (const k of keys) if (k[3] === 'click' && t >= k[0] - 1e-6) { n++; since = t - k[0]; at = [k[1], k[2]]; }
+  return { n, since, at, down: since < 0.085 ? 1 : 1 - EZ.o2(seg(since, 0.085, 0.24)) };
+}
+function uiRipple(c, r0, r1, o = {}) {   // the ring a click leaves
+  if (!c.at || c.since > 0.5) return; const u = EZ.o3(c.since / 0.5);
+  ctx.save(); uiCirc(c.at[0], c.at[1], lerp(r0, r1, u)); ctx.strokeStyle = uiA(o.c ?? UI.accent, 0.85 * (1 - u)); ctx.lineWidth = lerp(7, 1.5, u); ctx.stroke();
+  uiCirc(c.at[0], c.at[1], lerp(r0, r1, u) * 0.62); ctx.fillStyle = uiA(o.c ?? UI.accent, 0.16 * (1 - u)); ctx.fill(); ctx.restore();
+}
+const UI_ARROW = [[0, 0], [0, 1], [0.235, 0.775], [0.4, 1.155], [0.535, 1.095], [0.375, 0.72], [0.705, 0.72]];
+const uiArrowPts = (x, y, s, rot = 0) => xform(UI_ARROW.map(([px, py]) => [px - 0.3, py - 0.55]), x, y, rot, s);   // centred: a bridge shape, the hero's stand-in
+// the arrow cursor. o: s (its height, 58), out (the time it fades), c. Returns { x, y, n, since, down, at }
+function uiCursor(keys, o = {}) {
+  const [x, y] = uiPathAt(keys, TT, o), c = uiClicks(keys), s = (o.s ?? 58) * (1 - 0.12 * c.down), al = clamp((TT - keys[0][0]) / 0.15 + 0.01) * (o.out != null ? 1 - seg(TT, o.out, o.out + 0.2) : 1);
+  uiRipple(c, 8, 62);
+  if (al > 0.004) {
+    const P = UI_ARROW.map(([px, py]) => [x + px * s, y + py * s]);
+    ctx.save(); ctx.globalAlpha *= al; uiShadow(() => uiPath(P), 2, { fill: UI.ink });
+    uiPath(P); ctx.lineJoin = 'round'; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = s * 0.13; ctx.stroke(); ctx.fillStyle = o.c ?? UI.ink; ctx.fill(); ctx.restore();
+  }
+  return { x, y, ...c };
+}
+// the touch dot. o: r (36), out. Same keys and return value as uiCursor
+function uiTap(keys, o = {}) {
+  const [x, y] = uiPathAt(keys, TT, o), c = uiClicks(keys), r = (o.r ?? 36) * (1 - 0.24 * c.down), al = clamp((TT - keys[0][0]) / 0.15 + 0.01) * (o.out != null ? 1 - seg(TT, o.out, o.out + 0.2) : 1);
+  uiRipple(c, r * 0.6, r * 2.3);
+  if (al > 0.004) {
+    ctx.save(); ctx.globalAlpha *= al; uiShadow(() => uiCirc(x, y, r), 1, { fill: uiA(UI.ink, 0.3) });
+    uiCirc(x, y, r); ctx.fillStyle = uiA(UI.ink, 0.26 + 0.2 * c.down); ctx.fill(); ctx.strokeStyle = uiA('#ffffff', 0.95); ctx.lineWidth = 3.5; ctx.stroke(); ctx.restore();
+  }
+  return { x, y, ...c };
+}
+// a magnifier: the region of radius sr round (sx, sy) redrawn larger inside a round lens of radius dr at (dx, dy), with a
+// ring on the source and a leader. draw() redraws what is under the source (the device; no captions, no pointer).
+// o: k (0..1+ pop). Crisp, because it is a redraw and not a pixel copy.
+function uiZoom(sx, sy, sr, dx, dy, dr, o = {}, draw) {
+  const k = o.k ?? 1; if (k <= 0.01 || UI_LENS) return;
+  const R = dr * Math.min(k, 1.15), a = Math.atan2(dy - sy, dx - sx), cs = Math.cos(a), sn = Math.sin(a), mag = dr / sr;
+  ctx.save(); ctx.globalAlpha *= clamp(k * 2); ctx.lineCap = 'round';
+  for (const [c, lw] of [['#ffffff', 7], [UI.accent, 2.6]]) {
+    ctx.strokeStyle = c; ctx.lineWidth = uiHair(lw); ctx.beginPath(); ctx.moveTo(sx + cs * sr, sy + sn * sr); ctx.lineTo(lerp(sx + cs * sr, dx - cs * R, clamp(k)), lerp(sy + sn * sr, dy - sn * R, clamp(k))); ctx.stroke();
+    uiCirc(sx, sy, sr); ctx.stroke();
+  }
+  uiShadow(() => uiCirc(dx, dy, R), 3);
+  ctx.save(); uiCirc(dx, dy, R); ctx.clip(); ctx.fillStyle = UI.surface; ctx.fill();
+  UI_LENS = true;
+  try { uiCull(dx - R, dy - R, R * 2, R * 2, () => { ctx.translate(dx, dy); ctx.scale(mag * Math.min(k, 1.15), mag * Math.min(k, 1.15)); ctx.translate(-sx, -sy); draw(); }); } finally { UI_LENS = false; }
+  ctx.restore();
+  uiCirc(dx, dy, R); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = uiHair(9); ctx.stroke(); uiCirc(dx, dy, R + uiHair(4.5)); ctx.strokeStyle = uiA(UI.ink, 0.14); ctx.lineWidth = uiHair(1.5); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the hero: a rounded app-icon tile in the accent, with a white glyph. s = its side.
+//  o: glyph, bob (0..1: how much it floats), kick (a time: it jumps a little, e.g. when its app does something), rot, c
+// ---------------------------------------------------------------------
+const uiAppIconPts = (x, y, s) => rrectPts(x - s / 2, y - s / 2, s, s, s * 0.235, 8);
+function uiAppIcon(x, y, s, o = {}) {
+  const kt = o.kick != null && uiAt(o.kick) ? TT - o.kick : -1, kick = kt >= 0 ? Math.exp(-kt * 7) * Math.cos(kt * 22) : 0;
+  const by = Math.sin(TT * TAU * 0.45 + (o.ph ?? 0)) * s * 0.022 * (o.bob ?? 1), c = o.c ?? UI.accent, k = (o.k ?? 1) * (1 + 0.1 * kick);
+  SPARK_AT = toScreen(x, y);
+  ctx.save(); ctx.translate(x, y + by); ctx.rotate((o.rot ?? 0) + 0.05 * kick); ctx.scale(k, k);
+  uiShadow(() => uiRR(-s / 2, -s / 2, s, s, s * 0.235), o.shadow ?? 3, { fill: c });
+  uiRR(-s / 2, -s / 2, s, s, s * 0.235); ctx.fillStyle = c; ctx.fill();
+  const g = ctx.createLinearGradient(0, -s / 2, 0, s / 2); g.addColorStop(0, 'rgba(255,255,255,0.2)'); g.addColorStop(0.55, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(0,0,20,0.1)'); ctx.fillStyle = g; ctx.fill();
+  uiGlyph(o.glyph ?? 'check', 0, s * 0.01, s * 0.27, '#ffffff', { w: 0.27 });
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  captions and tags (DEFER: after the camera, at screen size). They fade as a bridge starts and wait for the new era's
+//  window to open.
+// ---------------------------------------------------------------------
+function uiBridgeK() {   // 1 outside bridges; falls to 0 over the first 0.2 s of a shrink; back to 1 once the new window has mostly opened
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc + d * 0.7) return TT < r.tc ? 1 - seg(TT, r.tc - d, r.tc - d + 0.2) : 0; }
+  return 1;
+}
+function uiArrive() { if (typeof BRIDGES !== 'undefined') for (const r of BRIDGES) if (Math.abs(r.tc - E0) < 0.05) return r.tc + (r.d ?? 0.6) * 0.7; return E0; }
+// a caption: one bold line centred on CX, words rising in one after another; *starred words* take the accent.
+// o: y (baseline), size, at (seconds after the era starts), dark, x
+function uiCaption(str, o = {}) {
+  const f = () => {
+    const al = uiBridgeK(); if (al <= 0.004) return;
+    const dark = o.dark ?? UI_DARKMODE, size = o.size ?? 62, y = o.y ?? (PORTRAIT ? 362 : H - 96), t0 = Math.max(E0 + (o.at ?? 0.2), uiArrive());
+    const words = String(str).split(/(\*[^*]+\*)/).filter((g) => g.trim()).flatMap((g) => (g[0] === '*' ? g.slice(1, -1).trim().split(/\s+/).map((w) => ({ w, hi: true })) : g.trim().split(/\s+/).map((w) => ({ w, hi: false }))));
+    ctx.save(); uiFont(size, 700); const sp = ctx.measureText(' ').width, ws = words.map((d) => ctx.measureText(d.w).width); ctx.restore();
+    let x = (o.x ?? (typeof CX !== 'undefined' ? CX : W / 2)) - (ws.reduce((a, b) => a + b, 0) + sp * (words.length - 1)) / 2;
+    words.forEach((d, i) => {
+      const s = uiSpring(t0 + i * 0.06, SPRING.smooth);
+      if (s > 0.02) uiText(d.w, x, y + (1 - s) * size * 0.4, size, d.hi ? (dark ? uiMix(UI.accent, '#ffffff', 0.38) : UI.accent) : dark ? '#ffffff' : UI.ink, { weight: 700, a: al * clamp(s * 1.5) });
+      x += ws[i] + sp;
+    });
+  };
+  if (DEFER) DEFER.push(f); else f();
+}
+// a tag: a small pill above the caption (an accent dot and a label). o: y, size, at, dark, x
+function uiTag(str, o = {}) {
+  const f = () => {
+    const al = uiBridgeK(), k = uiSpring(Math.max(E0 + (o.at ?? 0.1), uiArrive() - 0.05), SPRING.smooth); if (al <= 0.004 || k <= 0.02) return;
+    const dark = o.dark ?? UI_DARKMODE;
+    uiAlpha(al, () => uiChip(str, o.x ?? (typeof CX !== 'undefined' ? CX : W / 2), o.y ?? (PORTRAIT ? 276 : 70), { size: o.size ?? 26, dot: true, k, fill: dark ? uiMix(UI.groundD, '#ffffff', 0.12) : UI.surface, c: dark ? '#ffffff' : UI.ink, line: dark ? null : UI.line, shadow: dark ? 0 : 1 }));
+  };
+  if (DEFER) DEFER.push(f); else f();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks. The morph happens on the bare studio ground; the bridge object is a rounded tile.
+// =====================================================================
+const STYLE = {
+  name: 'ui-mockup',
+  paper: UI.ground,
+  backdrop(c) { ctx.save(); screen(); uiGround(c); ctx.restore(); },      // the studio in colour c (a hex, or rgb() mid-morph), with its light
+  window(P, key, src) {                                                  // the era seen through the object's outline: a screen with a shadow and a hairline
+    const bb = bbox(P), small = bb.x1 - bb.x0 < W * 1.5 && bb.y1 - bb.y0 < H * 1.5;
+    if (small) uiShadow(() => uiPath(P), 3, { fill: UI.surface });
+    ctx.save(); uiPath(P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    if (small) { ctx.save(); uiPath(P); ctx.strokeStyle = uiA(UI.ink, 0.1); ctx.lineWidth = 1.5; ctx.stroke(); ctx.restore(); }
+  },
+  blob(P, c, key, u = 0) {                                               // the tile itself: a flat accent surface, soft shadow, its glyph fading as it changes
+    const bb = bbox(P), cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, s = Math.min(bb.x1 - bb.x0, bb.y1 - bb.y0), k = 1 + 0.04 * Math.sin(Math.PI * clamp(u));
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(k, k); ctx.translate(-cx, -cy);
+    uiShadow(() => uiPath(P), 3, { fill: c }); uiPath(P); ctx.fillStyle = c; ctx.fill();
+    const g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1); g.addColorStop(0, 'rgba(255,255,255,0.2)'); g.addColorStop(0.55, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(0,0,20,0.1)'); ctx.fillStyle = g; ctx.fill();
+    uiAlpha(1 - smooth(0.1, 0.6, u), () => uiGlyph('check', cx, cy, s * 0.27, '#ffffff', { w: 0.27 }));
+    ctx.restore();
+  },
+  hero(x, y, r, o = {}) { uiAppIcon(x, y, r * 1.7, { ph: (o.key || '').length }); },   // r = half the hero's size
+  heroColor: UI.accent,
+  heroPts(x, y, r) { return uiAppIconPts(x, y, r * 1.7); },
+  post() {                                                               // the studio's falloff: corners a touch darker, nothing else (the look is clean)
+    const g = ctx.createRadialGradient(W / 2, H * 0.45, Math.min(W, H) * 0.55, W / 2, H * 0.45, Math.hypot(W, H) * 0.62);
+    g.addColorStop(0, 'rgba(14,16,28,0)'); g.addColorStop(1, 'rgba(14,16,28,0.075)'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  },
+  ones: true,                                                            // UI motion is crisp: on 1s
+};
+// =====================================================================
+//  SCENES — ui-mockup demo. World coordinates 1080x1920; time TT on 1s. Screens are drawn in each device's own
+//  logical units (the phone's screen is 280 wide, the browser's page 480); g.at(lx, ly) turns a screen point into a
+//  world point for the pointer, the lens and the call-outs. Content inside x 60-940, y 250-1500.
+// =====================================================================
+const cu = TIMELINE.cues;
+// ---- era 1: the phone
+const PH = { x: 480, y: 965, h: 1060 }, PHO = { tilt: -0.022, tilt0: 0.075, in: -0.3, from: [0, 130], float: 3, vw: 280 };
+const ICON = { x: 815, y: 590, s: 168 };                      // the hero and the bridge object: nothing else may overlap it at the bridge
+const TASK = 'Call the lab';
+const ROWS = [['AN', 'Review deck', 'Ana · 2 pm', 0], ['KA', 'Send invoice', 'Kai · 4 pm', 1], ['MI', 'Book venue', 'Mia · Fri', 3]];
+const LIST = { y: 104, rh: 68 }, FIELD = { x: 14, y: 458, w: 252, h: 54 };
+
+function phoneScreen(v) {
+  const added = uiAt(cu.add), ins = uiSpring(cu.add), n = added ? 0 : uiTyped(TASK, cu.type), press = uiPress(cu.add);
+  const focus = (uiAt(cu.tap) ? EZ.o3(seg(TT + 1 / FPS, cu.tap, cu.tap + 0.15)) : 0) * (1 - EZ.o3(seg(TT, cu.add + 0.04, cu.add + 0.3)));
+  uiNav(v, 'Today', { chip: (added ? 4 : 3) + ' open', chipOn: added ? 1 - seg(TT, cu.add + 0.45, cu.add + 0.75) : 0 });
+  // the list: three rows resolve out of skeletons; the new task opens a row at the top and pushes the rest down
+  uiScroll(0, LIST.y, v.w, LIST.rh * 4 + 6, 0, () => {
+    uiRow(0, LIST.y, v.w, LIST.rh, { initials: 'ME', tint: 2, title: TASK, sub: 'You · Today', right: 'check', k: ins, hi: added ? 1 - seg(TT, cu.add + 0.5, cu.add + 1.0) : 0 });
+    ROWS.forEach(([ini, title, sub, tint], i) => {
+      const y = LIST.y + (i + ins) * LIST.rh, k = EZ.o3(seg(TT, cu.load + i * 0.09, cu.load + i * 0.09 + 0.22));
+      uiResolve(k, () => uiSkelRow(0, y, v.w, LIST.rh, { sweep: [0, v.w], key: i }), () => uiRow(0, y, v.w, LIST.rh, { initials: ini, tint, title, sub, right: 'check' }));
+    });
+  });
+  // the field: focused by the first tap, typed into key by key, emptied by the add button
+  uiField(FIELD.x, FIELD.y, FIELD.w, FIELD.h, { text: TASK, n, placeholder: 'Add a task', focus, typing: n > 0 && n < TASK.length, size: 17 });
+  uiButton(FIELD.x + FIELD.w - 47, FIELD.y + 7, 40, 40, '', { glyph: 'up', press, kind: n > 0 || press > 0 ? 'primary' : 'plain', size: 22 });
+  uiTabBar(v, ['list', 'chart', 'user'], 0);
+}
+function scenePhone() {
+  uiGround(UI.ground, { glow: [PH.x + 50 + Math.sin(TT * 0.7) * 36, 930 + Math.cos(TT * 0.5) * 28, 700] });
+  uiDrift('phone', 7);
+  const g = uiPhone(PH.x, PH.y, PH.h, PHO, phoneScreen);
+  // the hero: the app's icon floats at the phone's shoulder and jumps when its task lands
+  uiAppIcon(ICON.x, ICON.y, ICON.s, { kick: cu.kick, bob: 1 - seg(TT, 2.1, 2.45), k: springEase(TT + 0.22, 200, 17) });
+  // the banner drops over the top of the phone
+  uiToast(240, 440, 480, { t0: cu.toast, title: 'Task added', sub: TASK + ' · Today', h: 104 });
+  // label chips
+  const btn = g.at(FIELD.x + FIELD.w - 27, FIELD.y + 27), row = g.at(11, LIST.y + LIST.rh / 2);
+  uiCallout('One tap', 818, 1232, btn[0] + 24, btn[1] - 22, { k: uiSpring(cu.add + 0.08, SPRING.smooth) });
+  uiCallout('Synced', 150, 690, row[0], row[1], { k: uiSpring(cu.kick + 0.1, SPRING.smooth), size: 26 });
+  // the touch: taps the field, waits below while the keys land, taps add, leaves
+  const f = g.at(150, FIELD.y + 27), rest = g.at(168, 548);
+  uiTap([[0.1, 850, 1400], [cu.tap, f[0], f[1], 'click'], [1.0, rest[0], rest[1]], [cu.add, btn[0], btn[1], 'click'], [2.3, 850, 1420]], { out: 2.15 });
+  uiTag('Quick add');
+  uiCaption('Add it in *one tap*');
+}
+
+// ---- era 2: the browser
+const BR = { x: 500, y: 941.5, w: 840, h: 947 }, BRO = { vw: 480, bar: 72, url: 'app.example/week' };
+const PAGE = { seg: { x: 276, y: 18, w: 184, h: 40 }, kpi: { x: 20, y: 74, w: 194, h: 132 }, dig: { x: 228, y: 74, w: 232, h: 132 }, chart: { x: 20, y: 222, w: 440, h: 210 }, team: { x: 20, y: 448, w: 440, h: 180 } };
+const MINE = [3, 4, 3, 5, 6, 2, 1], TEAM = [10, 13, 19, 22, 15, 11, 6], DAYS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+const SCROLL = 60, pageScroll = () => SCROLL * EZ.io(seg(TT, cu.scroll, cu.scroll + 0.45));
+const barK = (i) => uiSpring(cu.seg + i * 0.03, { k: 210, d: 17 });                     // each bar answers the click, a little after its neighbour
+const chartBox = () => { const c = PAGE.chart; return [c.x + 18, c.y + 52, c.w - 36, c.h - 64]; };
+const chartVals = () => MINE.map((m, i) => lerp(m / 10, TEAM[i] / 25, barK(i)));
+const chartHi = () => (barK(3) > 0.5 ? 3 : 4);
+const chartOpt = () => ({ max: 1, head: 36, labels: DAYS, size: 14, hi: chartHi(), value: chartHi() === 3 ? Math.round(lerp(5, 22, clamp(barK(3)))) : 6 });
+const kpiPts = () => { const g = uiBrowserGeo(BR.x, BR.y, BR.w, BR.h, BRO), c = PAGE.kpi; return rrectPts(c.x, c.y, c.w, c.h, 22, 8).map(([x, y]) => g.at(x, y)); };
+
+function browserPage(v) {
+  const team = uiAt(cu.seg), on = uiSpring(cu.toggle);
+  uiScroll(0, 0, v.w, v.h, pageScroll(), () => {
+    // the header: the app's icon, the page title, the view switch
+    uiAppIcon(40, 38, 36, { shadow: 1, bob: 0 });
+    uiText('This week', 68, 48, 26, UI.ink, { weight: 700 });
+    uiSeg(PAGE.seg.x, PAGE.seg.y, PAGE.seg.w, PAGE.seg.h, ['Mine', 'Team'], uiSpring(cu.seg), { size: 16 });
+    // the count card (the bridge object): the number runs up when the view changes
+    const c = PAGE.kpi;
+    uiCard(c.x, c.y, c.w, c.h, { fill: UI.accent, line: null, shadow: 2, r: 22 }, () => {
+      uiText('Tasks done', c.x + 18, c.y + 38, 17, 'rgba(255,255,255,0.86)', { weight: 600 });
+      uiText(uiCount(cu.seg, 0.7, 24, 96), c.x + 17, c.y + 106, 60, '#ffffff', { weight: 700 });
+      uiCirc(c.x + c.w - 32, c.y + 32, 15); ctx.fillStyle = 'rgba(255,255,255,0.2)'; ctx.fill(); uiGlyph('up', c.x + c.w - 32, c.y + 32, 7.5, '#ffffff', { w: 0.3 });
+    });
+    // the digest card: its toggle answers the second click
+    const d = PAGE.dig;
+    uiCard(d.x, d.y, d.w, d.h, { r: 22, press: uiPress(cu.toggle) * 0.5 }, () => {
+      uiText('Weekly digest', d.x + 18, d.y + 40, 19, UI.ink, { weight: 600 });
+      uiText(uiAt(cu.toggle) ? 'On · Mondays' : 'Off', d.x + 18, d.y + 67, 16, uiAt(cu.toggle) ? UI.accent : UI.ink2);
+      uiToggle(d.x + d.w - 18 - 58, d.y + d.h - 18 - 35, 58, on);
+    });
+    // the chart card
+    const h = PAGE.chart;
+    uiCard(h.x, h.y, h.w, h.h, { r: 22 }, () => {
+      uiText('Completed', h.x + 18, h.y + 37, 19, UI.ink, { weight: 600 });
+      uiText(team ? 'Team · 7 days' : 'You · 7 days', h.x + h.w - 18, h.y + 37, 16, UI.ink2, { align: 'right' });
+      uiChart(...chartBox(), chartVals(), chartOpt());
+    });
+    // further down the page: who did the most (the scroll brings it up)
+    const m = PAGE.team;
+    uiCard(m.x, m.y, m.w, m.h, { r: 22 }, () => {
+      uiText('Most active', m.x + 18, m.y + 37, 19, UI.ink, { weight: 600 });
+      uiRow(m.x + 2, m.y + 50, m.w - 4, 62, { initials: 'AN', tint: 0, title: 'Ana', sub: '31 done' });
+      uiRow(m.x + 2, m.y + 112, m.w - 4, 62, { initials: 'KA', tint: 1, title: 'Kai', sub: '27 done', sep: false });
+    });
+  });
+}
+function sceneBrowser() {
+  uiGround(UI.groundD, { glow: [560 + Math.sin(TT * 0.6) * 44, 860 + Math.cos(TT * 0.45) * 30, 780] });
+  uiDrift('browser', 7, { dark: true });
+  const device = () => uiBrowser(BR.x, BR.y, BR.w, BR.h, BRO, browserPage), g = device();
+  // the lens: the peak of the chart, magnified
+  const pk = uiChartPts(...chartBox(), chartVals(), chartOpt())[chartHi()], src = g.at(pk.x, pk.y - 16 - pageScroll());
+  uiZoom(src[0], src[1], 62, 772, 1336, 108, { k: uiSpring(cu.lens, SPRING.smooth) }, device);
+  // the banner drops over the window's corner
+  uiToast(566, 462, 360, { t0: cu.toast2, title: 'Digest on', sub: 'Mondays, 9 am', glyph: 'bell', h: 100 });
+  // the cursor: switches the view, waits while the page scrolls, flips the toggle, moves off
+  const sg = g.at(PAGE.seg.x + PAGE.seg.w * 0.75 + 26, PAGE.seg.y + 27), tg = g.at(PAGE.dig.x + PAGE.dig.w - 44, PAGE.dig.y + PAGE.dig.h - 34 - SCROLL), off = g.at(392, 262);
+  uiCursor([[3.4, 930, 1240], [cu.seg, sg[0], sg[1], 'click'], [cu.toggle, tg[0], tg[1], 'click'], [5.6, off[0], off[1]]]);
+  uiTag('Insights', { dark: true });
+  uiCaption('Watch it *add up*', { dark: true });
+}
+// the camera pushes slowly toward the part being used, anchored on the device's top edge (captions sit above it)
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.5, 1.7, { z: 1.07, p: [PH.x, PH.y - PH.h / 2], to: [PH.x, PH.y - PH.h / 2] }, 2.1, 2.45);
+  return push(t, 3.6, 5.4, { z: 1.05, p: [BR.x, BR.y - BR.h / 2], to: [BR.x, BR.y - BR.h / 2] });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — ui-mockup demo (read by kit/morph.js).
+// =====================================================================
+const ERA_BG = [UI.ground, UI.groundD];
+const BRIDGES = [
+  // the app-icon tile -> the count card in the browser: both rounded accent tiles of similar proportions and corner radius
+  { tc: 3.0, d: 0.5, A: () => ({ P: uiAppIconPts(ICON.x, ICON.y, ICON.s), c: UI.accent }), B: () => ({ P: kpiPts(), c: UI.accent }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — ui-mockup demo (inside buildScore(); see kit/score-head.js). Light and clicky: a soft pluck pulse in
+  // D major that opens to G, and interface sounds that land on the frames where the UI answers: a touch, key ticks,
+  // a pop, a two-note chime for each banner, a mouse click, bars rising as plucks, a toggle blip.
+  const T = TIMELINE, q = T.cues;
+  const tap = (t, vel = 0.05) => { noiseHit(t, 0.016, 'bandpass', 1900, 2.2, vel, 0, 0.04); blip(t, 420, 260, 0.045, vel * 0.9); };                 // a finger on glass
+  const key = (t, i) => noiseHit(t, 0.009, 'highpass', 3600 + (i % 3) * 500, 1, 0.016 + (i % 2) * 0.005, i % 2 ? 0.14 : -0.14);                  // a key lands
+  const mouse = (t, vel = 0.06) => { noiseHit(t, 0.007, 'highpass', 4200, 1, vel, 0.1); noiseHit(t + 0.075, 0.006, 'highpass', 5200, 1, vel * 0.55, 0.1); };   // down, up
+  const ding = (t, a, b, vel = 0.05, pan = 0) => { chime(t, [nz(a)], vel, pan); chime(t + 0.085, [nz(b)], vel * 0.9, pan); };                     // a banner
+  to = 'm';
+  pad(0.0, 3.1, ['D3', 'A3', 'Fs4'], 0.035, { type: 'triangle', cut: 1500, att: 0.25, rel: 0.3, send: 0.4 });
+  pad(3.0, 6.05, ['G2', 'D3', 'B3', 'E4'], 0.042, { type: 'triangle', cut: 1900, att: 0.2, rel: 0.4, send: 0.45 });
+  const pA = ['D4', 'A4', 'Fs4', 'A4', 'D4', 'B4', 'Fs4', 'A4'], pB = ['G4', 'B4', 'D5', 'B4', 'G4', 'E5', 'D5', 'B4'];
+  for (let i = 0; i < 24; i++) { const t = i * E8, n = (t < 3 ? pA : pB)[i % 8]; pluck(t, nz(n), t < 3 ? 0.04 : 0.048, i % 2 ? 0.25 : -0.25, 0.22, 2400, 0.3); }   // the pulse
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; bass(t, nz(t < 3 ? (i % 4 < 2 ? 'D2' : 'A1') : (i % 4 < 2 ? 'G1' : 'E2')), t < 3 ? 0.06 : 0.075); }
+  for (let i = 0; i < 12; i++) noiseHit(i * BEAT + E8, 0.012, 'highpass', 7500, 1, i < 6 ? 0.008 : 0.012, i % 2 ? 0.35 : -0.35);                    // a hat on the off-beats
+  ['G4', 'B4', 'D5', 'G5'].forEach((n, i) => pluck(3.0 + 1 / 6 + i * 0.03, nz(n), 0.07, -0.2 + i * 0.13, 0.5, 3200, 0.4));                           // the payoff: the card opens
+  to = 's';
+  sweep(0.0, 0.3, 0.012, 500, 1600, 0);                                                                                                           // the phone drifts in
+  tap(q.tap);                                                                                                                                      // the field
+  for (let i = 0; i < 12; i++) key(q.type + i / 12, i);                                                                                           // twelve keys, twelve characters
+  tap(q.add, 0.06); blip(q.add + 1 / 24, 520, 990, 0.09, 0.045, 0.1);                                                                              // add: a touch and a pop as the row opens
+  ding(q.toast, 'A5', 'D6');                                                                                                                       // "Task added"
+  blip(q.kick, 880, 1320, 0.06, 0.02, 0.4);                                                                                                        // the icon jumps
+  sweep(2.5, 2.98, 0.016, 700, 2400, 0);                                                                                                          // the world closes onto the icon
+  noiseHit(3.0, 0.03, 'bandpass', 900, 1.5, 0.05, 0, 0.1); blip(3.0, 300, 600, 0.12, 0.04, 0);                                                    // tile -> card
+  mouse(q.seg);                                                                                                                                    // the view switch
+  ['D5', 'E5', 'G5', 'B5', 'G5', 'E5', 'D5'].forEach((n, i) => pluck(q.seg + 0.06 + i * 0.03, nz(n), 0.03, -0.3 + i * 0.1, 0.14, 4200, 0.25));       // seven bars answer
+  for (let i = 0; i < 7; i++) noiseHit(q.seg + 0.1 + i * 0.09, 0.006, 'highpass', 5200 + i * 300, 1, 0.012, 0.3);                                    // the count runs up
+  sweep(q.scroll, q.scroll + 0.42, 0.009, 1800, 900, -0.1);                                                                                       // the page scrolls
+  blip(q.lens, 700, 1400, 0.08, 0.028, 0.35);                                                                                                      // the lens pops
+  mouse(q.toggle); blip(q.toggle + 1 / 24, 660, 990, 0.07, 0.04, 0.2);                                                                             // the toggle flips on
+  ding(q.toast2, 'B5', 'E6', 0.05, 0.25);                                                                                                          // "Digest on"
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

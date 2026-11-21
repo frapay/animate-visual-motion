@@ -1,0 +1,1693 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cave painting demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0806; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  CAVE PAINTING DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A limestone wall by torchlight. A red disc is rubbed on, a
+//  bison, a horse and a small red stag are daubed line by line, two stick hunters run in, a spear flies.
+//  At 3.0s the light closes onto the disc; in the dark it is blown over into the halo of a hand stencil; the
+//  hand is lifted and the light opens on a wall of hands, a babirusa and an anoa (Sulawesi), the stag still there.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/cave-painting/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneHunt()], [3, 6, () => sceneHands()]];
+const SHOTS = [
+  ['hunt',  0, 0.0, 3.0, 'a red disc, a bison, a horse and a red stag are daubed on the rock; two hunters run in and a spear flies'],
+  ['hands', 1, 3.0, 6.0, 'the disc is blown over into a hand stencil; more hands, a babirusa and an anoa appear; the stag walks in the flicker'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { disc: 0.0, bison: 0.2, horse: 0.75, stag: 1.0, hunters: 1.5, dots: 1.75, spear: 2.0, lift: 3.2, hand1: 3.5, pig: 3.6, hand2: 4.0, hand3: 4.5, anoa: 4.5, dots2: 5.0 },
+  acts: [
+    { name: '1 Hunt',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Hands', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.25, title: 'the hunt, daubed by firelight', sound: 'a low skin drum, a breath, dry finger scrapes, fire crackle', next: 'the red disc becomes a hand' },
+    { t: 5.25, title: 'we were here', sound: 'the drum doubles, a bone flute, breaths of blown pigment', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/cave-painting/kit.js — prehistoric rock art by firelight, on top of kit/core.js.
+//
+//  A living limestone wall deep in a cave, painted with red ochre, yellow ochre, umber, charcoal and a little
+//  white clay, seen in the pool of light of one unseen flame.
+//
+//  How it is drawn: a scene runs inside cavePaint(() => { ... }). The rock wall (cached, seeded: relief, stains,
+//  calcite, cracks, pits) is laid down first; inside the callback `ctx` is the PIGMENT LAYER, whose alpha is the
+//  pigment's THICKNESS. When the callback returns the layer is "developed" against the wall's own roughness map
+//  (cached with the wall): a pixel keeps its pigment only where the thickness beats the rock's roughness there, so
+//  thick paint covers all but the pits and cracks, thin paint catches only on the high grains, and a soft edge
+//  turns into speckle. That one pass is what makes every mark sit ON the rock and break over it.
+//
+//  Marks (three kinds only): caveDaub (a finger-daubed line that runs dry along its length), caveRub (a patchy
+//  rubbed fill inside any closed outline), caveSpray / caveHand (blown pigment round a clean negative shape).
+//  Light: STYLE.post multiplies the frame by a warm pool that flickers on 2s and drifts (caveAim), and floats dust
+//  motes and sparks in it. The wall never moves; the light does.
+//  Needs from the piece head: CX (caption centre x). No fonts: the lettering is daubed stroke by stroke.
+// =====================================================================
+const CAVE = {
+  rock: '#c3b297',      // limestone, warm grey-buff (the wall's mean tone; also STYLE.paper)
+  grey: '#b3ada0',      // cooler grey limestone
+  stain: '#a8754a',     // iron staining where water has run
+  calcite: '#e6ddcb',   // pale calcite crust
+  soot: '#5a4c40',      // dark mineral / soot patches
+  red: '#a8381f',       // red ochre: the hero, the hands
+  yellow: '#cc9a3a',    // yellow ochre: rubbed bodies
+  umber: '#70462a',     // brown umber: rubbed bodies, second contours
+  black: '#221b17',     // charcoal: contours, manes, lettering
+  white: '#efe7d6',     // white clay: tusks, a few dots (rare)
+  dark: '#070504',      // what the light falls to
+  flame: '#ffb25a',     // sparks and lit dust
+};
+const CAVE_CV = {}, CAVE_MEMO = new Map(), CAVE_ROCK = {}, CAVE_WALL_DEF = {};
+let CAVE_ON = null;     // inside cavePaint: { base, wall, q }
+let CAVE_AIM = null;    // this frame's torch aim (caveAim; read and cleared by STYLE.post)
+let CAVE_BR = null;     // this frame's bridge light (set by the STYLE hooks; read and cleared by STYLE.post)
+function caveCanvas(key, w = W, h = H, read = false) { let c = CAVE_CV[key]; if (!c) { c = document.createElement('canvas'); c.width = w; c.height = h; c.getContext('2d', read ? { willReadFrequently: true } : undefined); CAVE_CV[key] = c; } return c; }
+function caveMemo(key, make) { if (!CAVE_MEMO.has(key)) { if (CAVE_MEMO.size > 900) CAVE_MEMO.clear(); CAVE_MEMO.set(key, make()); } return CAVE_MEMO.get(key); }
+function caveRGB(c) { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); const m = c.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [0, 0, 0]; }
+const caveMix = (a, b, u) => a.map((v, i) => v + (b[i] - v) * u);
+function caveSig(P) { let h = 2166136261 >>> 0; for (const p of P) { h ^= Math.round(p[0] * 4) + 7919 * Math.round(p[1] * 4); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36) + ':' + P.length; }
+function caveCen(P) { let x = 0, y = 0; for (const p of P) { x += p[0]; y += p[1]; } x /= P.length; y /= P.length; let r = 0; for (const p of P) r += Math.hypot(p[0] - x, p[1] - y); return [x, y, r / P.length]; }
+// corner-cutting for hand-typed outlines (open lines keep their ends)
+function caveSmooth(P, closed = false, it = 2) {
+  for (let k = 0; k < it; k++) {
+    const Q = [], n = P.length, m = closed ? n : n - 1; if (!closed) Q.push(P[0]);
+    for (let i = 0; i < m; i++) { const a = P[i], b = P[(i + 1) % n]; Q.push([a[0] * 0.75 + b[0] * 0.25, a[1] * 0.75 + b[1] * 0.25], [a[0] * 0.25 + b[0] * 0.75, a[1] * 0.25 + b[1] * 0.75]); }
+    if (!closed) Q.push(P[n - 1]); P = Q;
+  }
+  return P;
+}
+function cavePath(g, P, closed = true) { g.beginPath(); g.moveTo(P[0][0], P[0][1]); for (let i = 1; i < P.length; i++) g.lineTo(P[i][0], P[i][1]); if (closed) g.closePath(); }
+
+// ---------------------------------------------------------------------
+//  timing (on the motion step TT)
+//    caveIn(t0, d)          0..1 progress of a mark that starts at t0 and takes d seconds: pass it as `frac`
+//    caveStep(every, phase) a whole-number counter (two-state life: % 2 picks the leg pose)
+//    caveAim(x, y, r)       point the torch for this frame (screen px; r = the pool's radius, default 1180)
+// ---------------------------------------------------------------------
+const caveIn = (t0, d = 0.5) => clamp((TT - t0) / d);
+const caveStep = (every = 0.5, phase = 0) => Math.floor(TT / every + phase + 1e-6);
+function caveAim(x, y, r) { CAVE_AIM = { x, y, r }; }
+
+// ---------------------------------------------------------------------
+//  the rock wall (built once per name, cached): caveRock(name) -> { cv, N, S }
+//    cv  the wall as a picture: albedo (buff / grey limestone, vertical iron stains, calcite crust, dark patches,
+//        grain) times its relief shading (large swells, small bumps, cracks, pits)
+//    N   Uint8Array W*H: the roughness a pigment's thickness has to beat at each pixel (hollows, pits and cracks
+//        are high; the tops of grains are low)
+//    S   Uint8Array W*H: the relief shading, so pigment is shaded like the rock it lies on
+//  caveDefWall(name, { seed, bulges: [[x, y, rx, ry, amt]] }) declares a wall before it is first used: a bulge is
+//  a swelling of the rock to hang an animal's hump or belly on.
+// ---------------------------------------------------------------------
+function caveDefWall(name, spec = {}) { CAVE_WALL_DEF[name] = { seed: name, bulges: [], ...spec }; delete CAVE_ROCK[name]; }
+function caveField(key, w, h, cx, cy = cx) {   // smooth value noise, w x h, cell cx x cy px, 0..1
+  const R = RNG('cavefield', key), gw = Math.ceil(w / cx) + 2, gh = Math.ceil(h / cy) + 2, G = new Float32Array(gw * gh), out = new Float32Array(w * h);
+  for (let i = 0; i < G.length; i++) G[i] = R.f();
+  for (let y = 0; y < h; y++) {
+    const v = y / cy, j = v | 0, f0 = v - j, fv = f0 * f0 * (3 - 2 * f0), r0 = j * gw, r1 = r0 + gw;
+    for (let x = 0; x < w; x++) { const u = x / cx, i = u | 0, e0 = u - i, fu = e0 * e0 * (3 - 2 * e0), a = G[r0 + i], b = G[r0 + i + 1], c = G[r1 + i], d = G[r1 + i + 1]; out[y * w + x] = a + (b - a) * fu + (c - a) * fv + (a - b - c + d) * fu * fv; }
+  }
+  return out;
+}
+function caveCracks(seed) {   // a few branching cracks and a scatter of pits, as [x, y, w] polylines and [x, y, rx, ry, rot] pits
+  const R = RNG('cavecrack', seed), lines = [], pits = [];
+  const walk = (x, y, a, n, w, depth) => {
+    const P = [[x, y, w]];
+    for (let i = 0; i < n; i++) {
+      a += R.n(0.55) + (R.f() < 0.16 ? R.n(1.1) : 0); const l = R.r(7, 20); x += Math.cos(a) * l; y += Math.sin(a) * l;
+      const ww = w * (1 - 0.8 * i / n) * R.r(0.35, 1.4); P.push([x, y, ww]);
+      if (depth < 1 && R.f() < 0.035) walk(x, y, a + (R.f() < 0.5 ? 1 : -1) * R.r(0.5, 1.2), Math.round(n * R.r(0.25, 0.5)), ww * 0.8, depth + 1);
+    }
+    lines.push(P);
+  };
+  for (let i = 0; i < 5; i++) walk(R.r(-40, W + 40), R.r(-40, H * 0.9), R.r(0.9, 2.2) + (R.f() < 0.3 ? R.n(1.2) : 0), R.i(40, 80), R.r(2.4, 4.6), 0);
+  for (let i = 0; i < 620; i++) { const big = R.f() < 0.1, s = big ? R.r(4, 9) : R.r(1.2, 3.6); pits.push([R.r(0, W), R.r(0, H), s, s * R.r(0.5, 1), R.r(0, Math.PI), R.r(0.45, 1)]); }
+  return { lines, pits };
+}
+function caveCrackDraw(g, K, dx, dy, color, wk) {
+  g.save(); g.translate(dx, dy); g.strokeStyle = color; g.fillStyle = color; g.lineCap = 'round'; g.lineJoin = 'round';
+  for (const P of K.lines) for (let i = 1; i < P.length; i++) { g.lineWidth = Math.max(0.8, P[i][2] * wk); g.beginPath(); g.moveTo(P[i - 1][0], P[i - 1][1]); g.lineTo(P[i][0], P[i][1]); g.stroke(); }
+  for (const p of K.pits) { g.globalAlpha = p[5]; g.beginPath(); g.ellipse(p[0], p[1], p[2] * wk, p[3] * wk, p[4], 0, TAU); g.fill(); }
+  g.restore();
+}
+function caveRock(name = 'wall') {
+  if (CAVE_ROCK[name]) return CAVE_ROCK[name];
+  const def = CAVE_WALL_DEF[name] || { seed: name, bulges: [] }, seed = def.seed ?? name, hw = Math.ceil(W / 2), hh = Math.ceil(H / 2), n = hw * hh;
+  const f = (k, cx, cy) => caveField(seed + ':' + k, hw, hh, cx, cy);
+  const n1 = f('a', 190), n2 = f('b', 74), n3 = f('c', 28), n4 = f('d', 10), n5 = f('e', 4.2), tone = f('tone', 240), stn = f('stain', 22, 210), cal = f('cal', 80, 150), cal2 = f('cal2', 12, 46), sot = f('soot', 170), fine = f('fine', 1.6);
+  const hs = new Float32Array(n), hf = new Float32Array(n);   // the smooth swells, the fine bumps
+  for (let i = 0; i < n; i++) { hs[i] = 13 * n1[i] + 6 * n2[i] + 2.5 * n3[i]; hf[i] = 0.8 * n4[i] + 0.2 * n5[i]; }   // each octave weighted so its slopes shade about equally
+  { const R = RNG('caveledge', seed);   // bedding ledges: a few wavy near-horizontal steps in the rock
+    for (let j = 0; j < 5; j++) { const y0 = R.r(0.08, 0.95) * hh, amp = R.r(0.7, 1.5) * (R.f() < 0.5 ? -1 : 1), f1 = R.r(90, 190), p1 = R.r(0, TAU), tilt = R.n(0.12), x0 = R.r(0, hw * 0.4), x1 = R.r(hw * 0.6, hw);
+      for (let x = 0; x < hw; x++) { const fade = smooth(x0 - 80, x0, x) * (1 - smooth(x1, x1 + 80, x)); if (fade <= 0) continue; const yc = y0 + (x - hw / 2) * tilt + 22 * Math.sin(x / f1 + p1) + 46 * (n2[Math.min(hh - 1, Math.max(0, Math.round(y0))) * hw + x] - 0.5); for (let y = Math.max(0, Math.floor(yc - 9)); y < hh; y++) hs[y * hw + x] += amp * fade * smooth(-7, 7, y - yc); } } }
+  for (const [bx, by, rx, ry, amt = 0.5] of def.bulges || []) {
+    const x0 = Math.max(0, Math.floor((bx - rx * 2) / 2)), x1 = Math.min(hw - 1, Math.ceil((bx + rx * 2) / 2)), y0 = Math.max(0, Math.floor((by - ry * 2) / 2)), y1 = Math.min(hh - 1, Math.ceil((by + ry * 2) / 2));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const dx = (x * 2 - bx) / rx, dy = (y * 2 - by) / ry; hs[y * hw + x] += 16 * amt * Math.exp(-(dx * dx + dy * dy) * 1.5); }
+  }
+  const rock = caveRGB(CAVE.rock), grey = caveRGB(CAVE.grey), stain = caveRGB(CAVE.stain), calc = caveRGB(CAVE.calcite), soot = caveRGB(CAVE.soot);
+  const a = new ImageData(hw, hh), b = new ImageData(hw, hh), A = a.data, Bd = b.data, lx = -0.6, ly = -0.8;
+  for (let y = 0; y < hh; y++) for (let x = 0; x < hw; x++) {
+    const i = y * hw + x, xm = x > 0 ? i - 1 : i, xp = x < hw - 1 ? i + 1 : i, ym = y > 0 ? i - hw : i, yp = y < hh - 1 ? i + hw : i;
+    const lit = -((hs[xp] - hs[xm] + hf[xp] - hf[xm]) * lx + (hs[yp] - hs[ym] + hf[yp] - hf[ym]) * ly);
+    const ao = 0.5 * n2[i] + 0.35 * n3[i] + 0.15 * n4[i] - 0.5;
+    const sh = clamp(1 + lit * 1.15 + ao * 0.3, 0.45, 1.3);
+    let c = caveMix(rock, grey, smooth(0.4, 0.8, tone[i]) * 0.6);
+    c = caveMix(c, stain, smooth(0.55, 0.86, stn[i] * 0.72 + n2[i] * 0.28) * 0.62);
+    c = caveMix(c, soot, smooth(0.6, 0.9, sot[i] * 0.72 + n3[i] * 0.28) * 0.5);
+    const ca = smooth(0.58, 0.72, cal[i] * 0.68 + cal2[i] * 0.2 + n4[i] * 0.12);
+    c = caveMix(c, calc, ca * 0.8);
+    const m = 0.92 + 0.16 * n2[i] + 0.05 * (n5[i] - 0.5);
+    A[i * 4] = clamp(c[0] * m, 0, 255); A[i * 4 + 1] = clamp(c[1] * m, 0, 255); A[i * 4 + 2] = clamp(c[2] * m, 0, 255); A[i * 4 + 3] = 255;
+    const rough = 0.46 * n5[i] + 0.34 * n4[i] + 0.2 * n3[i];
+    Bd[i * 4] = sh / 1.3 * 255; Bd[i * 4 + 1] = clamp(0.5 - (rough - 0.5) * 1.7) * 255; Bd[i * 4 + 2] = fine[i] * 255; Bd[i * 4 + 3] = 255;
+  }
+  const up = (im, key) => { const t = caveCanvas('cave-half', hw, hh), tg = t.getContext('2d'); tg.putImageData(im, 0, 0); const c = caveCanvas(key, W, H, true), g = c.getContext('2d'); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high'; g.drawImage(t, 0, 0, W, H); return g; };
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const cg = cv.getContext('2d', { willReadFrequently: true });
+  cg.imageSmoothingEnabled = true; cg.imageSmoothingQuality = 'high'; { const t = caveCanvas('cave-half', hw, hh); t.getContext('2d').putImageData(a, 0, 0); cg.drawImage(t, 0, 0, W, H); }
+  const aux = up(b, 'cave-aux').getImageData(0, 0, W, H).data;
+  const K = caveCracks(seed), kc = caveCanvas('cave-crk', W, H, true), kg = kc.getContext('2d'); kg.clearRect(0, 0, W, H); caveCrackDraw(kg, K, 0, 0, '#000', 1);
+  const crk = kg.getImageData(0, 0, W, H).data, img = cg.getImageData(0, 0, W, H), D = img.data, N = new Uint8Array(W * H), S = new Uint8Array(W * H), R = RNG('cavegrain', seed);
+  for (let k = 0, i = 0; k < W * H; k++, i += 4) {
+    const r1 = R.f(), r2 = R.f(), cr = crk[i + 3] / 255, sh = aux[i] / 255 * 1.3 * (1 - 0.68 * cr), g = (r1 - 0.5) * 20 + (aux[i + 2] - 128) * 0.09;
+    S[k] = sh / 1.3 * 255;
+    D[i] = (D[i] + g) * sh; D[i + 1] = (D[i + 1] + g) * sh; D[i + 2] = (D[i + 2] + g) * sh;
+    const hol = aux[i + 1] / 255; N[k] = cr > 0.3 ? 255 : 255 * clamp(0.02 + 0.44 * hol + 0.2 * aux[i + 2] / 255 + 0.22 * r2 + 2.2 * Math.max(0, hol - 0.74));
+  }
+  cg.putImageData(img, 0, 0);
+  caveCrackDraw(cg, K, 1.6, 2.2, 'rgba(255,238,210,0.2)', 0.5);   // the lit lip of every crack and pit
+  return (CAVE_ROCK[name] = { cv, N, S });
+}
+const caveWallOf = (era) => (typeof CAVE_WALLS !== 'undefined' && CAVE_WALLS[era] ? CAVE_WALLS[era] : 'wall');
+
+// ---------------------------------------------------------------------
+//  cavePaint(fn, { wall, over, box }) — run a scene on the pigment layer and develop it onto the wall.
+//    wall: the wall's name ('wall'); over: true = paint over what is already on ctx (captions, hooks) without
+//    laying the wall again; box [x0, y0, x1, y1]: develop only this screen box (cheaper for small passes).
+//  Inside fn, `ctx` is the pigment layer: use the marks below, or draw anything with a pigment colour and
+//  globalAlpha = thickness (1 = thick paint, 0.5 = a dry rub, 0.25 = a ghost).
+// ---------------------------------------------------------------------
+function cavePaint(fn, o = {}) {
+  const base = ctx, wall = caveRock(o.wall ?? 'wall'), m = base.getTransform();
+  if (!o.over) { base.save(); base.setTransform(1, 0, 0, 1, 0, 0); base.globalAlpha = 1; base.globalCompositeOperation = 'source-over'; base.drawImage(wall.cv, 0, 0); base.restore(); }
+  const cv = caveCanvas('cave-pig', W, H, true), g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; g.filter = 'none'; g.clearRect(0, 0, W, H);
+  g.save(); g.setTransform(m);
+  const prev = CAVE_ON, on = { base, wall, q: [] }; CAVE_ON = on; ctx = g;
+  try { fn(); } finally { ctx = base; g.restore(); CAVE_ON = prev; }
+  const bx = o.box ? [Math.max(0, Math.floor(o.box[0])), Math.max(0, Math.floor(o.box[1])), Math.min(W, Math.ceil(o.box[2])), Math.min(H, Math.ceil(o.box[3]))] : [0, 0, W, H];
+  const w = bx[2] - bx[0], h = bx[3] - bx[1];
+  if (w > 0 && h > 0) {
+    const im = g.getImageData(bx[0], bx[1], w, h), d = im.data, N = wall.N, S = wall.S;
+    for (let y = 0; y < h; y++) {
+      let i = y * w * 4, k = (bx[1] + y) * W + bx[0];
+      for (let x = 0; x < w; x++, i += 4, k++) {
+        const al = d[i + 3]; if (!al) continue;
+        const nn = N[k]; if (al <= nn) { d[i + 3] = 0; continue; }
+        const v = (al - nn) * 5, s = S[k];
+        d[i + 3] = v > 236 ? 236 : v; d[i] = d[i] * s * 333 >> 16; d[i + 1] = d[i + 1] * s * 333 >> 16; d[i + 2] = d[i + 2] * s * 333 >> 16;
+      }
+    }
+    g.putImageData(im, bx[0], bx[1]);
+    base.save(); base.setTransform(1, 0, 0, 1, 0, 0); base.globalAlpha = 1; base.globalCompositeOperation = 'source-over'; base.drawImage(cv, bx[0], bx[1], w, h, bx[0], bx[1], w, h); base.restore();
+  }
+  on.q.forEach((q) => q());   // things that are light, not pigment (a hand's shadow), drawn over the developed paint
+}
+// one mark, drawn on a scratch canvas (so that drying it never eats the paint under it) and laid on the pigment layer
+function caveMark(bb, draw) {
+  const m = ctx.getTransform(), xs = [], ys = [];
+  for (const [x, y] of [[bb.x0, bb.y0], [bb.x1, bb.y0], [bb.x1, bb.y1], [bb.x0, bb.y1]]) { xs.push(m.a * x + m.c * y + m.e); ys.push(m.b * x + m.d * y + m.f); }
+  const X0 = clamp(Math.floor(Math.min(...xs)) - 2, 0, W), Y0 = clamp(Math.floor(Math.min(...ys)) - 2, 0, H), X1 = clamp(Math.ceil(Math.max(...xs)) + 2, 0, W), Y1 = clamp(Math.ceil(Math.max(...ys)) + 2, 0, H), w = X1 - X0, h = Y1 - Y0;
+  if (w <= 0 || h <= 0) return;
+  const sc = caveCanvas('cave-scratch'), g = sc.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; g.clearRect(X0, Y0, w, h);
+  g.save(); g.beginPath(); g.rect(X0, Y0, w, h); g.clip(); g.setTransform(m); draw(g); g.restore();
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(sc, X0, Y0, w, h, X0, Y0, w, h); ctx.restore();
+}
+function caveSoft() {   // a soft round dab (alpha (1 - t^2)^2), used to dry a line and to leave bare patches in a rub
+  if (CAVE_CV['cave-soft']) return CAVE_CV['cave-soft'];
+  const c = caveCanvas('cave-soft', 64, 64), g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  for (let i = 0; i <= 8; i++) { const t = i / 8; gr.addColorStop(t, `rgba(0,0,0,${((1 - t * t) ** 2).toFixed(3)})`); }
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return c;
+}
+
+// ---------------------------------------------------------------------
+//  caveDaub(P, o) — THE line: a finger or pad dragged along polyline P, thick and confident, running dry.
+//    o: c (pigment), w (width, 20), frac (0..1 drawn so far, along its length), key (fixes its wobble),
+//       dry (0.72: how much of its load the finger has lost when it is re-dipped), dip (560: px of line one load
+//       of pigment lasts; a longer line starts again fat and wet), d (thickness, 1; 0.3 = a ghost),
+//       wob (hand wobble in px, w * 0.1), closed
+//    The line is widest and wettest where the finger lands, thins and breaks up as the load runs out, and lifts
+//    off with a slight taper. Its rim is thin pigment, so it develops ragged. Returns the finger's position.
+// ---------------------------------------------------------------------
+function caveDaubGeo(P, o) {
+  const w = o.w ?? 20, closed = !!o.closed, key = o.key ?? 'daub', dip = o.dip ?? 560, dry = o.dry ?? 0.72, wob = o.wob ?? w * 0.1;
+  return caveMemo(['daub', key, w, closed ? 1 : 0, dip, dry, wob, caveSig(P)].join('|'), () => {
+    const Q = resample(P, closed, Math.max(2.5, w * 0.26)); if (closed) Q.push(Q[0]);
+    const n = Q.length, R = RNG('cavedaub', key), f1 = R.r(0.011, 0.02), f2 = R.r(0.045, 0.085), p1 = R.r(0, TAU), p2 = R.r(0, TAU), p3 = R.r(0, TAU), cum = new Float64Array(n);
+    for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + dist(Q[i - 1], Q[i]);
+    const tot = cum[n - 1], pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = Q[Math.max(0, i - 1)], b = Q[Math.min(n - 1, i + 1)], nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1, s = cum[i];
+      const off = wob * (0.7 * Math.sin(s * f1 + p1) + 0.4 * Math.sin(s * f2 + p2)), sd = s % dip;
+      const load = 1 - dry * Math.pow(Math.min(1, sd / dip), 0.7), press = 0.92 + 0.1 * Math.sin(s * f2 * 1.9 + p3);
+      const head = 0.78 + 0.22 * Math.sqrt(clamp((s + 1) / (w * 0.6))), tail = closed ? 1 : 0.62 + 0.38 * Math.sqrt(clamp((tot - s) / (w * 1.2)));
+      pts.push([Q[i][0] + nx / l * off, Q[i][1] + ny / l * off, w * (0.7 + 0.3 * load) * press * head * tail / 2, load * (0.9 + 0.1 * press)]);
+    }
+    return { pts, cum, tot };
+  });
+}
+function caveDaub(P, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0 || P.length < 2) return null;
+  if (!CAVE_ON) { let tip = null; cavePaint(() => { tip = caveDaub(P, o); }, { over: true }); return tip; }
+  const G = caveDaubGeo(P, o), w = o.w ?? 20, d = o.d ?? 1, c = o.c ?? CAVE.black, L = frac * G.tot;
+  let m = G.pts.length - 1; if (frac < 1) { m = 0; while (m < G.pts.length - 1 && G.cum[m + 1] <= L) m++; }
+  const pts = G.pts.slice(0, m + 1);
+  if (frac < 1 && m < G.pts.length - 1) { const a = G.pts[m], b = G.pts[m + 1], t = (L - G.cum[m]) / ((G.cum[m + 1] - G.cum[m]) || 1); pts.push([lerp(a[0], b[0], t), lerp(a[1], b[1], t), a[2], a[3]]); }
+  if (pts.length < 2) pts.push([pts[0][0] + 0.5, pts[0][1], pts[0][2], pts[0][3]]);
+  caveMark(bbox(pts, w * 1.5 + 4), (g) => {
+    const body = (k) => {
+      g.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i], r = p[2] * k; g.moveTo(p[0] + r, p[1]); g.arc(p[0], p[1], r, 0, TAU);
+        if (i) { const q = pts[i - 1], rq = q[2] * k, dx = p[0] - q[0], dy = p[1] - q[1], l = Math.hypot(dx, dy) || 1, nx = -dy / l, ny = dx / l; g.moveTo(q[0] + nx * rq, q[1] + ny * rq); g.lineTo(q[0] - nx * rq, q[1] - ny * rq); g.lineTo(p[0] - nx * r, p[1] - ny * r); g.lineTo(p[0] + nx * r, p[1] + ny * r); g.closePath(); }
+      }
+    };
+    g.fillStyle = c; g.globalAlpha = 0.46 * d; body(1.45); g.fill(); g.globalAlpha = 0.8 * d; body(1); g.fill();
+    g.globalCompositeOperation = 'destination-out';                                           // the finger runs dry
+    const soft = caveSoft(), rr = w * 0.95; let next = 0;
+    for (let i = 0; i < pts.length; i++) { const s = i <= m ? G.cum[i] : L; if (s < next && i < pts.length - 1) continue; next = s + w * 0.45; const T = pts[i][3]; if (T > 0.985) continue; g.globalAlpha = Math.min(0.9, -Math.log(T) / 2.27); g.drawImage(soft, pts[i][0] - rr, pts[i][1] - rr, rr * 2, rr * 2); }
+  });
+  const e = pts[pts.length - 1]; return [e[0], e[1]];
+}
+// a finger-tip dab; a row or list of them
+function caveDot(x, y, r, o = {}) { return caveDaub([[x - r * 0.25, y - r * 0.1], [x + r * 0.25, y + r * 0.1]], { w: r * 2, wob: 0, c: CAVE.red, ...o }); }
+function caveDots(list, o = {}) { const frac = clamp(o.frac ?? 1), k = frac * list.length; list.forEach(([x, y, r], i) => { if (i < k) caveDot(x, y, r ?? o.r ?? 13, { ...o, frac: 1, key: (o.key ?? 'dots') + i }); }); }
+
+// ---------------------------------------------------------------------
+//  caveRub(P, o) — the flat fill: pigment rubbed with the pad of the hand inside ANY closed outline, patchy, the
+//  rock showing through. o: c, d (thickness, 0.7), frac (rubbed in from one side), key, a (rub direction, rad), edge (px the margin thins over)
+// ---------------------------------------------------------------------
+function caveRub(P, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0 || P.length < 3) return;
+  if (!CAVE_ON) return cavePaint(() => caveRub(P, o), { over: true });
+  const c = o.c ?? CAVE.yellow, d = o.d ?? 0.7, key = o.key ?? 'rub', a = o.a ?? -0.45, bb = bbox(P, 6), bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0, area = bw * bh, R = RNG('caverub', key), soft = caveSoft();
+  caveMark(bbox(P, 12), (g) => {
+    g.save(); cavePath(g, P); g.clip();
+    g.fillStyle = c; g.strokeStyle = c; g.lineCap = 'round'; g.globalAlpha = d * 0.82; g.fillRect(bb.x0, bb.y0, bw, bh);
+    const ns = clamp(Math.round(area / 6000), 4, 70), sz = clamp(Math.sqrt(area) / 300, 0.35, 1.4);
+    for (let i = 0; i < ns; i++) {   // heavier passes of the pad
+      const x = R.r(bb.x0, bb.x1), y = R.r(bb.y0, bb.y1), l = R.r(40, 150) * sz, aa = a + R.n(0.35), ww = R.r(26, 64) * sz, al = R.r(0.14, 0.4);
+      g.globalAlpha = d * al; g.lineWidth = ww; g.beginPath(); g.moveTo(x - Math.cos(aa) * l / 2, y - Math.sin(aa) * l / 2); g.lineTo(x + Math.cos(aa) * l / 2, y + Math.sin(aa) * l / 2); g.stroke();
+    }
+    g.globalCompositeOperation = 'destination-out';
+    const nb = clamp(Math.round(area / 13000), 2, 40);
+    for (let i = 0; i < nb; i++) { const x = R.r(bb.x0, bb.x1), y = R.r(bb.y0, bb.y1), r = R.r(26, 78) * sz, al = R.r(0.25, 0.65); g.globalAlpha = al; g.drawImage(soft, x - r, y - r, r * 2, r * 2); }   // patches the pad missed
+    const ed = o.edge ?? clamp(Math.sqrt(area) * 0.035, 4, 12); if (ed > 0) { g.lineJoin = 'round'; cavePath(g, P); g.globalAlpha = 0.25; g.lineWidth = ed * 2.6; g.stroke(); g.globalAlpha = 0.35; g.lineWidth = ed; g.stroke(); }   // the pad lifts off toward the edge
+    if (frac < 1) { const xf = lerp(bb.x0 - 30, bb.x1 + 90, frac), gr = g.createLinearGradient(xf - 90, 0, xf, 0); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,1)'); g.globalAlpha = 1; g.fillStyle = gr; g.fillRect(xf - 90, bb.y0 - 4, bb.x1 - xf + 200, bh + 8); }
+    g.restore();
+  });
+}
+// a painted shape: a rubbed fill with a daubed contour (a disc, a sign, the morph's blob)
+function caveShape(P, o = {}) {
+  const frac = clamp(o.frac ?? 1), key = o.key ?? 'shape', c = o.c ?? CAVE.red;
+  caveRub(P, { c, d: (o.d ?? 0.62) * (o.k ?? 1), frac: clamp(frac * 2 - 0.6), key: key + 'f' });
+  if (o.line !== false) caveDaub(P, { closed: true, c: o.line ?? c, w: o.w ?? 17, d: o.k ?? 1, frac: clamp(frac * 1.6), key: key + 'l', dip: o.dip ?? 420 });
+}
+const caveDiscPts = (x, y, r, n = 44) => { const R = RNG('cavedisc', Math.round(r)); return ellipsePts(x, y, r, r * 0.96, 0, n).map(([px, py], i) => { const k = 1 + 0.035 * Math.sin(i / n * TAU * 3 + 1) + 0.02 * Math.sin(i / n * TAU * 7 + 2); return [x + (px - x) * k, y + (py - y) * k]; }); };
+function caveDisc(x, y, r, o = {}) { caveShape(caveDiscPts(x, y, r), { key: 'disc', ...o }); }
+
+// ---------------------------------------------------------------------
+//  caveSpray(x, y, r, o) — blown pigment: a cloud that develops into speckle, densest in the middle, with fat
+//  droplets flung further out (cached sprites, keyed), round a shape that was covered and so stays clean rock.
+//    o: c, d (peak thickness, 0.86), frac (how much has been blown so far), key, cut(g): fill / stroke the covered
+//       shape on g (it is cut out of the cloud), core (0.28: the solid middle as a share of r)
+//  caveHand(x, y, s, o) — the negative hand stencil: s = the palm's width in px (the hand is about 1.9 s tall).
+//    o: frac, rot, flip, c, key, lift (0..1: the hand's shadow as it is taken off the wall; omit for none), arm
+// ---------------------------------------------------------------------
+function caveDrops(key, r, c, j) {
+  const k = ['drops', key, Math.round(r), c, j].join('|'); if (CAVE_CV[k]) return CAVE_CV[k];
+  const S = Math.ceil(r * 2.7), cv = caveCanvas(k, S, S), g = cv.getContext('2d'), R = RNG('cavedrop', key, j), n = Math.round(r * r / 230);
+  g.fillStyle = c;
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), dd = r * (0.18 + 1.12 * Math.pow(R.f(), 0.75)), s = R.f() < 0.86 ? R.r(1.1, 2.5) : R.r(2.6, 5.6);
+    g.globalAlpha = R.r(0.55, 1) * (dd > r ? 0.8 : 1); g.beginPath(); g.ellipse(S / 2 + Math.cos(a) * dd, S / 2 + Math.sin(a) * dd, s * R.r(1, 1.7), s, a, 0, TAU); g.fill();
+  }
+  return cv;
+}
+function caveSpray(x, y, r, o = {}) {
+  const k = clamp(o.frac ?? 1); if (k <= 0) return;
+  if (!CAVE_ON) return cavePaint(() => caveSpray(x, y, r, o), { over: true });
+  const c = o.c ?? CAVE.red, d = o.d ?? 0.86, key = o.key ?? 'spray', [cr, cg, cb] = caveRGB(c), col = (a) => `rgba(${cr | 0},${cg | 0},${cb | 0},${a.toFixed(3)})`, kk = Math.pow(k, 0.8), R = RNG('cavespray', key);
+  caveMark({ x0: x - r * 1.36, y0: y - r * 1.36, x1: x + r * 1.36, y1: y + r * 1.36 }, (g) => {
+    const puff = (px, py, pr, a, core) => { const gr = g.createRadialGradient(px, py, pr * core, px, py, pr); gr.addColorStop(0, col(a)); gr.addColorStop(0.34, col(a * 0.9)); gr.addColorStop(0.58, col(a * 0.56)); gr.addColorStop(0.82, col(a * 0.2)); gr.addColorStop(1, col(0)); g.fillStyle = gr; g.fillRect(px - pr, py - pr, pr * 2, pr * 2); };
+    puff(x, y, r, d * kk, o.core ?? 0.28);
+    for (let i = 0; i < 5; i++) { const a = R.r(0, TAU), dd = r * R.r(0.25, 0.5), pr = r * R.r(0.45, 0.7), al = R.r(0.3, 0.55); puff(x + Math.cos(a) * dd, y + Math.sin(a) * dd, pr, d * al * kk * clamp(k * 5 - i * 0.6), 0.1); }   // breath by breath: a lumpy cloud
+    const dc = c[0] === '#' ? c : CAVE.red;
+    for (let j = 0; j < 4; j++) if (k > (j + 0.35) / 4.4) g.drawImage(caveDrops(key, r, dc, j), x - Math.ceil(r * 2.7) / 2, y - Math.ceil(r * 2.7) / 2);
+    if (o.cut) { g.globalCompositeOperation = 'destination-out'; g.globalAlpha = 1; g.fillStyle = '#000'; g.strokeStyle = '#000'; o.cut(g); }
+  });
+}
+const CAVE_HAND = {
+  palm: [[-0.44, -0.34], [-0.2, -0.45], [0.14, -0.46], [0.42, -0.36], [0.5, 0.0], [0.44, 0.4], [0.3, 0.6], [-0.28, 0.6], [-0.44, 0.42], [-0.52, 0.04]],
+  fingers: [[-0.33, -0.34, -106, 0.76, 0.2], [-0.07, -0.42, -91, 0.9, 0.21], [0.19, -0.4, -77, 0.8, 0.2], [0.4, -0.28, -58, 0.62, 0.17], [-0.4, 0.2, -157, 0.66, 0.24]],
+};
+function caveHandPath(g, x, y, s, rot = 0, flip = false, arm = 1.25) {   // fills the hand (and a stub of forearm) with g's current fill / stroke
+  g.save(); g.translate(x, y); g.rotate(rot); g.scale(flip ? -s : s, s); g.lineCap = 'round'; g.lineJoin = 'round';
+  cavePath(g, caveMemo('handpalm', () => caveSmooth(CAVE_HAND.palm, true, 2))); g.fill();
+  for (const [bx, by, a, l, w] of CAVE_HAND.fingers) { const ca = Math.cos(a * DEG), sa = Math.sin(a * DEG); g.lineWidth = w; g.beginPath(); g.moveTo(bx, by); g.lineTo(bx + ca * l * 0.62, by + sa * l * 0.62); g.stroke(); g.lineWidth = w * 0.86; g.beginPath(); g.moveTo(bx + ca * l * 0.55, by + sa * l * 0.55); g.lineTo(bx + ca * l, by + sa * l); g.stroke(); }
+  if (arm > 0) { g.beginPath(); g.moveTo(-0.3, 0.5); g.lineTo(0.31, 0.5); g.lineTo(0.37, 0.6 + arm); g.lineTo(-0.36, 0.6 + arm); g.closePath(); g.fill(); }
+  g.restore();
+}
+function caveHand(x, y, s, o = {}) {
+  const frac = clamp(o.frac ?? 1), rot = o.rot ?? 0, flip = !!o.flip, key = o.key ?? 'hand' + Math.round(x) + ':' + Math.round(y);
+  if (frac > 0) caveSpray(x + Math.sin(rot) * s * 0.22, y - Math.cos(rot) * s * 0.22, s * (o.reach ?? 2.15), { c: o.c ?? CAVE.red, d: o.d, frac, key, cut: (g) => caveHandPath(g, x, y, s, rot, flip, o.arm ?? 1.25) });
+  if (o.lift != null && o.lift > 0 && o.lift < 1 && CAVE_ON) {
+    const u = o.lift;
+    CAVE_ON.q.push(() => { ctx.save(); ctx.globalAlpha = 0.6 * (1 - u) ** 1.3; ctx.filter = `blur(${(3 + 16 * u).toFixed(1)}px)`; ctx.fillStyle = ctx.strokeStyle = '#100905'; caveHandPath(ctx, x + 26 * u, y + 44 * u, s * (1 + 0.3 * u), rot, flip, o.arm ?? 1.25); ctx.filter = 'none'; ctx.restore(); });
+  }
+}
+
+// ---------------------------------------------------------------------
+//  animals: simple side views in the cave manner — a rubbed body, a daubed back line and belly line, stick legs
+//  that taper as the finger dries, a few strokes for horns, mane and tail, an unpainted eye.
+//    caveAnimal(kind, x, y, s, o)   kind: 'deer' | 'bison' | 'horse' | 'babirusa' | 'anoa'
+//      (x, y) = the middle of the body, s = px per unit (a body is about 2.4 units long, legs reach y + 1.15 s)
+//      o: flip, c (the rubbed fill, or 'none'), line (the contour), d (fill thickness), frac (0..1: daubed on),
+//         step (the leg pose, 0 | 1; default caveStep(0.5)), ghost (false = no second, fainter set of legs),
+//         w (line width as a share of s, 0.085), key
+//    The second set of legs is the old trick of the many-legged cave animals: in the flicker they seem to run.
+// ---------------------------------------------------------------------
+const CAVE_ANIMALS = {
+  deer: {
+    back: [[-1.12, 0.0], [-1.06, -0.22], [-0.8, -0.36], [-0.3, -0.4], [0.2, -0.38], [0.52, -0.46], [0.72, -0.78], [0.86, -1.12], [0.98, -1.3], [1.16, -1.33], [1.36, -1.2], [1.52, -1.04]],
+    belly: [[1.52, -1.04], [1.42, -0.94], [1.22, -0.96], [1.08, -0.82], [1.0, -0.45], [0.92, -0.05], [0.78, 0.22], [0.3, 0.3], [-0.3, 0.27], [-0.74, 0.22], [-1.0, 0.12], [-1.1, -0.06]],
+    legs: [[[[0.74, 0.18], [0.78, 0.66], [0.72, 1.18]], [[0.54, 0.22], [0.48, 0.7], [0.54, 1.18]], [[-0.8, 0.18], [-0.98, 0.62], [-0.86, 1.18]], [[-0.6, 0.22], [-0.72, 0.66], [-0.58, 1.18]]],
+           [[[0.74, 0.18], [1.0, 0.6], [1.2, 1.04]], [[0.54, 0.22], [0.38, 0.7], [0.2, 1.12]], [[-0.8, 0.18], [-1.04, 0.6], [-1.32, 1.0]], [[-0.6, 0.22], [-0.56, 0.7], [-0.34, 1.14]]]],
+    extra: [{ P: [[1.0, -1.3], [0.9, -1.7], [0.66, -2.05], [0.5, -2.3]], w: 0.62 }, { P: [[0.93, -1.6], [1.2, -1.86]], w: 0.5 }, { P: [[0.78, -1.9], [1.02, -2.2]], w: 0.5 },
+            { P: [[1.08, -1.32], [1.22, -1.7], [1.14, -2.08], [1.04, -2.3]], w: 0.62 }, { P: [[1.21, -1.76], [1.46, -1.96]], w: 0.5 }, { P: [[0.96, -1.28], [0.8, -1.42]], w: 0.55 }],
+    eye: [1.2, -1.19],
+  },
+  bison: {
+    back: [[-1.26, 0.2], [-1.22, -0.1], [-1.05, -0.32], [-0.6, -0.44], [-0.18, -0.56], [0.16, -0.86], [0.5, -1.02], [0.82, -0.94], [1.02, -0.7], [1.12, -0.4], [1.22, -0.08], [1.32, 0.2], [1.27, 0.36]],
+    belly: [[1.27, 0.36], [1.1, 0.42], [0.99, 0.36], [0.95, 0.62], [0.83, 0.46], [0.7, 0.56], [0.3, 0.5], [-0.3, 0.42], [-0.8, 0.38], [-1.1, 0.34], [-1.24, 0.1]],
+    legs: [[[[0.62, 0.5], [0.66, 0.82], [0.6, 1.1]], [[0.4, 0.5], [0.36, 0.84], [0.42, 1.1]], [[-0.92, 0.36], [-1.04, 0.72], [-0.94, 1.1]], [[-0.7, 0.4], [-0.78, 0.76], [-0.66, 1.1]]],
+           [[[0.62, 0.5], [0.84, 0.8], [1.0, 1.04]], [[0.4, 0.5], [0.28, 0.84], [0.12, 1.06]], [[-0.92, 0.36], [-1.12, 0.72], [-1.32, 1.0]], [[-0.7, 0.4], [-0.66, 0.78], [-0.48, 1.08]]]],
+    extra: [{ P: [[0.98, -0.66], [1.02, -0.92], [1.2, -1.04]], w: 0.8 }, { P: [[-1.22, -0.1], [-1.42, -0.3], [-1.52, -0.66]], w: 0.5 }, { P: [[0.95, 0.56], [0.92, 0.8]], w: 0.6 }],
+    mane: [4, 7, 0.13, 1], eye: [1.04, -0.28],
+  },
+  horse: {
+    back: [[-1.16, 0.0], [-1.12, -0.2], [-0.9, -0.36], [-0.4, -0.36], [0.1, -0.34], [0.45, -0.5], [0.7, -0.86], [0.9, -1.08], [1.1, -1.1], [1.3, -0.88], [1.42, -0.66]],
+    belly: [[1.42, -0.66], [1.3, -0.57], [1.12, -0.7], [1.0, -0.5], [0.9, -0.1], [0.78, 0.24], [0.3, 0.44], [-0.3, 0.44], [-0.8, 0.32], [-1.08, 0.12], [-1.16, -0.06]],
+    legs: [[[[0.7, 0.24], [0.74, 0.62], [0.68, 1.04]], [[0.5, 0.3], [0.46, 0.66], [0.5, 1.04]], [[-0.84, 0.28], [-0.98, 0.62], [-0.88, 1.04]], [[-0.64, 0.32], [-0.72, 0.66], [-0.6, 1.04]]],
+           [[[0.7, 0.24], [0.94, 0.58], [1.1, 0.94]], [[0.5, 0.3], [0.36, 0.66], [0.2, 0.98]], [[-0.84, 0.28], [-1.06, 0.6], [-1.3, 0.9]], [[-0.64, 0.32], [-0.6, 0.68], [-0.4, 1.0]]]],
+    extra: [{ P: [[-1.14, -0.18], [-1.34, 0.1], [-1.4, 0.56]], w: 0.6 }, { P: [[0.94, -1.1], [0.86, -1.26]], w: 0.5 }],
+    mane: [5, 8, 0.16, 1], eye: [1.12, -0.92],
+  },
+  babirusa: {   // a barrel body, a low head with a long snout, and the tusks that curl up and back over it
+    back: [[-1.2, 0.05], [-1.15, -0.3], [-0.85, -0.55], [-0.3, -0.66], [0.25, -0.6], [0.62, -0.5], [0.82, -0.36], [1.0, -0.38], [1.18, -0.3], [1.45, -0.12], [1.7, 0.02]],
+    belly: [[1.7, 0.02], [1.7, 0.16], [1.45, 0.2], [1.15, 0.24], [0.95, 0.36], [0.75, 0.52], [0.2, 0.6], [-0.4, 0.58], [-0.9, 0.46], [-1.14, 0.28], [-1.2, 0.05]],
+    legs: [[[[0.62, 0.5], [0.66, 0.78], [0.62, 1.02]], [[0.42, 0.54], [0.38, 0.8], [0.42, 1.02]], [[-0.86, 0.46], [-0.94, 0.76], [-0.88, 1.02]], [[-0.66, 0.5], [-0.7, 0.8], [-0.64, 1.02]]],
+           [[[0.62, 0.5], [0.8, 0.76], [0.92, 0.98]], [[0.42, 0.54], [0.3, 0.8], [0.18, 1.0]], [[-0.86, 0.46], [-1.02, 0.74], [-1.2, 0.94]], [[-0.66, 0.5], [-0.62, 0.8], [-0.48, 1.0]]]],
+    extra: [{ P: [[1.42, -0.12], [1.52, -0.44], [1.36, -0.66], [1.14, -0.6]], w: 0.62 }, { P: [[1.54, 0.1], [1.66, -0.2], [1.56, -0.42]], w: 0.5 }, { P: [[0.92, -0.38], [0.82, -0.64]], w: 0.6 }, { P: [[-1.2, 0.0], [-1.38, 0.14], [-1.36, 0.44]], w: 0.42 }],
+    mane: [2, 5, 0.15, 1], eye: [1.12, -0.12],
+  },
+  anoa: {
+    back: [[-1.1, 0.12], [-1.08, -0.2], [-0.86, -0.4], [-0.3, -0.44], [0.3, -0.46], [0.62, -0.52], [0.84, -0.7], [1.02, -0.78], [1.2, -0.64], [1.38, -0.4], [1.44, -0.24]],
+    belly: [[1.44, -0.24], [1.34, -0.14], [1.16, -0.2], [1.0, -0.1], [0.9, 0.2], [0.74, 0.4], [0.2, 0.44], [-0.4, 0.42], [-0.86, 0.36], [-1.06, 0.26], [-1.1, 0.08]],
+    legs: [[[[0.66, 0.38], [0.7, 0.72], [0.64, 1.08]], [[0.46, 0.42], [0.42, 0.76], [0.46, 1.08]], [[-0.8, 0.34], [-0.92, 0.7], [-0.82, 1.08]], [[-0.6, 0.38], [-0.68, 0.74], [-0.56, 1.08]]],
+           [[[0.66, 0.38], [0.88, 0.7], [1.02, 1.0]], [[0.46, 0.42], [0.32, 0.76], [0.18, 1.04]], [[-0.8, 0.34], [-1.0, 0.68], [-1.2, 0.98]], [[-0.6, 0.38], [-0.56, 0.74], [-0.38, 1.04]]]],
+    extra: [{ P: [[1.0, -0.78], [0.72, -1.02], [0.5, -1.14]], w: 0.6 }, { P: [[1.08, -0.8], [0.86, -1.08], [0.68, -1.24]], w: 0.55 }, { P: [[-1.08, -0.18], [-1.22, 0.1], [-1.2, 0.46]], w: 0.42 }, { P: [[0.9, -0.74], [0.78, -0.84]], w: 0.5 }],
+    eye: [1.16, -0.52],
+  },
+};
+function caveAnimalGeo(kind, x, y, s, flip) {
+  return caveMemo(['ani', kind, x.toFixed(1), y.toFixed(1), s.toFixed(2), flip ? 1 : 0].join('|'), () => {
+    const A = CAVE_ANIMALS[kind], fl = flip ? -1 : 1, T = (P) => P.map(([u, v]) => [x + u * s * fl, y + v * s]);
+    const back = T(caveSmooth(A.back)), belly = T(caveSmooth(A.belly)), out = { back, belly, body: [...back, ...belly], legs: A.legs.map((set) => set.map((l) => T(caveSmooth(l, false, 1)))), extra: (A.extra || []).map((e) => ({ ...e, P: T(caveSmooth(e.P, false, 1)) })), mane: [], eye: A.eye ? T([A.eye])[0] : null };
+    if (A.mane) { const [i0, i1, len, dir] = A.mane, seg0 = T(caveSmooth(A.back.slice(i0, i1 + 1))), L = pathLen(seg0), n = Math.max(4, Math.round(L / (s * 0.085))), R = RNG('cavemane', kind);
+      for (let i = 0; i < n; i++) { const p = pointAt(seg0, (i + 0.5) / n), q = pointAt(seg0, Math.min(1, (i + 0.5) / n + 0.02)), tx = q[0] - p[0], ty = q[1] - p[1], tl = Math.hypot(tx, ty) || 1, nx = ty / tl * dir * fl, ny = -tx / tl * dir * fl, l = len * s * R.r(0.75, 1.2), lean = R.r(-0.5, -0.1) * fl; out.mane.push([[p[0] - nx * l * 0.15, p[1] - ny * l * 0.15], [p[0] + nx * l + tx / tl * l * lean, p[1] + ny * l + ty / tl * l * lean]]); } }
+    return out;
+  });
+}
+function caveAnimal(kind, x, y, s, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0) return;
+  if (!CAVE_ON) return cavePaint(() => caveAnimal(kind, x, y, s, o), { over: true });
+  const G = caveAnimalGeo(kind, x, y, s, !!o.flip), key = o.key ?? kind, line = o.line ?? CAVE.black, fill = o.c ?? CAVE.yellow, w = (o.w ?? 0.085) * s, ph = (a, b) => clamp((frac - a) / (b - a));
+  if (fill !== 'none') caveRub(G.body, { c: fill, d: o.d ?? 0.52, frac: ph(0.42, 0.8), key: key + 'f' });
+  caveDaub(G.back, { c: line, w, frac: ph(0, 0.4), key: key + 'b', dip: s * 2.6, dry: 0.55 });
+  caveDaub(G.belly, { c: line, w: w * 0.9, frac: ph(0.26, 0.58), key: key + 'u', dip: s * 2.6, dry: 0.6 });
+  const pose = ((o.step ?? caveStep(0.5)) % 2 + 2) % 2;
+  G.legs[pose].forEach((P, i) => {
+    if (frac >= 1 && o.ghost !== false) caveDaub(G.legs[1 - pose][i], { c: line, w: w * 0.66, d: 0.52, key: key + 'g' + i + (1 - pose), dip: s * 1.3, dry: 0.7 });
+    caveDaub(P, { c: line, w: w * 0.8, frac: ph(0.5 + i * 0.06, 0.64 + i * 0.06), key: key + 'l' + i + pose, dip: s * 1.3, dry: 0.72 });
+  });
+  G.extra.forEach((e, i) => caveDaub(e.P, { c: e.c === 'white' ? CAVE.white : line, w: w * (e.w ?? 0.6), frac: ph(0.76 + i * 0.03, 0.88 + i * 0.03), key: key + 'x' + i, dry: 0.5 }));
+  G.mane.forEach((P, i) => caveDaub(P, { c: o.mane ?? CAVE.black, w: w * 0.5, frac: ph(0.8, 0.9) >= (i + 1) / G.mane.length ? 1 : 0, key: key + 'm' + i, wob: 0 }));
+  if (G.eye && frac >= 0.95) caveDot(G.eye[0], G.eye[1], w * 0.3, { c: fill === 'none' || line === CAVE.black ? CAVE.black : CAVE.white, key: key + 'e' });
+}
+// a stick hunter with a spear. (x, y) = the middle, s = the height in px. o: c, flip, step, frac, spear (false), throw (px the spear has flown), key
+function caveHunter(x, y, s, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0) return;
+  const fl = o.flip ? -1 : 1, c = o.c ?? CAVE.black, key = o.key ?? 'hunter' + Math.round(x), w = s * 0.085, pose = ((o.step ?? caveStep(0.5)) % 2 + 2) % 2, T = (P) => P.map(([u, v]) => [x + u * s * fl, y + v * s]), ph = (a, b) => clamp((frac - a) / (b - a));
+  const legs = [[[[0.02, 0.1], [-0.11, 0.3], [-0.15, 0.5]], [[0.02, 0.1], [0.13, 0.3], [0.19, 0.5]]], [[[0.02, 0.1], [-0.2, 0.25], [-0.31, 0.45]], [[0.02, 0.1], [0.2, 0.24], [0.17, 0.48]]]];
+  caveDaub(T([[0, -0.25], [0.02, 0.1]]), { c, w: w * 1.15, frac: ph(0, 0.3), key: key + 'b', wob: 0 });
+  if (frac > 0.25) caveDot(x + 0.01 * s * fl, y - 0.36 * s, s * 0.085, { c, key: key + 'h' });
+  legs[pose].forEach((P, i) => { if (frac >= 1 && o.ghost !== false) caveDaub(T(legs[1 - pose][i]), { c, w: w * 0.6, d: 0.5, key: key + 'g' + i + (1 - pose), wob: 0 }); caveDaub(T(P), { c, w: w * 0.85, frac: ph(0.3 + i * 0.12, 0.55 + i * 0.12), key: key + 'l' + i + pose, wob: 0, dry: 0.7, dip: s * 0.6 }); });
+  caveDaub(T([[0, -0.2], [-0.14, -0.3], [-0.2, -0.43]]), { c, w: w * 0.8, frac: ph(0.6, 0.78), key: key + 'a1', wob: 0 });
+  caveDaub(T([[0, -0.2], [0.16, -0.17], [0.27, -0.25]]), { c, w: w * 0.8, frac: ph(0.7, 0.88), key: key + 'a2', wob: 0 });
+  if (o.spear !== false) { const th = (o.throw ?? 0) / s, a = [-0.46 + th, -0.5 - th * 0.12], b = [0.46 + th, -0.37 - th * 0.12]; caveDaub(T([a, b]), { c, w: w * 0.5, frac: ph(0.85, 1), key: key + 's', wob: 0, dry: 0.3 }); }
+}
+
+// ---------------------------------------------------------------------
+//  the hero: Rusa, a small red-ochre stag — red body, red line, antlers, an unpainted eye. Red ochre belongs to the
+//  living: the hero and the hands. caveHero(x, y, r, o): r = half its size; o: frac, flip, step, key. Sets SPARK_AT.
+// ---------------------------------------------------------------------
+function caveHero(x, y, r, o = {}) {
+  const s = r * 0.72;
+  caveAnimal('deer', x - 0.15 * s * (o.flip ? -1 : 1), y + 0.5 * s, s, { c: CAVE.red, line: CAVE.red, d: 0.66, w: 0.1, key: 'rusa', ...o });
+  SPARK_AT = toScreen(x, y);
+}
+function caveHeroPts(x, y, r) { const s = r * 0.72, A = CAVE_ANIMALS.deer; return [...caveSmooth(A.back), ...caveSmooth(A.belly)].map(([u, v]) => [x - 0.15 * s + u * s, y + 0.5 * s + v * s]); }
+
+// ---------------------------------------------------------------------
+//  lettering: rough capitals daubed with a finger, stroke by stroke (no font). `size` works like a font size:
+//  the caps are 0.72 * size tall. caveText(str, x, y, size, { c, frac, align, key, w, d, track }) — y = baseline.
+//  A transparent fillText of the same box is issued so tools/textcheck.mjs can see where the words are.
+// ---------------------------------------------------------------------
+const CAVE_ARC = (cx, cy, rx, ry, a0, a1, n = 8) => { const P = []; for (let i = 0; i <= n; i++) { const a = (a0 + (a1 - a0) * i / n) * DEG; P.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]); } return P; };
+const CAVE_GLYPH = {
+  A: [0.72, [[0, 1], [0.36, 0], [0.72, 1]], [[0.15, 0.64], [0.57, 0.64]]],
+  B: [0.62, [[0, 1], [0, 0]], [[0, 0], [0.34, 0], ...CAVE_ARC(0.34, 0.24, 0.22, 0.24, -90, 90, 6), [0, 0.48]], [[0, 0.48], [0.36, 0.48], ...CAVE_ARC(0.36, 0.74, 0.26, 0.26, -90, 90, 6), [0, 1]]],
+  C: [0.64, CAVE_ARC(0.36, 0.5, 0.35, 0.5, -42, -318, 12)],
+  D: [0.66, [[0, 1], [0, 0]], [[0, 0], [0.26, 0], ...CAVE_ARC(0.28, 0.5, 0.38, 0.5, -90, 90, 9), [0, 1]]],
+  E: [0.58, [[0.56, 0], [0, 0], [0, 1], [0.58, 1]], [[0, 0.5], [0.44, 0.5]]],
+  F: [0.56, [[0.56, 0], [0, 0], [0, 1]], [[0, 0.5], [0.42, 0.5]]],
+  G: [0.68, [...CAVE_ARC(0.36, 0.5, 0.35, 0.5, -42, -335, 12), [0.68, 0.56], [0.4, 0.56]]],
+  H: [0.66, [[0, 0], [0, 1]], [[0.66, 0], [0.66, 1]], [[0, 0.5], [0.66, 0.5]]],
+  I: [0.1, [[0.05, 0], [0.05, 1]]],
+  J: [0.5, [[0.5, 0], [0.5, 0.72], ...CAVE_ARC(0.26, 0.74, 0.24, 0.26, 0, 170, 6)]],
+  K: [0.64, [[0, 0], [0, 1]], [[0.6, 0], [0.03, 0.58]], [[0.22, 0.42], [0.64, 1]]],
+  L: [0.54, [[0, 0], [0, 1], [0.54, 1]]],
+  M: [0.82, [[0, 1], [0.04, 0], [0.41, 0.68], [0.78, 0], [0.82, 1]]],
+  N: [0.66, [[0, 1], [0, 0], [0.66, 1], [0.66, 0]]],
+  O: [0.72, CAVE_ARC(0.36, 0.5, 0.36, 0.5, -90, 275, 16)],
+  P: [0.6, [[0, 1], [0, 0]], [[0, 0], [0.34, 0], ...CAVE_ARC(0.34, 0.27, 0.25, 0.27, -90, 90, 6), [0, 0.54]]],
+  Q: [0.72, CAVE_ARC(0.36, 0.5, 0.36, 0.5, -90, 275, 16), [[0.44, 0.72], [0.74, 1.06]]],
+  R: [0.64, [[0, 1], [0, 0]], [[0, 0], [0.34, 0], ...CAVE_ARC(0.34, 0.27, 0.25, 0.27, -90, 90, 6), [0, 0.54]], [[0.26, 0.54], [0.64, 1]]],
+  S: [0.6, [...CAVE_ARC(0.31, 0.26, 0.28, 0.26, -30, -230, 8), ...CAVE_ARC(0.3, 0.74, 0.3, 0.26, -60, 150, 8)]],
+  T: [0.68, [[0, 0], [0.68, 0]], [[0.34, 0], [0.34, 1]]],
+  U: [0.66, [[0, 0], [0, 0.66], ...CAVE_ARC(0.33, 0.66, 0.33, 0.34, 180, 0, 8), [0.66, 0]]],
+  V: [0.7, [[0, 0], [0.35, 1], [0.7, 0]]],
+  W: [0.92, [[0, 0], [0.22, 1], [0.46, 0.3], [0.7, 1], [0.92, 0]]],
+  X: [0.66, [[0, 0], [0.66, 1]], [[0.66, 0], [0, 1]]],
+  Y: [0.68, [[0, 0], [0.34, 0.52], [0.68, 0]], [[0.34, 0.52], [0.34, 1]]],
+  Z: [0.64, [[0.02, 0], [0.62, 0], [0, 1], [0.64, 1]]],
+  0: [0.62, CAVE_ARC(0.31, 0.5, 0.31, 0.5, -90, 275, 16)],
+  1: [0.3, [[0, 0.22], [0.26, 0], [0.26, 1]]],
+  2: [0.6, [...CAVE_ARC(0.3, 0.27, 0.27, 0.27, -170, 30, 8), [0, 1], [0.6, 1]]],
+  3: [0.58, [...CAVE_ARC(0.27, 0.25, 0.27, 0.25, -150, 90, 8)], [...CAVE_ARC(0.27, 0.74, 0.31, 0.26, -90, 150, 8)]],
+  4: [0.66, [[0.48, 1], [0.48, 0], [0, 0.68], [0.66, 0.68]]],
+  5: [0.6, [[0.56, 0], [0.08, 0], [0.04, 0.44], ...CAVE_ARC(0.28, 0.68, 0.31, 0.3, -100, 150, 9)]],
+  6: [0.62, [[0.5, 0.02], [0.14, 0.4], ...CAVE_ARC(0.31, 0.7, 0.3, 0.29, -170, 190, 12)]],
+  7: [0.6, [[0, 0], [0.6, 0], [0.22, 1]]],
+  8: [0.6, [...CAVE_ARC(0.3, 0.25, 0.24, 0.24, 90, -270, 12), ...CAVE_ARC(0.3, 0.74, 0.3, 0.26, -90, 270, 12)]],
+  9: [0.62, [...CAVE_ARC(0.31, 0.3, 0.3, 0.29, 10, 370, 12), [0.48, 0.62], [0.14, 1]]],
+  '.': [0.1, [[0.03, 0.97], [0.07, 0.99]]], ',': [0.12, [[0.08, 0.92], [0.02, 1.14]]], '!': [0.1, [[0.05, 0], [0.05, 0.66]], [[0.03, 0.97], [0.07, 0.99]]],
+  '?': [0.54, [...CAVE_ARC(0.26, 0.25, 0.26, 0.25, -170, 70, 8), [0.26, 0.68]], [[0.24, 0.97], [0.28, 0.99]]],
+  '-': [0.4, [[0.02, 0.54], [0.38, 0.54]]], "'": [0.08, [[0.05, 0], [0.03, 0.24]]], ':': [0.1, [[0.03, 0.36], [0.07, 0.38]], [[0.03, 0.97], [0.07, 0.99]]],
+};
+function caveTextLay(str, size, track = 0.24) {
+  const h = size * 0.72, out = []; let x = 0;
+  for (const ch of String(str).toUpperCase()) { const g = CAVE_GLYPH[ch]; if (!g) { x += h * 0.5; continue; } out.push({ ch, x, g }); x += g[0] * h + track * h; }
+  return { g: out, w: Math.max(0, x - track * h), h };
+}
+const caveTextW = (str, size, track) => caveTextLay(str, size, track).w;
+function caveText(str, x, y, size, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0) return 0;
+  if (!CAVE_ON) { let w = 0; cavePaint(() => { w = caveText(str, x, y, size, o); }, { over: true }); return w; }
+  const L = caveTextLay(str, size, o.track), h = L.h, ax = o.align === 'center' ? -L.w / 2 : o.align === 'right' ? -L.w : 0, key = o.key ?? 'txt' + str, R = RNG('cavetext', key), w = o.w ?? size * 0.15;
+  ctx.save(); ctx.font = `900 ${size}px "Arial Black", Arial, sans-serif`; ctx.fillStyle = 'rgba(0,0,0,0)'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillText(String(str).toUpperCase(), x + ax, y, Math.max(1, L.w)); ctx.restore();   // for the text check only: draws nothing
+  let total = 0; for (const g of L.g) total += g.g.length - 1;
+  let k = frac * total, si = 0;
+  L.g.forEach((gl, gi) => {
+    const rot = R.n(0.045), dy = R.n(h * 0.035), sx = 1 + R.n(0.05), ox = x + ax + gl.x, gw = gl.g[0] * h, c0 = Math.cos(rot), s0 = Math.sin(rot);
+    for (let j = 1; j < gl.g.length; j++, si++) {
+      const f = clamp(k - si); if (f <= 0) continue;
+      const P = gl.g[j].map(([u, v]) => { const px = (u * h - gw / 2) * sx, py = (v - 0.5) * h; return [ox + gw / 2 + px * c0 - py * s0, y - h / 2 + dy + px * s0 + py * c0]; });
+      caveDaub(P, { c: o.c ?? CAVE.black, w, d: o.d ?? 1, frac: f, key: key + ':' + gi + ':' + j, wob: w * 0.07, dry: 0.28, dip: h * 2.6 });
+    }
+  });
+  return L.w;
+}
+
+// ---------------------------------------------------------------------
+//  the caption (through DEFER: after the camera, at screen size). Charcoal capitals daubed straight on the rock
+//  over a patch rubbed pale with white clay; one *word* in red ochre with a red finger stroke under it.
+//    caveCaption('WE WERE *HERE*', { x (CX), y (the baseline, 1420), w (800: it shrinks to fit), size (92), at (0.5), dur (0.7) })
+//  It thins out to grain as a bridge starts and is gone while the light is closed.
+// ---------------------------------------------------------------------
+function caveBridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - seg(TT, r.tc - d, r.tc - d + 0.25);
+    if (TT >= r.tc && TT < r.tc + d) return 0;
+  }
+  return 1;
+}
+function caveCaptionNow(str, o = {}) {
+  const at = E0 + (o.at ?? 0.5), k = caveBridgeK(); if (k <= 0.02 || TT < at - 1e-6) return;
+  const cx = o.x ?? (typeof CX !== 'undefined' ? CX : W / 2), y = o.y ?? 1420, maxW = o.w ?? 800; let size = o.size ?? 92;
+  const toks = String(str).toUpperCase().split('*').map((s, i) => ({ s: s.trim(), hi: i % 2 === 1 })).filter((t) => t.s);
+  const lay = () => { let tw = 0; toks.forEach((t, i) => { t.w = caveTextW(t.s, size); tw += t.w + (i ? size * 0.42 : 0); }); return tw; };
+  let tw = lay(); if (tw > maxW) { size *= maxW / tw; tw = lay(); }
+  const h = size * 0.72, x0 = cx - tw / 2, key = 'cap' + str, u = caveIn(at, o.dur ?? 0.7), nTok = toks.length;
+  cavePaint(() => {
+    if (o.ground !== false) {   // the wall is rubbed pale first, so charcoal reads on it
+      const R = RNG('cavecapg', key), P = []; for (let i = 0; i < 26; i++) { const a = i / 26 * TAU; P.push([cx + Math.cos(a) * (tw / 2 + 64) * (1 + R.n(0.04)), y - h * 0.45 + Math.sin(a) * h * 1.18 * (1 + R.n(0.1))]); }
+      caveRub(P, { c: CAVE.white, d: 0.5 * k, edge: 30, frac: caveIn(at - 0.25, 0.35), key: key + 'g', a: 0.05 });
+    }
+    let xx = x0;
+    toks.forEach((t, i) => {
+      if (i) xx += size * 0.42;
+      const f = clamp(u * nTok - i);
+      caveText(t.s, xx, y, size, { c: t.hi ? CAVE.red : CAVE.black, frac: f, d: k, key: key + i });
+      if (t.hi) caveDaub([[xx - 4, y + h * 0.34], [xx + t.w * 0.5, y + h * 0.3], [xx + t.w + 6, y + h * 0.33]], { c: CAVE.red, w: size * 0.1, d: k, frac: caveIn(at + (o.dur ?? 0.7) * (i + 1) / nTok, 0.2), key: key + 'ul', dry: 0.7, dip: t.w + 40 });
+      xx += t.w;
+    });
+  }, { over: true, box: [x0 - 120, y - h * 2.1, x0 + tw + 120, y + h * 1.4] });
+}
+const caveCaption = (str, o = {}) => { const f = () => caveCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---------------------------------------------------------------------
+//  the light: one unseen flame. caveLight() -> { x, y, r, k }: where the pool is this frame (it wanders slowly,
+//  jumps a little on every 2s step, dips now and then), caveLightAt(L, x, y) -> 0..1 how lit a point is.
+// ---------------------------------------------------------------------
+const CAVE_FALL = [[0, 1], [0.3, 0.98], [0.5, 0.88], [0.66, 0.62], [0.8, 0.34], [0.92, 0.12], [1, 0.03]], CAVE_SQ = 0.74;   // brightness by distance / r; the pool is taller than wide
+function caveLight() {
+  const R = RNG('caveflick', B), dip = R.f() < 0.14 ? 0.1 : 0, k = 1 - 0.07 * R.f() - dip;
+  let x = W * 0.5 + 120 * Math.sin(TT * 0.83 + 0.4) + 40 * Math.sin(TT * 2.1 + 1), y = H * 0.47 + 100 * Math.sin(TT * 0.61 + 1.3), r = 1180;
+  if (CAVE_AIM) { x = CAVE_AIM.x; y = CAVE_AIM.y; r = CAVE_AIM.r ?? r; }
+  if (CAVE_BR) { x = lerp(x, CAVE_BR.x, CAVE_BR.w); y = lerp(y, CAVE_BR.y, CAVE_BR.w); }
+  return { x: x + R.n(16), y: y + R.n(16), r: r * (0.95 + 0.07 * R.f()) * (1 - dip * 0.5), k };
+}
+function caveLightAt(L, x, y) {
+  const t = Math.hypot((x - L.x) / CAVE_SQ, y - L.y) / L.r; if (t >= 1) return 0.03 * L.k;
+  for (let i = 1; i < CAVE_FALL.length; i++) if (t <= CAVE_FALL[i][0]) { const a = CAVE_FALL[i - 1], b = CAVE_FALL[i]; return lerp(a[1], b[1], (t - a[0]) / (b[0] - a[0])) * L.k; }
+  return 0.03;
+}
+function caveTorch(L) {
+  ctx.save(); screen();
+  ctx.globalCompositeOperation = 'multiply'; ctx.translate(L.x, L.y); ctx.scale(CAVE_SQ, 1);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, L.r), warm = [[255, 245, 226], [255, 238, 212], [252, 218, 176], [238, 184, 130], [216, 148, 94], [182, 108, 62], [130, 72, 38]];
+  CAVE_FALL.forEach(([t, v], i) => { const c = warm[i].map((q) => Math.round(q * v * L.k)); g.addColorStop(t, `rgb(${c[0]},${c[1]},${c[2]})`); });
+  ctx.fillStyle = g; ctx.fillRect(-(W + L.r) * 2, -(H + L.r) * 2, (W + L.r) * 4, (H + L.r) * 4);
+  ctx.restore();
+}
+// dust in the light and a spark or two (closed-form in TT; nothing is carried between frames)
+function caveAir(L) {
+  ctx.save(); screen(); ctx.globalCompositeOperation = 'lighter';
+  const [fr, fg, fb] = caveRGB(CAVE.flame);
+  for (let i = 0; i < 46; i++) {
+    const R = RNG('cavemote', i), x0 = R.r(0, W), y0 = R.r(0, H), vx = R.n(16), vy = R.r(-22, -4), f = R.r(0.5, 1.4), p = R.r(0, TAU), s = R.r(1.3, 3.4), a0 = R.r(0.1, 0.42);
+    const x = mod(x0 + vx * TT + 26 * Math.sin(TT * f + p), W), y = mod(y0 + vy * TT + 14 * Math.cos(TT * f * 0.7 + p), H), a = a0 * caveLightAt(L, x, y) * (0.6 + 0.4 * Math.sin(TT * 2.2 * f + p));
+    if (a < 0.02) continue;
+    ctx.fillStyle = `rgba(255,${218 + (i % 3) * 10},${170 + (i % 4) * 12},${a.toFixed(3)})`; ctx.beginPath(); ctx.arc(x, y, s, 0, TAU); ctx.fill();
+  }
+  for (let i = 0; i < 3; i++) {
+    const life = 1.7 + i * 0.35, t = TT + i * 0.77 + 0.3, n = Math.floor(t / life), u = t / life - n, R = RNG('cavespark', i, n), x0 = R.r(W * 0.2, W * 0.8), sw = R.r(40, 110), ph = R.r(0, TAU), top = R.r(0.42, 0.62);
+    const at = (v) => [x0 + sw * Math.sin(v * 5 + ph) * v + 60 * v * (i - 1), H * 0.93 - H * top * (1 - (1 - v) ** 1.7)];
+    const fl = RNG('cavesparkf', i, B).r(0.55, 1), a = fl * Math.min(1, u * 8) * (1 - u) ** 0.7; if (a < 0.03) continue;
+    const [x, y] = at(u), [px, py] = at(Math.max(0, u - 0.035));
+    ctx.strokeStyle = `rgba(${fr},${fg},${fb},${(a * 0.55).toFixed(3)})`; ctx.lineWidth = 2.6; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(x, y); ctx.stroke();
+    const g = ctx.createRadialGradient(x, y, 0, x, y, 16); g.addColorStop(0, `rgba(255,200,120,${(a * 0.5).toFixed(3)})`); g.addColorStop(1, 'rgba(255,160,60,0)'); ctx.fillStyle = g; ctx.fillRect(x - 16, y - 16, 32, 32);
+    ctx.fillStyle = `rgba(255,236,190,${a.toFixed(3)})`; ctx.beginPath(); ctx.arc(x, y, 2.6, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+// a picture seen in a pool of light shaped like outline P; everything else is left in near-darkness
+function caveLit(P, src, w = 1, pad = 46) {
+  const [cx, cy, r] = caveCen(P), k = (r + pad) / (r || 1), m = caveCanvas('cave-mask'), g = m.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1; g.clearRect(0, 0, W, H);
+  g.filter = 'blur(26px)'; g.fillStyle = '#000'; cavePath(g, P.map(([x, y]) => [cx + (x - cx) * k, cy + (y - cy) * k])); g.fill(); g.filter = 'none';
+  g.globalCompositeOperation = 'source-in'; g.drawImage(src, 0, 0); g.globalCompositeOperation = 'source-over';
+  ctx.save(); screen(); ctx.globalAlpha = 0.085; ctx.drawImage(src, 0, 0); ctx.globalAlpha = 1; ctx.drawImage(m, 0, 0); ctx.restore();
+  CAVE_BR = { x: cx, y: cy, w };
+}
+function caveOnLayer(fn) { const lay = caveCanvas('cave-hook'), g = lay.getContext('2d'), keep = ctx; g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'; ctx = g; try { fn(); } finally { ctx = keep; } return lay; }
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md). A bridge is done with light: the pool closes onto the
+//  bridge object and the rest of the wall falls dark; in the dark the object is repainted as its counterpart
+//  (a bridge shape may carry `spray: { x, y, r, cut(g) }` to say it is a blown cloud round a covered shape, e.g. a
+//  hand); then the light opens on the new wall.
+// =====================================================================
+const STYLE = {
+  name: 'cave-painting',
+  paper: CAVE.rock,
+  backdrop() { fillAll(CAVE.dark); },                                        // the unlit cave; the blended colour has no use here
+  window(P, key, src, o = {}) { caveLit(P, src, o.phase === 'grow' ? 1 - (o.u ?? 0) : (o.u ?? 1)); },
+  blob(P, c, key, u = 0, o = {}) {
+    const br = typeof BRIDGES !== 'undefined' ? BRIDGES.find((r) => 'morph' + r.tc === key) : null, sa = br && br.A(), sb = br && br.B(), [cx, cy, r] = caveCen(P);
+    const wall = caveWallOf(u < 0.5 ? o.eraA : o.eraB), spA = sa && sa.spray, spB = sb && sb.spray, col = spB && !spA ? sa.c : spA && !spB ? sb.c : c;
+    const lay = caveOnLayer(() => cavePaint(() => {
+      const kShape = spB && !spA ? (1 - u) ** 1.4 : spA && !spB ? u ** 1.4 : 1, kSpray = spB && !spA ? u : spA && !spB ? 1 - u : spA && spB ? 1 : 0;
+      if (kShape > 0.03) caveShape(P, { c: col, k: kShape, key: 'disc' });
+      if (kSpray > 0) { const sp = spB || spA, [sx, sy] = caveCen((spB ? sb : sa).P), dx = cx - sx, dy = cy - sy; caveSpray(sp.x + dx, sp.y + dy, sp.r, { c: (spB ? sb : sa).c, frac: Math.max(0.05, kSpray), key: sp.key, cut: sp.cut ? (g) => { g.save(); g.translate(dx, dy); sp.cut(g); g.restore(); } : null }); }
+    }, { wall }));
+    caveLit(P, lay, 1, spA || spB ? 46 + 60 * (spB ? u : 1 - u) : 46);
+  },
+  hero(x, y, r, o = {}) { const lay = caveOnLayer(() => cavePaint(() => caveHero(x, y, r, { step: 0 }))); caveLit(caveDiscPts(x, y, r * 1.5, 30), lay, 1); },
+  heroColor: CAVE.red,
+  heroPts(x, y, r) { return caveHeroPts(x, y, r); },
+  // the torchlight over the finished frame: a warm pool that falls to near-black, flickering on 2s, then the air
+  post() { const L = caveLight(); caveTorch(L); caveAir(L); CAVE_AIM = null; CAVE_BR = null; },
+  ones: false,
+};
+// =====================================================================
+//  SCENES — cave-painting demo. World coordinates 1080x1920; time TT on 2s. Everything is drawn inside cavePaint:
+//  `ctx` is the pigment layer and every mark is a daub, a rub or blown pigment. Content inside x 60-940, y 250-1300
+//  (the caption owns y 1330-1460).
+// =====================================================================
+const cu = TIMELINE.cues;
+// the wall: one stretch of limestone for both eras, with two swellings the big animals are hung on
+caveDefWall('wall', { bulges: [[470, 700, 250, 150, 0.5], [340, 1080, 260, 130, 0.42]] });
+// the bridge objects: nothing else may come within ~80px of them at the bridge, or it shows in the pool of light
+const DISC = { x: 745, y: 400, r: 104 };
+const HAND0 = { x: 700, y: 470, s: 96 };
+const HALO = { x: HAND0.x, y: HAND0.y - HAND0.s * 0.22, r: HAND0.s * 1.5, spray: { x: HAND0.x, y: HAND0.y - HAND0.s * 0.22, r: HAND0.s * 2.15, key: 'hand0', cut: (g) => caveHandPath(g, HAND0.x, HAND0.y, HAND0.s, 0, false) } };
+const DOTS1 = [[790, 660], [834, 648], [878, 652], [920, 668], [806, 716], [850, 706], [894, 714]].map(([x, y], i) => [x, y, 13 - (i % 3)]);
+const DOTS2 = [[250, 1050], [306, 1030], [364, 1040], [300, 1104], [360, 1112], [424, 1090], [470, 1040]].map(([x, y], i) => [x - 54, y, 13 - (i % 2) * 2]);   // white clay dots on the babirusa's flank
+// the torch: a slow path through a few stations (eased), so different parts of the wall light up
+const torch = (keys) => { let i = 0; while (i < keys.length - 2 && TT >= keys[i + 1][0]) i++; const a = keys[i], b = keys[i + 1], u = EZ.io(seg(TT, a[0], b[0])); caveAim(lerp(a[1], b[1], u) + 22 * Math.sin(TT * 2.3), lerp(a[2], b[2], u) + 18 * Math.sin(TT * 1.7 + 1)); };
+
+// ---- era 1: the hunt
+function sceneHunt() {
+  torch([[0, 640, 640], [0.9, 470, 860], [1.8, 560, 1010], [2.4, 620, 900], [3, 700, 620]]);
+  const step = TT >= cu.spear ? caveStep(0.25) : 0;                                      // once the spear flies, the legs change on every eighth
+  cavePaint(() => {
+    caveDisc(DISC.x, DISC.y, DISC.r, { frac: caveIn(cu.disc, 0.5) });                    // a rubbed red disc, ringed with one stroke of the finger
+    caveAnimal('bison', 400, 800, 205, { c: CAVE.yellow, frac: caveIn(cu.bison, 1.1), step, key: 'bison' });
+    caveAnimal('horse', 235, 452, 92, { c: CAVE.umber, d: 0.42, frac: caveIn(cu.horse, 0.7), step: step + 1, key: 'horse' });
+    caveDots(DOTS1, { c: CAVE.red, frac: caveIn(cu.dots, 0.45), key: 'd1' });            // finger dots, one per sixteenth
+    [0, 1].forEach((i) => caveHunter(165 + i * 150, 1160 + i * 36, 176 - i * 14, { frac: caveIn(cu.hunters + i * 0.15, 0.45), step: step + i, spear: i === 0 || TT < cu.spear, throw: i === 0 ? 0 : 0, key: 'hun' + i }));
+    if (TT >= cu.spear) { const u = caveIn(cu.spear, 0.5), x = lerp(400, 600, EZ.o2(u)), y = 1128 - 34 * Math.sin(u * Math.PI) + 30 * u; caveDaub([[x - 70, y + 10 - 20 * u], [x + 70, y - 10 + 20 * u]], { c: CAVE.black, w: 7.5, wob: 0, dry: 0.3, key: 'spear' }); }   // the thrown spear
+    caveHero(790, 1070, 142, { frac: caveIn(cu.stag, 0.8), step });                      // Rusa, the red stag
+  });
+  caveCaption('We *hunted*', { at: 0.6 });
+}
+
+// ---- era 2: the hands
+function sceneHands() {
+  torch([[3, 700, 560], [3.7, 600, 720], [4.6, 500, 980], [5.4, 560, 860], [6, 600, 760]]);
+  const step = caveStep(0.5);
+  cavePaint(() => {
+    caveHand(HAND0.x, HAND0.y, HAND0.s, { key: 'hand0', lift: caveIn(cu.lift, 0.33) });                               // the bridge left it: the hand is lifted
+    [[330, 470, 90, -0.28, false, cu.hand1], [885, 735, 72, 0.3, true, cu.hand2], [470, 760, 84, 0.12, true, cu.hand3]].forEach(([x, y, s, rot, flip, t], i) =>
+      caveHand(x, y, s, { rot, flip, frac: caveIn(t, 0.45), lift: caveIn(t + 0.45, 0.3), key: 'hand' + (i + 1) }));   // blown breath by breath round a hand
+    caveAnimal('babirusa', 318, 1092, 176, { c: CAVE.umber, line: CAVE.black, d: 0.5, frac: caveIn(cu.pig, 1.0), step, key: 'pig' });
+    caveAnimal('anoa', 190, 800, 78, { c: CAVE.yellow, d: 0.45, frac: caveIn(cu.anoa, 0.6), step: step + 1, key: 'anoa' });
+    caveDots(DOTS2, { c: CAVE.white, frac: caveIn(cu.dots2, 0.45), key: 'd2' });
+    caveHero(790, 1070, 142, { step });                                                                               // the stag is still on the wall; in the flicker it walks
+  });
+  caveCaption('We were *here*', { at: 0.9 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — cave-painting demo (read by kit/morph.js). No camera: the wall is fixed, the light moves.
+// =====================================================================
+const ERA_BG = [CAVE.rock, CAVE.rock];
+const BRIDGES = [
+  // the rubbed red disc -> the blown halo of the first hand stencil (both round, about the same size)
+  { tc: 3.0, A: () => ({ P: caveDiscPts(DISC.x, DISC.y, DISC.r), c: CAVE.red }), B: () => ({ P: caveDiscPts(HALO.x, HALO.y, HALO.r), c: CAVE.red, spray: HALO.spray }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — cave-painting demo (inside buildScore(); see kit/score-head.js). Deep in a cave: a low skin
+  // drum, a slow breath, a bone flute in A minor pentatonic, the fire crackling throughout; every daub is a dry
+  // finger scrape, blown pigment is a short puff of breath.
+  const T = TIMELINE, q = T.cues;
+  const drum = (t, vel, hi = false) => { const o = osc('sine', hi ? 150 : 96, t, t + 0.6); o.frequency.exponentialRampToValueAtTime(hi ? 88 : 52, t + 0.22); const g = ac.createGain(); env(g, t, 0.004, vel, hi ? 0.3 : 0.5); o.connect(g); out(g, hi ? 0.15 : -0.1, 0.3); noiseHit(t, 0.05, 'lowpass', hi ? 900 : 480, 0.8, vel * 0.5, 0, 0.25); };
+  const breath = (t0, t1, vel, f = 700, pan = 0) => { const src = ac.createBufferSource(); src.buffer = noise; src.loop = true; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.9; bp.frequency.setValueAtTime(f * 0.7, t0); bp.frequency.linearRampToValueAtTime(f * 1.25, (t0 + t1) / 2); bp.frequency.linearRampToValueAtTime(f * 0.8, t1); const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, (t0 + t1) / 2); g.gain.exponentialRampToValueAtTime(0.0001, t1); src.connect(bp); bp.connect(g); out(g, pan, 0.5); src.start(t0, (t0 * 1.7) % 1.5); src.stop(t1 + 0.05); };
+  const flute = (t, n, dur, vel, pan = 0) => {   // a bone flute: a breathy sine with a slow vibrato that opens late
+    const f = nz(n), o = osc('sine', f * 0.985, t, t + dur + 0.2); o.frequency.linearRampToValueAtTime(f, t + 0.07);
+    const lfo = osc('sine', 5.2, t, t + dur + 0.2), lg = ac.createGain(); lg.gain.setValueAtTime(0, t); lg.gain.linearRampToValueAtTime(f * 0.012, t + dur * 0.7); lfo.connect(lg); lg.connect(o.frequency);
+    const o2 = osc('sine', f * 2.01, t, t + dur + 0.2), g2 = ac.createGain(); g2.gain.value = 0.16; o2.connect(g2);
+    const o3 = osc('sine', f * 3.0, t, t + dur + 0.2), g3 = ac.createGain(); g3.gain.value = 0.05; o3.connect(g3);
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f * 2; bp.Q.value = 3; const gn = ac.createGain(); gn.gain.value = 0.5; src.connect(bp); bp.connect(gn); src.start(t, (t * 2.3) % 1.2); src.stop(t + dur + 0.2);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vel, t + 0.06); g.gain.setValueAtTime(vel * 0.85, t + dur * 0.75); g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.12);
+    o.connect(g); g2.connect(g); g3.connect(g); gn.connect(g); out(g, pan, 0.6);
+  };
+  const crackle = (t0, t1, vel) => { let i = 0; for (let t = t0; t < t1; i++) { const h = hash('crk', i), a = (h % 1000) / 1000, b = ((h >> 10) % 1000) / 1000; t += 0.03 + a * 0.13; if (t >= t1) break; noiseHit(t, 0.008 + b * 0.02, 'highpass', 2400 + b * 3500, 1, vel * (0.35 + 0.65 * a * a), (b - 0.5) * 1.2, 0.08); } };
+  const scrape = (t0, t1, vel, pan0 = -0.3, pan1 = 0.3, f = 1500) => { let i = 0; for (let t = t0; t < t1 - 1e-6; t += E16, i++) noiseHit(t + (i % 3) * 0.007, 0.1, 'bandpass', f * (0.85 + 0.3 * ((i * 3) % 5) / 4), 0.9, vel * (0.6 + 0.4 * ((i * 5) % 4) / 3), lerp(pan0, pan1, (t - t0) / (t1 - t0)), 0.1, f * 0.5); };   // a dry finger on rock
+  const dab = (t, vel, pan = 0) => { noiseHit(t, 0.03, 'lowpass', 700, 1.2, vel, pan, 0.1); blip(t, 240, 170, 0.04, vel * 0.5, pan); };
+  const puff = (t, dur, vel, pan = 0) => breath(t, t + dur, vel, 2400, pan);                                               // pigment blown from the mouth
+  to = 'm';
+  drone(0.0, 6.05, nz('A1'), 0.05, { att: 0.6, rel: 0.5 });
+  pad(0.0, 3.1, ['A2', 'E3'], 0.03, { type: 'triangle', cut: 600, att: 0.5, rel: 0.4, send: 0.5 });
+  pad(3.0, 6.05, ['A2', 'E3', 'A3'], 0.05, { type: 'triangle', cut: 900, att: 0.2, rel: 0.4, send: 0.5 });
+  for (let i = 0; i < 6; i++) { const t = i * BEAT; drum(t, i % 2 ? 0.1 : 0.16); if (i % 2) drum(t + E8, 0.06, true); }               // the hunt: a slow heartbeat
+  for (let i = 0; i < 12; i++) { const t = 3.0 + i * E8; drum(t, i % 4 === 0 ? 0.22 : i % 2 === 0 ? 0.14 : 0.07, i % 4 === 3 || i % 4 === 1); }   // the hands: it doubles
+  breath(0.1, 1.5, 0.03, 600, -0.2); breath(1.6, 2.9, 0.035, 650, 0.2); breath(3.3, 4.6, 0.03, 600, -0.2); breath(4.7, 5.9, 0.03, 650, 0.2);
+  flute(1.0, 'E5', 0.9, 0.035, 0.2); flute(2.0, 'D5', 0.45, 0.03, 0.2); flute(2.5, 'C5', 0.45, 0.03, 0.2);
+  [['A4', 3.0, 0.45], ['C5', 3.5, 0.22], ['D5', 3.75, 0.22], ['E5', 4.0, 0.7], ['G5', 4.75, 0.22], ['E5', 5.0, 0.45], ['D5', 5.5, 0.2], ['E5', 5.75, 0.22]].forEach(([n, t, d]) => flute(t, n, d, 0.075, 0.15));
+  to = 's';
+  crackle(0.0, 6.0, 0.03);
+  scrape(q.disc, q.disc + 0.5, 0.03, 0.3, 0.4, 1300);                                                                      // the disc is rubbed on
+  scrape(q.bison, q.bison + 1.1, 0.034, -0.4, 0.1, 1500);                                                                  // the bison
+  scrape(q.horse, q.horse + 0.7, 0.024, -0.5, -0.3, 1900);                                                                 // the horse
+  scrape(q.stag, q.stag + 0.8, 0.03, 0.3, 0.5, 1700);                                                                      // the stag
+  [0, 0.15].forEach((d, i) => scrape(q.hunters + d, q.hunters + d + 0.4, 0.02, -0.6 + i * 0.2, -0.5 + i * 0.2, 2200));     // two hunters
+  for (let i = 0; i < 7; i++) dab(q.dots + i * 0.0625, 0.03, 0.4 + i * 0.05);                                              // seven finger dots
+  sweep(q.spear, q.spear + 0.4, 0.02, 900, 2600, 0); dab(q.spear + 0.5, 0.05, 0.1);                                        // the spear flies
+  sweep(2.4, 2.85, 0.016, 1800, 300, 0);                                                                                   // the light closes on the disc
+  puff(2.8, 0.45, 0.07, 0.2);                                                                                              // in the dark it is blown over
+  sub(3.0, 0.12);
+  blip(q.lift, 300, 520, 0.12, 0.03, 0.2);                                                                                 // the hand comes off the wall
+  [[q.hand1, -0.4], [q.hand2, 0.5], [q.hand3, -0.1]].forEach(([t, pan]) => { puff(t, 0.22, 0.06, pan); puff(t + 0.24, 0.2, 0.05, pan); blip(t + 0.47, 300, 520, 0.1, 0.025, pan); });   // two breaths and a lift for every hand
+  scrape(q.pig, q.pig + 1.0, 0.03, -0.5, 0, 1500);                                                                         // the babirusa
+  scrape(q.anoa, q.anoa + 0.6, 0.02, -0.6, -0.5, 2000);                                                                    // the anoa
+  for (let i = 0; i < 7; i++) dab(q.dots2 + i * 0.0625, 0.028, -0.5 + i * 0.12);
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

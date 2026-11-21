@@ -1,0 +1,1659 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retro 80s demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #24104f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  RETRO 80s DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Over a scrolling grid floor a slatted sun rises between palms and
+//  mountains, a chrome triangle pops up behind it, and Kaset, a little teal cassette tape, tumbles in and bops to
+//  the beat. At 3.0s the sun's slats close and it becomes a spinning pink record on a Memphis party wall: confetti
+//  springs in on the 8ths, chrome lettering drops in and shines, notes float up, Kaset dances and jumps.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/retro-80s/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneSenja()], [3, 6, () => scenePesta()]];
+const SHOTS = [
+  ['senja', 0, 0.0, 3.0, 'a slatted sun rises over the grid floor; a chrome triangle pops up; the cassette hero tumbles in and bops'],
+  ['pesta', 1, 3.0, 6.0, 'the sun becomes a spinning record; confetti springs in, chrome lettering shines, the hero dances and jumps'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.0, roll: 0.5, tri: 1.0, land: 1.25, shine1: 1.5, jump: 2.0, pop: 3.75, title: 4.0, shine2: 4.5, script: 5.0, hop: 5.5 },
+  acts: [
+    { name: '1 Senja', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Pesta', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'a cool 80s sunset', sound: 'saw pad, octave bass, arpeggio; a tumble, a thud, sparkles', next: 'the sun becomes a record' },
+    { t: 5.2, title: 'time for a music party', sound: 'drums in, bright arpeggio; pops, a slam, a shine sweep', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/retro-80s/kit.js — RETRO 80s: an airbrushed poster / VHS cover / arcade flyer in daylight-to-sunset colour.
+//  The medium is the smooth airbrush GRADIENT: every surface is a banded gradient fill (never a flat colour, never a
+//  glowing tube): a sunset sky, a sun cut by sliding horizontal slats, flat silhouette ranges (mountains, palms, a
+//  skyline), a perspective grid floor of SOLID coloured lines, chrome with a hard bevel and four-point sparkles,
+//  and Memphis confetti with hard offset shadows. A light VHS finish (chroma offset, scanlines, grain) sits on top.
+//  Built on kit/core.js. Motion on 1s. Helpers are prefixed r80…; the palette is R80. Needs from the piece head: CX.
+// =====================================================================
+const R80 = {
+  paper: '#f7ead0',                                     // cream poster board: the ground a morph happens on
+  cream: '#fff3d6', peach: '#ffd2b0',                   // light grounds, caption text, horizon lines
+  indigo: '#24104f',                                    // silhouettes, outlines, hard shadows, the caption bar (never black)
+  deep: '#3b1791', purple: '#6b2fb5',                   // the top of the sky, far ranges, floors
+  mag: '#c0268f', pink: '#ff4f9e',                      // the sky's middle, grid lines, underlines, records
+  orange: '#ff9a3c', yellow: '#ffd43b',                 // the sun, the horizon; yellow = the highlighted word
+  teal: '#12c4b8',                                      // RESERVED for the hero (Kaset)
+  sky: '#4fb4ff', blue: '#2438b8', brown: '#2a0f45',    // chrome: its sky half, its top, its dark band
+  white: '#ffffff',
+};
+const R80_DISPLAY = 'Impact, Haettenschweiler, "Arial Narrow Bold", "Franklin Gothic Heavy", "Arial Black", Futura, "Helvetica Neue", Arial, sans-serif';
+const R80_SCRIPT = '"Brush Script MT", "Segoe Script", "Lucida Handwriting", "Snell Roundhand", "Comic Sans MS", cursive';
+const R80_SUNSET = [[0, '#2a1470'], [0.3, '#7a2bbd'], [0.54, '#e0359f'], [0.72, '#ff4f9e'], [0.88, '#ff8a3c'], [1, '#ffd95a']];
+const R80_CHROME = [[0, '#2438b8'], [0.27, '#4fb4ff'], [0.46, '#e4f6ff'], [0.5, '#ffffff'], [0.515, '#2a0f45'], [0.7, '#8a2a80'], [0.9, '#ff9d4d'], [1, '#ffe9a6']];
+
+// ---------------------------------------------------------------------
+//  colour (hex or rgb() in), gradients, caches
+// ---------------------------------------------------------------------
+function r80RGB(c) { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); return c.match(/[\d.]+/g).slice(0, 3).map(Number); }
+const r80Mix = (a, b, u) => { const x = r80RGB(a), y = r80RGB(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+const r80Tone = (c, k) => (k < 0 ? r80Mix(c, R80.indigo, -k) : r80Mix(c, '#ffffff', k));   // k < 0 deeper, k > 0 lighter
+const r80A = (c, a) => { const [r, g, b] = r80RGB(c); return `rgba(${r},${g},${b},${a})`; };
+const r80Hot = (c) => [r80Mix(c, '#fff2a8', 0.5), c, r80Mix(c, R80.mag, 0.45)];             // the airbrush ramp of a warm object (sun, record)
+// a linear gradient; stops = ['#a', '#b', ...] (evenly spaced) or [[0, '#a'], [0.4, '#b'], ...]
+function r80Lin(x0, y0, x1, y1, stops) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  stops.forEach((s, i) => (Array.isArray(s) ? g.addColorStop(s[0], s[1]) : g.addColorStop(stops.length > 1 ? i / (stops.length - 1) : 0, s)));
+  return g;
+}
+const r80V = (y0, y1, stops) => r80Lin(0, y0, 0, y1, stops);
+const R80_CACHE = new Map(), R80_GEO = new Map();
+// a static picture painted once into an offscreen canvas (draw() paints with the normal helpers: ctx points at it)
+function r80Cache(key, w, h, draw) {
+  let cv = R80_CACHE.get(key);
+  if (!cv) { cv = document.createElement('canvas'); cv.width = Math.ceil(w); cv.height = Math.ceil(h); const keep = ctx; ctx = cv.getContext('2d'); draw(cv); ctx = keep; R80_CACHE.set(key, cv); }
+  return cv;
+}
+function r80Pat(key, w, h, draw) { let p = R80_GEO.get('pat' + key); if (!p) { p = ctx.createPattern(r80Cache('pat' + key, w, h, draw), 'repeat'); R80_GEO.set('pat' + key, p); } return p; }
+const r80DotPat = (c = 'rgba(107,47,181,0.16)', gap = 54, r = 4.5) => r80Pat('dot' + c + gap + r, gap, gap, () => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(gap / 2, gap / 2, r, 0, TAU); ctx.fill(); });
+function r80Path(P, closed = true) { ctx.beginPath(); P.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); if (closed) ctx.closePath(); }
+const r80Centroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+// the beat pulse: 1 on the beat, falling to 0 before the next one
+const r80Beat = (every = 0.5, sharp = 7, t0 = 0) => Math.exp(-mod(TT - t0, every) * sharp);
+// a soft airbrush puff (a radial spray of colour c, alpha a at the centre): shading only, never a light source
+function r80Puff(x, y, rx, ry, c, a = 0.4) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(rx / 100, ry / 100);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 100); g.addColorStop(0, r80A(c, a)); g.addColorStop(0.55, r80A(c, a * 0.45)); g.addColorStop(1, r80A(c, 0));
+  ctx.fillStyle = g; ctx.fillRect(-100, -100, 200, 200); ctx.restore();
+}
+// a flat poster shape: fill = a colour or gradient stops (top to bottom of the shape); o: shadow (colour | true), off [dx, dy], line, lw, smooth
+function r80Shape(P, fill, o = {}) {
+  const path = () => (o.smooth ? trace(P, true) : r80Path(P)), bb = bbox(P);
+  if (o.shadow) { const [dx, dy] = o.off ?? [10, 11]; ctx.save(); ctx.translate(dx, dy); path(); ctx.fillStyle = o.shadow === true ? R80.indigo : o.shadow; ctx.fill(); ctx.restore(); }
+  path(); ctx.fillStyle = Array.isArray(fill) ? r80V(bb.y0, bb.y1, fill) : fill; ctx.fill();
+  if (o.line) { ctx.strokeStyle = o.line; ctx.lineWidth = o.lw ?? 5; ctx.lineJoin = 'round'; ctx.stroke(); }
+}
+
+// ---------------------------------------------------------------------
+//  sparkles: the four-point star that sits on chrome, on the sun's rim, in the sky
+// ---------------------------------------------------------------------
+//   o: c (white), c2 (the small diagonal star, yellow), rot, al, shadow (true = a hard indigo copy, for light grounds)
+function r80Sparkle(x, y, s, o = {}) {
+  if (s <= 0.5) return;
+  const st = (a, b, col) => { ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(0, -a); ctx.quadraticCurveTo(a * 0.07, -b * 0.07, b, 0); ctx.quadraticCurveTo(a * 0.07, b * 0.07, 0, a); ctx.quadraticCurveTo(-a * 0.07, b * 0.07, -b, 0); ctx.quadraticCurveTo(-a * 0.07, -b * 0.07, 0, -a); ctx.fill(); };
+  const all = (c, c2) => { ctx.rotate(Math.PI / 4); st(s * 0.42, s * 0.42, c2); ctx.rotate(-Math.PI / 4); st(s, s * 0.74, c); ctx.beginPath(); ctx.arc(0, 0, s * 0.12, 0, TAU); ctx.fill(); };
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1;
+  if (o.shadow) { ctx.save(); ctx.translate(x + s * 0.07, y + s * 0.08); ctx.rotate(o.rot ?? 0); all(R80.indigo, R80.indigo); ctx.restore(); }
+  ctx.translate(x, y); ctx.rotate(o.rot ?? 0); all(o.c ?? R80.white, o.c2 ?? R80.yellow);
+  ctx.restore();
+}
+// one sparkle that pops at t0: grows, turns a little, shrinks (o.dur 0.45)
+function r80Twinkle(x, y, s, t0, o = {}) {
+  const u = (TT - t0) / (o.dur ?? 0.45); if (u <= 0 || u >= 1) return;
+  r80Sparkle(x, y, s * Math.sin(Math.PI * u) ** 0.8, { ...o, rot: (u - 0.5) * 0.9 });
+}
+// seeded sparkles popping on every beat inside a box; o: box [x0, y0, x1, y1], every (0.5), n (2 per beat), s [min, max], avoid [[x0, y0, x1, y1], ...]
+function r80Twinkles(key, o = {}) {
+  const every = o.every ?? 0.5, b = Math.floor(TT / every + 1e-6), box = o.box ?? [80, 280, 920, 900], R = RNG('r80tw', key, b), [s0, s1] = o.s ?? [34, 66];
+  for (let i = 0; i < (o.n ?? 2); i++) {
+    let x = 0, y = 0, ok = false;
+    for (let k = 0; k < 8 && !ok; k++) { x = R.r(box[0], box[2]); y = R.r(box[1], box[3]); ok = !(o.avoid ?? []).some(([a, c, d, e]) => x > a && x < d && y > c && y < e); }
+    const s = R.r(s0, s1), dt = R.r(0, every * 0.3);
+    if (ok) r80Twinkle(x, y, s, b * every + dt, o);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  the sunset set: sky, slatted sun, silhouette ranges, skyline, palms, the grid floor
+// ---------------------------------------------------------------------
+// the sky above horizon hy (world coords, cached): banded sunset gradient, airbrushed streaks, a warm haze, tiny stars
+//   o: stops (R80_SUNSET), sun { x, y } (where the haze sits), stars (22), key
+function r80Sky(hy, o = {}) {
+  const M = 240, stops = o.stops ?? R80_SUNSET, key = ['sky', hy, o.key ?? '', o.sun ? o.sun.x + ',' + o.sun.y : ''].join('|');
+  const cv = r80Cache(key, W + 2 * M, hy + M, () => {
+    ctx.fillStyle = r80V(M * 0.5, hy + M, stops); ctx.fillRect(0, 0, W + 2 * M, hy + M);
+    const R = RNG('r80sky', key);
+    if (o.sun) r80Puff(M + o.sun.x, M + o.sun.y, 620, 470, '#fff0b0', 0.42);
+    for (let i = 0; i < 10; i++) r80Puff(R.r(0, W + 2 * M), M + R.r(0.3, 0.97) * hy, R.r(260, 560), R.r(10, 26), i % 2 ? '#ffe9a8' : '#ff86c6', R.r(0.2, 0.42));
+    for (let i = 0; i < (o.stars ?? 22); i++) r80Sparkle(R.r(0, W + 2 * M), M + R.r(-0.1, 0.3) * hy, R.r(5, 13), { al: R.r(0.45, 0.95), c2: '#ffc9ef' });
+  });
+  ctx.drawImage(cv, -M, -M);
+}
+// the gaps of a slatted disc between yTop and yBot: [[centre y, height], ...] sliding downward with phase ph, wider toward the bottom
+function r80SlatGaps(yTop, yBot, n = 6, ph = 0, hMax = 30, open = 1) {
+  const G = []; for (let k = 0; k < n; k++) { const f = (k + mod(ph, 1)) / n; G.push([lerp(yTop, yBot, f), lerp(1.5, hMax, f) * open]); } return G;
+}
+// fill outline P in horizontal bands, leaving the gaps open (what is behind shows through)
+function r80BandFill(P, gaps, fill, dx = 0, dy = 0, smoothP = true) {
+  const bb = bbox(P, 4); ctx.save(); ctx.translate(dx, dy); if (smoothP) trace(P, true); else r80Path(P); ctx.clip(); ctx.fillStyle = fill;
+  let y0 = bb.y0;
+  for (const [gy, gh] of gaps) { if (gh <= 0.2) continue; ctx.fillRect(bb.x0, y0, bb.x1 - bb.x0, gy - gh / 2 - y0); y0 = gy + gh / 2; }
+  ctx.fillRect(bb.x0, y0, bb.x1 - bb.x0, bb.y1 - y0); ctx.restore();
+}
+const r80SunGaps = (bb, u = 0) => r80SlatGaps(lerp(bb.y0, bb.y1, 0.45), bb.y1, 6, TT * 0.9, (bb.y1 - bb.y0) * 0.075, 1 - u);
+// the sun: an airbrushed disc cut by slats that slide down. o: c (orange), clipY (hide what is below this y: the horizon), shine
+function r80Sun(x, y, r, o = {}) {
+  const P = ellipsePts(x, y, r, r, 0, 64), bb = bbox(P);
+  ctx.save();
+  if (o.clipY != null) { ctx.beginPath(); ctx.rect(x - r * 2, y - r * 2, r * 4, o.clipY - (y - r * 2)); ctx.clip(); }
+  r80BandFill(P, r80SunGaps(bb), r80V(bb.y0, bb.y1, o.stops ?? r80Hot(o.c ?? R80.orange)));
+  ctx.save(); trace(P, true); ctx.clip(); r80Puff(x - r * 0.35, y - r * 0.5, r * 0.75, r * 0.5, '#ffffff', 0.34); ctx.restore();   // an airbrushed highlight
+  ctx.restore();
+}
+const r80SunPts = (x, y, r) => ellipsePts(x, y, r, r, 0, 64);
+// a silhouette mountain range standing on y. o: amp (200), step (90), x (parallax shift), stops [top, bottom],
+//   gap [cx, halfWidth, floorK] (a dip, e.g. where the sun sits), sunX (the lit facets face it), lit (colour | false), bottom
+function r80Range(key, y, o = {}) {
+  const amp = o.amp ?? 200, step = o.step ?? 90, x0 = -600, n = Math.ceil((W + 1200) / step);
+  let K = R80_GEO.get('rg' + key + step);
+  if (!K) { const R = RNG('r80range', key); K = []; for (let i = 0; i <= n; i++) K.push(i % 2 ? R.r(0.55, 1) : R.r(0.1, 0.42)); R80_GEO.set('rg' + key + step, K); }
+  const dx = o.x ?? 0, gap = o.gap, sunX = o.sunX ?? W / 2, P = [];
+  for (let i = 0; i <= n; i++) { const x = x0 + i * step + dx; let k = K[i]; if (gap) k *= lerp(gap[2] ?? 0.08, 1, smooth(gap[1] * 0.45, gap[1], Math.abs(x - gap[0]))); P.push([x, y - amp * k]); }
+  const bot = o.bottom ?? y + 6;
+  r80Path([...P, [P[n][0], bot], [P[0][0], bot]]); ctx.fillStyle = r80V(y - amp, y, o.stops ?? [R80.purple, R80.indigo]); ctx.fill();
+  if (o.lit !== false) for (let i = 1; i < n; i += 2) {   // an airbrushed facet on the slope facing the sun
+    const p = P[i], v = P[p[0] < sunX ? i + 1 : i - 1]; if (v[1] - p[1] < 8) continue;
+    r80Path([p, v, [lerp(p[0], v[0], 0.28), v[1]]]); ctx.fillStyle = r80V(p[1], v[1], [r80A(o.lit ?? '#ff9ad0', 0.6), r80A(o.lit ?? '#ff9ad0', 0)]); ctx.fill();
+  }
+}
+// a silhouette skyline standing on y. o: amp (160), x0, x1, x (shift), stops, win (window colour | false)
+function r80City(key, y, o = {}) {
+  const xa = o.x0 ?? -100, xb = o.x1 ?? W + 100, gk = ['ct', key, xa, xb].join('|');
+  let L = R80_GEO.get(gk);
+  if (!L) {
+    const R = RNG('r80city', key); L = []; let x = xa;
+    while (x < xb) { const w = R.r(36, 78), h = R.r(0.3, 1), top = R.i(0, 3), wins = []; for (let r = 0; r < 14; r++) for (let c = 0; c < 4; c++) if (R.f() < 0.28) wins.push([c, r, R.f()]); L.push({ x, w, h, top, wins }); x += w + R.r(-2, 12); }
+    R80_GEO.set(gk, L);
+  }
+  const amp = o.amp ?? 160, dx = o.x ?? 0;
+  ctx.save(); ctx.translate(dx, 0); ctx.beginPath();
+  for (const b of L) {
+    const h = b.h * amp, t = y - h; ctx.rect(b.x, t, b.w, h + 6);
+    if (b.top === 1) ctx.rect(b.x + b.w * 0.45, t - h * 0.22, b.w * 0.1, h * 0.22);
+    else if (b.top === 2) ctx.rect(b.x + b.w * 0.22, t - 14, b.w * 0.56, 14);
+    else if (b.top === 3) { ctx.moveTo(b.x, t); ctx.lineTo(b.x + b.w, t - 18); ctx.lineTo(b.x + b.w, t); ctx.closePath(); }
+  }
+  ctx.fillStyle = r80V(y - amp, y, o.stops ?? ['#4a1d8f', R80.indigo]); ctx.fill();
+  if (o.win !== false) {
+    ctx.fillStyle = o.win ?? R80.yellow; ctx.beginPath();
+    for (const b of L) { const cw = b.w / 5, h = b.h * amp; for (const [c, r, p] of b.wins) { const wy = y - h + 10 + r * 13; if (wy > y - 12 || mod(TT * 0.7 + p * 5, 5) < 0.6) continue; ctx.rect(b.x + cw * (c + 0.75), wy, cw * 0.5, 6); } }
+    ctx.fill();
+  }
+  ctx.restore();
+}
+// a silhouette palm: (x, base) the foot, h the trunk height. o: key, lean (-1..1), sway (radians; default a slow breeze), stops, fronds (8)
+function r80Palm(x, base, h, o = {}) {
+  const key = o.key ?? 'palm', lean = o.lean ?? 0.4, R = RNG('r80palm', key), sway = o.sway ?? Math.sin(TT * 1.7 + R.r(0, TAU)) * 0.06;
+  const tx = x + lean * h * 0.3 + sway * h * 0.5, ty = base - h, cxm = x + lean * h * 0.02, cym = base - h * 0.55, L = [], Rr = [];
+  for (let i = 0; i <= 12; i++) { const u = i / 12, a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u, px = a * x + b * cxm + c * tx, py = a * base + b * cym + c * ty, w = lerp(h * 0.05, h * 0.022, u); L.push([px - w, py]); Rr.unshift([px + w, py]); }
+  ctx.save(); ctx.fillStyle = r80V(ty - h * 0.3, base, o.stops ?? ['#5a22a6', R80.indigo]);
+  r80Path([...L, ...Rr]); ctx.fill();
+  const n = o.fronds ?? 8;
+  for (let i = 0; i < n; i++) {
+    const a = lerp(-200, 20, i / (n - 1)) * DEG + R.n(0.1) + sway * (1.2 + (i % 3) * 0.5), len = h * 0.46 * R.r(0.82, 1.1), droop = R.r(0.5, 0.75) + sway * 0.6, up = [], lo = [];
+    for (let k = 0; k <= 18; k++) {
+      const u = k / 18, px = tx + Math.cos(a) * len * u, py = ty + Math.sin(a) * len * u + droop * len * u * u, wd = len * 0.17 * Math.sin(Math.PI * Math.min(1, u * 1.05)) ** 0.6;
+      up.push([px, py - wd * 0.2]); lo.unshift([px + (k % 2 ? len * 0.012 : 0), py + wd * (k % 2 ? 1 : 0.42)]);
+    }
+    r80Path([...up, ...lo]); ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(tx - h * 0.03, ty + h * 0.035, h * 0.034, 0, TAU); ctx.arc(tx + h * 0.035, ty + h * 0.045, h * 0.03, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+// the ground plane below horizon hy: a gradient floor with a perspective grid of SOLID lines scrolling toward the viewer.
+//   o: speed (1.1 squares/s), vx (vanishing x), stops, c (line colour), gap (190: square width at the bottom), dz (0.3), w (7),
+//      near (H: the y where a square is `gap` wide), hc (horizon line colour), sun { x } (a rippling reflection under the sun)
+function r80Floor(hy, o = {}) {
+  const t = o.t ?? TT, vx = o.vx ?? W / 2, near = o.near ?? H, bot = near + 260, h0 = near - hy, M = 300, stops = o.stops ?? [R80.deep, '#6a1fa8', R80.mag];
+  const c = o.c ?? R80.pink, sx = o.gap ?? 190, dz = o.dz ?? 0.3, lw = o.w ?? 7, ph = mod(t * (o.speed ?? 1.1), 1), s = (bot - hy) / h0;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(-M, hy, W + 2 * M, bot - hy); ctx.clip();
+  ctx.fillStyle = r80V(hy, near, stops); ctx.fillRect(-M, hy, W + 2 * M, bot - hy);
+  if (o.sun) for (let k = 0; k < 8; k++) {
+    const y = hy + 16 + k * 17 + k * k * 4.5, hw = (150 - k * 13) * (1 + 0.13 * Math.sin(t * 5 + k * 1.7)), hh = 5 + k * 1.3;
+    ctx.fillStyle = r80Mix(o.sun.c ?? '#ffe07a', R80.pink, k / 8); ctx.beginPath(); ctx.roundRect(o.sun.x - hw, y, hw * 2, hh, hh / 2); ctx.fill();
+  }
+  ctx.fillStyle = c; ctx.beginPath();
+  for (let j = -64; j <= 64; j++) { const bx = vx + j * sx * s, w = lw * s / 2; ctx.moveTo(vx, hy); ctx.lineTo(bx - w, bot); ctx.lineTo(bx + w, bot); ctx.closePath(); }
+  for (let i = -2; i < 44; i++) { const z = 1 + (i - ph) * dz, y = hy + h0 / z, w = Math.max(1.6, lw / z); ctx.rect(-M, y - w / 2, W + 2 * M, w); }
+  ctx.fill();
+  ctx.fillStyle = r80V(hy, hy + h0 * 0.15, [r80A(stops[0], 0.8), r80A(stops[0], 0)]); ctx.fillRect(-M, hy, W + 2 * M, h0 * 0.15);   // airbrushed distance
+  ctx.restore();
+  ctx.fillStyle = o.hc ?? '#fff0b0'; ctx.fillRect(-M, hy - 3, W + 2 * M, 6);
+}
+// a light poster wall (cached): a cream-to-peach gradient, a dotted grid, a few big pale Memphis shapes. o: stops, key, dot
+function r80Wall(o = {}) {
+  const M = 200, stops = o.stops ?? [R80.cream, R80.peach, '#ffb9cd'], key = 'wall|' + stops.join() + (o.key ?? '');
+  const cv = r80Cache(key, W + 2 * M, H + 2 * M, () => {
+    ctx.fillStyle = r80V(M, M + (o.hy ?? H * 0.7), stops); ctx.fillRect(0, 0, W + 2 * M, H + 2 * M);
+    ctx.save(); ctx.beginPath(); ctx.arc(M + W + 20, M + 300, 330, 0, TAU); ctx.fillStyle = r80V(M - 30, M + 630, ['#ffe58f', '#ffc98a']); ctx.globalAlpha = 0.75; ctx.fill();
+    ctx.beginPath(); ctx.arc(M + 30, M + 840, 210, 0, TAU); ctx.strokeStyle = '#ffb3cf'; ctx.lineWidth = 30; ctx.stroke();
+    ctx.beginPath(); for (let i = 0; i < 7; i++) { ctx.moveTo(M + 720 + i * 34, M + 1010); ctx.lineTo(M + 620 + i * 34, M + 1190); } ctx.strokeStyle = '#ffc3a0'; ctx.lineWidth = 14; ctx.lineCap = 'round'; ctx.stroke(); ctx.restore();
+    ctx.fillStyle = r80DotPat(o.dot); ctx.fillRect(0, 0, W + 2 * M, H + 2 * M);
+  });
+  ctx.drawImage(cv, -M, -M);
+}
+// a scrolling pattern band (a Memphis border). kind: 'check' | 'tri' | 'stripe'; o: speed (px/s), a, b (the two colours)
+function r80Band(y, h, kind = 'check', o = {}) {
+  const a = o.a ?? R80.indigo, b = o.b ?? R80.cream, M = 200, sp = TT * (o.speed ?? 40);
+  ctx.save(); ctx.beginPath(); ctx.rect(-M, y, W + 2 * M, h); ctx.clip(); ctx.fillStyle = b; ctx.fillRect(-M, y, W + 2 * M, h); ctx.fillStyle = a; ctx.beginPath();
+  if (kind === 'check') { const cs = h / 2, off = mod(sp, cs * 2); for (let i = -2; i * cs < W + 2 * M; i++) ctx.rect(-M + i * cs - off + cs * 2, y + (mod(i, 2) ? cs : 0), cs, cs); }
+  else if (kind === 'tri') { const off = mod(sp, h); for (let x = -M - off; x < W + M; x += h) { ctx.moveTo(x, y + h); ctx.lineTo(x + h / 2, y); ctx.lineTo(x + h, y + h); ctx.closePath(); } }
+  else { const off = mod(sp, h); for (let x = -M - off - h; x < W + M; x += h) { ctx.moveTo(x, y + h); ctx.lineTo(x + h, y); ctx.lineTo(x + h * 1.5, y); ctx.lineTo(x + h * 0.5, y + h); ctx.closePath(); } }
+  ctx.fill(); ctx.restore();
+  ctx.fillStyle = a; ctx.fillRect(-M, y - 6, W + 2 * M, 6); ctx.fillRect(-M, y + h, W + 2 * M, 6);
+}
+
+// ---------------------------------------------------------------------
+//  chrome: sky-blue top, a white horizon line, a dark band, a warm underside, a hard bevel, a shine that sweeps across
+// ---------------------------------------------------------------------
+// a white band sweeping across box bb at progress u (0..1); call under a clip
+function r80ShineBand(bb, u, wd) {
+  const hgt = bb.y1 - bb.y0, w = wd ?? hgt * 0.5, x = lerp(bb.x0 - w - hgt * 0.5, bb.x1 + hgt * 0.5, u);
+  const g = ctx.createLinearGradient(x, 0, x + w, 0); g.addColorStop(0, 'rgba(255,255,255,0)'); g.addColorStop(0.5, 'rgba(255,255,255,0.95)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.save(); ctx.transform(1, 0, -0.5, 1, 0.5 * bb.y1, 0); ctx.fillStyle = g; ctx.fillRect(x - hgt, bb.y0 - 4, w + hgt * 2, hgt + 8); ctx.restore();
+}
+// a chrome shape. P: outline; o: hole (an inner outline: a chrome frame), bevel (9), out (outline width 7), shadow [dx, dy] | false,
+//   shine (0..1: the sweep's progress), smooth, stops (R80_CHROME)
+function r80Chrome(P, o = {}) {
+  const bb = bbox(P), bev = o.bevel ?? 9, rule = o.hole ? 'evenodd' : 'nonzero';
+  const path = () => { if (o.smooth) trace(P, true); else r80Path(P); if (o.hole) { o.hole.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); } };
+  const sh = o.shadow === undefined ? [9, 11] : o.shadow;
+  ctx.save(); ctx.lineJoin = 'miter'; ctx.miterLimit = 4;
+  if (sh) { ctx.save(); ctx.translate(sh[0], sh[1]); path(); ctx.fillStyle = ctx.strokeStyle = R80.indigo; ctx.lineWidth = o.out ?? 7; ctx.fill(rule); ctx.stroke(); ctx.restore(); }
+  path(); ctx.strokeStyle = R80.indigo; ctx.lineWidth = o.out ?? 7; ctx.stroke();
+  path(); ctx.fillStyle = r80V(bb.y0, bb.y1, o.stops ?? R80_CHROME); ctx.fill(rule); ctx.clip(rule);
+  path(); ctx.lineWidth = bev * 2 + 5; ctx.strokeStyle = 'rgba(36,16,79,0.6)'; ctx.stroke();                                                    // the seam under the bevel
+  path(); ctx.lineWidth = bev * 2; ctx.strokeStyle = r80V(bb.y0, bb.y1, [[0, '#ffffff'], [0.45, '#c4e8ff'], [0.56, '#a765cf'], [1, '#3a1560']]); ctx.stroke();   // the bevel: lit above, dark below
+  if (o.shine != null && o.shine > 0 && o.shine < 1) r80ShineBand(bb, o.shine);
+  ctx.restore();
+}
+// chrome lettering is painted once per word into a sprite (face, bevel, outline, hard shadow) plus a mask for the shine
+function r80ChromeSprite(str, size, o = {}) {
+  const fam = o.fam ?? R80_DISPLAY, sk = o.skew ?? 0.16, key = ['ct', str, size, fam, sk].join('|');
+  let S = R80_GEO.get(key); if (S) return S;
+  const font = `${size}px ${fam}`;
+  ctx.save(); ctx.font = font; const m = ctx.measureText(str); ctx.restore();
+  const w = m.width, asc = m.actualBoundingBoxAscent || size * 0.8, desc = m.actualBoundingBoxDescent || 0, pad = Math.ceil(size * 0.24 + sk * size), by = pad + Math.ceil(asc);
+  const cw = Math.ceil(w + pad * 2), ch = Math.ceil(asc + desc + pad * 2), bev = size * 0.05;
+  const mk = () => { const c = document.createElement('canvas'); c.width = cw; c.height = ch; const g = c.getContext('2d'); g.font = font; g.textBaseline = 'alphabetic'; g.lineJoin = 'round'; g.setTransform(1, 0, -sk, 1, sk * by, 0); return [c, g]; };
+  const [cv, g] = mk(), [tv, t] = mk(), [mask, mg] = mk(), [sv, sg] = mk();
+  const stops = (gr, st) => { st.forEach(([a, c]) => gr.addColorStop(a, c)); return gr; };
+  mg.fillStyle = '#fff'; mg.fillText(str, pad, by);
+  g.fillStyle = g.strokeStyle = R80.indigo; g.lineWidth = size * 0.1;
+  g.fillText(str, pad + size * 0.06, by + size * 0.075); g.strokeText(str, pad + size * 0.06, by + size * 0.075);   // the hard shadow
+  g.strokeText(str, pad, by);                                                                                       // the outline
+  g.fillStyle = stops(g.createLinearGradient(0, by - asc, 0, by + desc), o.stops ?? R80_CHROME); g.fillText(str, pad, by);
+  t.lineWidth = bev * 2 + size * 0.03; t.strokeStyle = 'rgba(36,16,79,0.6)'; t.strokeText(str, pad, by);
+  t.lineWidth = bev * 2; t.strokeStyle = stops(t.createLinearGradient(0, by - asc, 0, by + desc), [[0, '#ffffff'], [0.45, '#c4e8ff'], [0.56, '#a765cf'], [1, '#3a1560']]); t.strokeText(str, pad, by);
+  t.globalCompositeOperation = 'destination-in'; t.fillStyle = '#000'; t.fillText(str, pad, by);                   // keep the bevel inside the letters
+  g.setTransform(1, 0, 0, 1, 0, 0); g.drawImage(tv, 0, 0);
+  sg.setTransform(1, 0, 0, 1, 0, 0);
+  S = { cv, mask, sv, sg, pad, by, w, font, asc }; R80_GEO.set(key, S); return S;
+}
+// chrome display caps at baseline (x, y). o: align ('center'), shine (0..1), skew (0.16), fam, stops
+function r80ChromeText(str, x, y, size, o = {}) {
+  const S = r80ChromeSprite(str, size, o), al = o.align ?? 'center', x0 = al === 'center' ? x - S.w / 2 : al === 'right' ? x - S.w : x;
+  ctx.drawImage(S.cv, x0 - S.pad, y - S.by);
+  if (o.shine != null && o.shine > 0 && o.shine < 1) {
+    const g = S.sg, cw = S.cv.width, ch = S.cv.height, bw = size * 0.55, bx = lerp(-bw - ch * 0.5, cw + ch * 0.5, o.shine);
+    g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, cw, ch);
+    const gr = g.createLinearGradient(bx, 0, bx + bw, 0); gr.addColorStop(0, 'rgba(255,255,255,0)'); gr.addColorStop(0.5, 'rgba(255,255,255,0.95)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.setTransform(1, 0, -0.5, 1, 0.5 * ch, 0); g.fillStyle = gr; g.fillRect(bx - ch, 0, bw + ch * 2, ch); g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'destination-in'; g.drawImage(S.mask, 0, 0);
+    ctx.drawImage(S.sv, x0 - S.pad, y - S.by);
+  }
+  ctx.save(); ctx.font = S.font; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = 'rgba(0,0,0,0)'; ctx.fillText(str, x0, y, S.w); ctx.restore();   // for the text check (it only sees fillText)
+  return S.w;
+}
+// gradient display caps with a dark offset shadow (drawn live, so it can be scaled / revealed). o: stops, align, skew (0.16), fam, out (outline width)
+function r80GradText(str, x, y, size, o = {}) {
+  ctx.save(); ctx.translate(x, y); ctx.transform(1, 0, -(o.skew ?? 0.16), 1, 0, 0);
+  ctx.font = `${size}px ${o.fam ?? R80_DISPLAY}`; ctx.textAlign = o.align ?? 'center'; ctx.textBaseline = 'alphabetic'; ctx.lineJoin = 'round';
+  ctx.fillStyle = ctx.strokeStyle = R80.indigo; ctx.lineWidth = o.out ?? size * 0.08;
+  ctx.fillText(str, size * 0.06, size * 0.07); ctx.strokeText(str, size * 0.06, size * 0.07); ctx.strokeText(str, 0, 0);
+  ctx.fillStyle = r80V(-size * 0.78, 0, o.stops ?? [R80.yellow, R80.orange, R80.pink]); ctx.fillText(str, 0, 0);
+  ctx.restore();
+}
+// a casual brush-script accent word with a swash under it. o: rot (-0.1), reveal (0..1 written on from the left), shc
+function r80Script(str, x, y, size, c, o = {}) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(o.rot ?? -0.1); ctx.font = `${size}px ${R80_SCRIPT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const w = ctx.measureText(str).width, rv = clamp(o.reveal ?? 1); if (rv <= 0) { ctx.restore(); return; }
+  ctx.beginPath(); ctx.rect(-w / 2 - size * 0.3, -size * 1.2, (w + size * 0.7) * rv, size * 2); ctx.clip();
+  const draw = (col, dx, dy) => {
+    ctx.fillStyle = ctx.strokeStyle = col; ctx.fillText(str, dx, dy);
+    ctx.lineWidth = size * 0.07; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(-w / 2 + dx, size * 0.3 + dy); ctx.quadraticCurveTo(dx, size * 0.44 + dy, w / 2 + size * 0.15 + dx, size * 0.2 + dy); ctx.stroke();
+  };
+  draw(o.shc ?? R80.indigo, size * 0.05, size * 0.06); draw(c, 0, 0);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  Memphis confetti: squiggles, zigzags, triangles, dotted grids, half-circles, rings, plus signs; flat colour + a hard offset shadow
+// ---------------------------------------------------------------------
+//   kind: 'squig' | 'zig' | 'tri' | 'triO' | 'dots' | 'half' | 'ring' | 'plus'; s = its size; o: shadow (false = none), off [dx, dy], shc
+function r80Mem(kind, x, y, s, c, rot = 0, o = {}) {
+  if (s <= 1) return;
+  const draw = (col) => {
+    ctx.fillStyle = ctx.strokeStyle = col; ctx.lineWidth = s * 0.17; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath();
+    if (kind === 'squig') { for (let i = 0; i <= 28; i++) { const u = i / 28, px = (u - 0.5) * s * 2, py = Math.sin(u * TAU * 2) * s * 0.26; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); } ctx.stroke(); }
+    else if (kind === 'zig') { ctx.lineJoin = 'miter'; ctx.lineCap = 'butt'; for (let i = 0; i <= 6; i++) { const px = (i / 6 - 0.5) * s * 2, py = (i % 2 ? -1 : 1) * s * 0.26; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); } ctx.stroke(); }
+    else if (kind === 'tri' || kind === 'triO') { for (let i = 0; i < 3; i++) { const a = -Math.PI / 2 + i * TAU / 3, px = Math.cos(a) * s * 0.64, py = Math.sin(a) * s * 0.64; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); } ctx.closePath(); if (kind === 'tri') ctx.fill(); else ctx.stroke(); }
+    else if (kind === 'dots') { for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) { ctx.moveTo(i * s * 0.42 + s * 0.11, j * s * 0.42); ctx.arc(i * s * 0.42, j * s * 0.42, s * 0.11, 0, TAU); } ctx.fill(); }
+    else if (kind === 'half') { ctx.arc(0, 0, s * 0.62, Math.PI, 0); ctx.closePath(); ctx.fill(); }
+    else if (kind === 'ring') { ctx.arc(0, 0, s * 0.5, 0, TAU); ctx.stroke(); }
+    else { ctx.moveTo(-s * 0.5, 0); ctx.lineTo(s * 0.5, 0); ctx.moveTo(0, -s * 0.5); ctx.lineTo(0, s * 0.5); ctx.stroke(); }
+  };
+  if (o.shadow !== false) { const [dx, dy] = o.off ?? [7, 8]; ctx.save(); ctx.translate(x + dx, y + dy); ctx.rotate(rot); draw(o.shc ?? R80.indigo); ctx.restore(); }
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); draw(c); ctx.restore();
+}
+// a seeded scatter of Memphis shapes that spring in one after another, spin slowly, float and pulse on the beat.
+//   o: box [x0, y0, x1, y1], avoid [[x0, y0, x1, y1], ...], colors, kinds, size [min, max], t0 (era start), stagger (0.06),
+//      at(i) (each shape's own start time), spin (0.5 rad/s), every (0.5: the beat), pulse (1)
+function r80Confetti(key, n, o = {}) {
+  const box = o.box ?? [70, 330, 930, 1290], avoid = o.avoid ?? [], cols = o.colors ?? [R80.pink, R80.yellow, R80.purple, R80.orange, R80.sky];
+  const kinds = o.kinds ?? ['squig', 'tri', 'dots', 'zig', 'half', 'ring', 'plus', 'triO'], [s0, s1] = o.size ?? [46, 82];
+  let L = R80_GEO.get('cf' + key);
+  if (!L) {
+    const R = RNG('r80conf', key); L = [];
+    for (let i = 0; i < n; i++) for (let k = 0; k < 60; k++) {
+      const x = R.r(box[0], box[2]), y = R.r(box[1], box[3]), s = R.r(s0, s1);
+      if (avoid.some(([a, b, c, d]) => x > a - s && x < c + s && y > b - s && y < d + s) || L.some((q) => Math.hypot(q.x - x, q.y - y) < (q.s + s) * 1.3)) continue;
+      L.push({ x, y, s, kind: kinds[L.length % kinds.length], c: cols[(L.length * 2 + R.i(0, 1)) % cols.length], rot: R.r(0, TAU), dir: R.f() < 0.5 ? -1 : 1, ph: R.f() }); break;
+    }
+    R80_GEO.set('cf' + key, L);
+  }
+  const t0 = o.t0 ?? E0, st = o.stagger ?? 0.06, beat = r80Beat(o.every ?? 0.5);
+  L.forEach((q, i) => {
+    const s = springEase(TT - (o.at ? o.at(i) : t0 + i * st), 260, 14); if (s <= 0.02) return;
+    r80Mem(q.kind, q.x, q.y + Math.sin(TT * 2.2 + q.ph * TAU) * 6, q.s * s * (1 + 0.1 * beat * (o.pulse ?? 1)), q.c, q.rot + q.dir * (o.spin ?? 0.5) * TT, o);
+  });
+}
+
+// ---------------------------------------------------------------------
+//  props for background life
+// ---------------------------------------------------------------------
+// an 80s stripe cloud: stacked rounded bars. o: key, stops
+function r80Cloud(x, y, w, o = {}) {
+  const R = RNG('r80cloud', o.key ?? 'c'), h = w * 0.085; ctx.save(); ctx.fillStyle = r80V(y - h, y + h * 5.4, o.stops ?? ['#fff6dc', '#ffc2d8']); ctx.beginPath();
+  for (let i = 0; i < 4; i++) { const bw = w * (i === 1 || i === 2 ? R.r(0.8, 1) : R.r(0.42, 0.66)), bx = x - bw / 2 + R.n(w * 0.12); ctx.roundRect(bx, y + i * h * 1.45, bw, h, h / 2); }
+  ctx.fill(); ctx.restore();
+}
+// a gull silhouette; flap -1..1
+function r80Bird(x, y, s, flap = 0, c = R80.indigo) {
+  ctx.save(); ctx.translate(x, y); ctx.strokeStyle = c; ctx.lineWidth = s * 0.15; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath();
+  const wy = -s * 0.36 * flap; ctx.moveTo(-s, wy); ctx.quadraticCurveTo(-s * 0.5, wy - s * 0.42, 0, 0); ctx.quadraticCurveTo(s * 0.5, wy - s * 0.42, s, wy); ctx.stroke(); ctx.restore();
+}
+// an eighth note with a hard shadow
+function r80Note(x, y, s, c = R80.purple, rot = 0) {
+  if (s <= 1) return;
+  const draw = (col) => { ctx.fillStyle = ctx.strokeStyle = col; ctx.beginPath(); ctx.ellipse(0, 0, s * 0.3, s * 0.22, -0.4, 0, TAU); ctx.fill(); ctx.lineWidth = s * 0.1; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(s * 0.26, -s * 0.06); ctx.lineTo(s * 0.26, -s); ctx.quadraticCurveTo(s * 0.7, -s * 0.8, s * 0.62, -s * 0.42); ctx.stroke(); };
+  ctx.save(); ctx.translate(x + s * 0.09, y + s * 0.1); ctx.rotate(rot); draw(R80.indigo); ctx.restore();
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); draw(c); ctx.restore();
+}
+// a coloured vinyl record: an airbrushed disc, grooves, two shine wedges, a spinning label. o: c (pink), label (yellow), spin (radians), shadow
+function r80Record(x, y, r, o = {}) {
+  const c = o.c ?? R80.pink, spin = o.spin ?? TT * 3, P = ellipsePts(x, y, r, r, 0, 64);
+  if (o.shadow !== false) { ctx.save(); ctx.translate(14, 16); trace(P, true); ctx.fillStyle = R80.indigo; ctx.fill(); ctx.restore(); }
+  ctx.save(); trace(P, true); ctx.fillStyle = r80V(y - r, y + r, r80Hot(c)); ctx.fill(); ctx.clip();
+  ctx.strokeStyle = r80A(r80Tone(c, -0.45), 0.5); ctx.lineWidth = 3;
+  for (const k of [0.5, 0.6, 0.7, 0.78, 0.86, 0.93]) { ctx.beginPath(); ctx.arc(x, y, r * k, 0, TAU); ctx.stroke(); }
+  for (const a of [-0.9, Math.PI - 0.9]) { ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, r, a - 0.2, a + 0.2); ctx.closePath(); ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.fill(); }   // the airbrushed shine stays put while the label turns
+  ctx.restore();
+  ctx.save(); ctx.translate(x, y); ctx.rotate(spin);
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.38, 0, TAU); ctx.fillStyle = r80V(-r * 0.38, r * 0.38, ['#fff2a8', o.label ?? R80.yellow, R80.orange]); ctx.fill(); ctx.strokeStyle = R80.indigo; ctx.lineWidth = r * 0.03; ctx.stroke();
+  ctx.fillStyle = R80.indigo; ctx.beginPath(); ctx.roundRect(-r * 0.26, -r * 0.2, r * 0.52, r * 0.07, r * 0.03); ctx.roundRect(-r * 0.18, r * 0.14, r * 0.36, r * 0.05, r * 0.02); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.06, 0, TAU); ctx.fillStyle = R80.cream; ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the hero: Kaset, a little teal cassette tape whose two reels are its eyes. (x, y) = the body centre at rest, r = half its
+//  width; it stands on y + 0.95r. o: key, c, mood 'smile' | 'happy' | 'wow', look [x, y] (-1..1), tilt (radians), sx, sy
+//  (squash about the feet), lift, step (-1..1: which foot is up), spin (reel angle), blink, legs (false = none), shadow
+// ---------------------------------------------------------------------
+function r80Hero(x, y, r, o = {}) {
+  const key = o.key ?? 'kaset', c = o.c ?? R80.teal, look = o.look ?? [0, 0], mood = o.mood ?? 'smile', lift = o.lift ?? 0;
+  const hb = r * 1.3, leg = o.legs === false ? 0 : r * 0.3, gy = y + hb / 2 + leg, spin = o.spin ?? TT * 4, ink = R80.indigo;
+  const blink = o.blink ?? (mod(TT + (hash(key) % 97) / 31, 2.9) < 0.1);
+  SPARK_AT = toScreen(x, y - lift);
+  if (o.shadow !== false) { const k = clamp(lift / (r * 1.6)); ctx.save(); ctx.globalAlpha *= 0.34 * (1 - 0.5 * k); ctx.fillStyle = ink; ctx.beginPath(); ctx.ellipse(x, gy + r * 0.05, r * (1.05 - 0.3 * k), r * 0.13, 0, 0, TAU); ctx.fill(); ctx.restore(); }
+  ctx.save(); ctx.translate(x, gy - lift); ctx.scale(o.sx ?? 1, o.sy ?? 1); ctx.translate(0, -(hb / 2 + leg)); ctx.rotate(o.tilt ?? 0);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  if (leg) for (const s of [-1, 1]) {   // short legs and yellow sneakers
+    const up = Math.max(0, (o.step ?? 0) * s) * r * 0.14, fx = s * r * 0.42, fy = hb / 2 + leg - up;
+    ctx.strokeStyle = ink; ctx.lineWidth = r * 0.11; ctx.beginPath(); ctx.moveTo(fx, hb / 2 - 4); ctx.lineTo(fx, fy - r * 0.1); ctx.stroke();
+    ctx.beginPath(); ctx.roundRect(fx - r * 0.2 + s * r * 0.05, fy - r * 0.17, r * 0.4, r * 0.17, r * 0.08); ctx.fillStyle = R80.yellow; ctx.fill(); ctx.lineWidth = r * 0.05; ctx.stroke();
+  }
+  const B0 = rrectPts(-r, -hb / 2, 2 * r, hb, r * 0.16, 5);
+  r80Path(B0); ctx.fillStyle = r80V(-hb / 2, hb / 2, [r80Tone(c, 0.42), c, r80Tone(c, -0.34)]); ctx.fill(); ctx.strokeStyle = ink; ctx.lineWidth = r * 0.07; ctx.stroke();
+  ctx.save(); r80Path(B0); ctx.clip(); ctx.fillStyle = 'rgba(255,255,255,0.2)'; ctx.beginPath(); ctx.moveTo(-r * 0.86, -hb / 2); ctx.lineTo(-r * 0.4, -hb / 2); ctx.lineTo(-r * 0.92, hb / 2); ctx.lineTo(-r * 1.4, hb / 2); ctx.fill(); ctx.restore();   // an airbrushed sheen
+  // the shell's lower trapezoid, where the mouth sits
+  r80Path([[-r * 0.56, hb / 2 - r * 0.035], [-r * 0.44, r * 0.3], [r * 0.44, r * 0.3], [r * 0.56, hb / 2 - r * 0.035]]); ctx.fillStyle = r80Tone(c, 0.3); ctx.fill(); ctx.lineWidth = r * 0.04; ctx.stroke();
+  // the label: cream with three sunset stripes
+  ctx.save(); ctx.beginPath(); ctx.roundRect(-r * 0.84, -r * 0.54, r * 1.68, r * 0.76, r * 0.08); ctx.fillStyle = R80.cream; ctx.fill(); ctx.clip();
+  [R80.pink, R80.orange, R80.yellow].forEach((sc, i) => { ctx.fillStyle = sc; ctx.fillRect(-r, -r * 0.54 + i * r * 0.065, 2 * r, r * 0.07); });
+  ctx.restore();
+  ctx.beginPath(); ctx.roundRect(-r * 0.84, -r * 0.54, r * 1.68, r * 0.76, r * 0.08); ctx.lineWidth = r * 0.04; ctx.stroke();
+  // the tape window with the two reels = the eyes
+  ctx.beginPath(); ctx.roundRect(-r * 0.66, -r * 0.3, r * 1.32, r * 0.46, r * 0.21); ctx.fillStyle = ink; ctx.fill();
+  for (const s of [-1, 1]) {
+    const ex = s * r * 0.37, ey = -r * 0.07, er = r * 0.18;
+    ctx.fillStyle = R80.white;
+    if (blink) { ctx.beginPath(); ctx.roundRect(ex - er, ey - r * 0.02, er * 2, r * 0.04, r * 0.02); ctx.fill(); continue; }
+    ctx.beginPath(); ctx.arc(ex, ey, er, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#b9a8e0'; ctx.lineWidth = r * 0.035; ctx.beginPath();
+    for (let i = 0; i < 3; i++) { const a = spin * s + i * TAU / 3; ctx.moveTo(ex + Math.cos(a) * er * 0.72, ey + Math.sin(a) * er * 0.72); ctx.lineTo(ex + Math.cos(a) * er * 0.98, ey + Math.sin(a) * er * 0.98); }
+    ctx.stroke(); ctx.strokeStyle = ink;
+    const px = ex + clamp(look[0], -1, 1) * er * 0.3, py = ey + clamp(look[1], -1, 1) * er * 0.3, pr = er * (mood === 'wow' ? 0.4 : 0.5);
+    ctx.fillStyle = ink; ctx.beginPath(); ctx.arc(px, py, pr, 0, TAU); ctx.fill();
+    ctx.fillStyle = R80.white; ctx.beginPath(); ctx.arc(px - pr * 0.35, py - pr * 0.38, pr * 0.32, 0, TAU); ctx.fill();
+  }
+  // cheeks and mouth
+  r80Puff(-r * 0.74, r * 0.36, r * 0.17, r * 0.12, R80.pink, 0.75); r80Puff(r * 0.74, r * 0.36, r * 0.17, r * 0.12, R80.pink, 0.75);
+  ctx.strokeStyle = ctx.fillStyle = ink; ctx.lineWidth = r * 0.055;
+  if (mood === 'wow') { ctx.beginPath(); ctx.ellipse(0, r * 0.47, r * 0.075, r * 0.095, 0, 0, TAU); ctx.fill(); }
+  else if (mood === 'happy') { ctx.beginPath(); ctx.moveTo(-r * 0.17, r * 0.4); ctx.arc(0, r * 0.4, r * 0.17, 0, Math.PI); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.save(); ctx.clip(); ctx.fillStyle = R80.pink; ctx.beginPath(); ctx.ellipse(0, r * 0.58, r * 0.11, r * 0.07, 0, 0, TAU); ctx.fill(); ctx.restore(); }
+  else { ctx.beginPath(); ctx.arc(0, r * 0.37, r * 0.15, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke(); }
+  ctx.restore();
+}
+const r80HeroPts = (x, y, r) => rrectPts(x - r, y - r * 0.65, 2 * r, r * 1.3, r * 0.16, 6);
+
+// ---------------------------------------------------------------------
+//  captions and tags (through DEFER: after the camera, at screen size). The caption is a solid dark-indigo slanted bar
+//  with a pink underline bar behind it; cream italic display caps, one *word* in yellow. The tag is a small yellow
+//  slanted plate. Both slide away as a bridge starts and come back when the next era is open.
+// ---------------------------------------------------------------------
+function r80BridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.i2(seg(TT, r.tc - d, r.tc - d + 0.22));
+    if (TT >= r.tc && TT < r.tc + d + 0.25) return EZ.o3(seg(TT, r.tc + d - 0.1, r.tc + d + 0.25));
+  }
+  return 1;
+}
+const r80Slant = (w, h, sk = 0.22) => [[-w / 2 + sk * h / 2, -h / 2], [w / 2 + sk * h / 2, -h / 2], [w / 2 - sk * h / 2, h / 2], [-w / 2 - sk * h / 2, h / 2]];
+//   o: y (bar centre, 1392), x (CX), size (62), at (seconds after the era starts, 0.5), hi (yellow), c (text), bar, under (pink), caps (true)
+function r80CaptionNow(str, o = {}) {
+  const k = r80BridgeK(), at = E0 + (o.at ?? 0.5); if (TT < at || k <= 0.004) return;
+  const size = o.size ?? 62, cx = o.x ?? CX, cy = o.y ?? 1392, hi = o.hi ?? R80.yellow, col = o.c ?? R80.cream;
+  const toks = str.split('*').map((s, i) => ({ s: (o.caps === false ? s : s.toUpperCase()).trim(), hi: i % 2 === 1 })).filter((t) => t.s);
+  ctx.save(); ctx.font = `${size}px ${R80_DISPLAY}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  if ('letterSpacing' in ctx) ctx.letterSpacing = (size * 0.035).toFixed(1) + 'px';
+  toks.forEach((t, i) => { t.w = ctx.measureText(t.s).width; t.gap = i === 0 ? 0 : /^[!?.,]/.test(t.s) ? size * 0.04 : size * 0.28; });
+  const tw = toks.reduce((a, t) => a + t.w + t.gap, 0), w = tw + size * 1.5, h = size * 1.72;
+  const sIn = springEase(TT - at, 320, 30), off = (1 - sIn) * -(cx + w) + (1 - k) * (W - cx + w);
+  ctx.translate(cx + off, cy); ctx.rotate(-0.02);
+  const P = r80Slant(w, h);
+  ctx.save(); ctx.translate(12, 13); r80Path(P); ctx.fillStyle = o.under ?? R80.pink; ctx.fill(); ctx.restore();
+  r80Path(P); ctx.fillStyle = o.bar ?? R80.indigo; ctx.fill();
+  ctx.transform(1, 0, -0.14, 1, 0, 0);
+  let xx = -tw / 2;
+  toks.forEach((t, i) => {
+    xx += t.gap; const p = springEase(TT - (at + 0.14 + i * 0.09), 260, 16);
+    if (p > 0.05) { ctx.save(); ctx.translate(xx + t.w / 2, size * 0.36); ctx.scale(p, p); ctx.fillStyle = t.hi ? hi : col; ctx.fillText(t.s, -t.w / 2, 0); ctx.restore(); }
+    xx += t.w;
+  });
+  ctx.restore();
+}
+//   o: x (70, the left edge), y (300, the centre), size (48), at (0.25), c (yellow), col (text)
+function r80TagNow(str, o = {}) {
+  const k = r80BridgeK(), p = springEase(TT - (E0 + (o.at ?? 0.25)), 260, 14) * k; if (p <= 0.05) return;
+  const size = o.size ?? 48, s = (o.caps === false ? str : str.toUpperCase());
+  ctx.save(); ctx.font = `${size}px ${R80_DISPLAY}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  if ('letterSpacing' in ctx) ctx.letterSpacing = (size * 0.05).toFixed(1) + 'px';
+  const w = ctx.measureText(s).width + size * 1.3, h = size * 1.6, P = r80Slant(w, h);
+  ctx.translate((o.x ?? 70) + w / 2 + h * 0.11, o.y ?? 300); ctx.rotate(-0.035); ctx.scale(p, p);
+  ctx.save(); ctx.translate(8, 9); r80Path(P); ctx.fillStyle = o.under ?? R80.pink; ctx.fill(); ctx.restore();
+  r80Path(P); ctx.fillStyle = r80V(-h / 2, h / 2, ['#ffe98a', o.c ?? R80.yellow, R80.orange]); ctx.fill(); ctx.strokeStyle = R80.indigo; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.transform(1, 0, -0.14, 1, 0, 0); ctx.fillStyle = o.col ?? R80.indigo; ctx.fillText(s, size * 0.03, size * 0.36);
+  ctx.restore();
+  r80Twinkle((o.x ?? 70) + w + h * 0.1, (o.y ?? 300) - h * 0.5, 40, E0 + (o.at ?? 0.25) + 0.2, { shadow: true });
+}
+const r80Caption = (str, o = {}) => { const f = () => r80CaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const r80Tag = (str, o = {}) => { const f = () => r80TagNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---------------------------------------------------------------------
+//  the VHS finish: a slight chroma offset (red slips 2px right), faint scanlines, soft film grain, a light vignette
+// ---------------------------------------------------------------------
+function r80Post(o = {}) {
+  const dst = ctx.canvas, sc = r80Cache('scratch', W, H, () => {}), g = sc.getContext('2d'), dx = o.chroma ?? 2;
+  ctx.save(); screen();
+  if (dx) {
+    g.globalCompositeOperation = 'copy'; g.drawImage(dst, 0, 0); g.globalCompositeOperation = 'multiply'; g.fillStyle = '#ff0000'; g.fillRect(0, 0, W, H);   // the red channel alone
+    ctx.globalCompositeOperation = 'multiply'; ctx.fillStyle = '#00ffff'; ctx.fillRect(0, 0, W, H);                                                            // take red out of the frame
+    ctx.globalCompositeOperation = 'lighter'; ctx.drawImage(sc, 0, 0, dx, H, 0, 0, dx, H); ctx.drawImage(sc, dx, 0);                                            // put it back, shifted
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.fillStyle = r80Pat('scan', 4, 4, () => { ctx.fillStyle = 'rgba(36,16,79,0.11)'; ctx.fillRect(0, 0, 4, 1); ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fillRect(0, 2, 4, 1); });
+  ctx.fillRect(0, 0, W, H);
+  const k = F % 4, R = RNG('r80grain', F), gx = R.i(0, 255), gy = R.i(0, 255);
+  ctx.translate(-gx, -gy);
+  ctx.fillStyle = r80Pat('grain' + k, 256, 256, () => { const S = RNG('r80grainT', k); for (let i = 0; i < 2600; i++) { ctx.fillStyle = S.f() < 0.5 ? 'rgba(255,255,255,0.075)' : 'rgba(36,16,79,0.075)'; ctx.fillRect(S.i(0, 255), S.i(0, 255), 2, 2); } });
+  ctx.fillRect(gx, gy, W, H); ctx.translate(gx, gy);
+  ctx.drawImage(r80Cache('vig', W, H, () => { const v = ctx.createRadialGradient(W / 2, H / 2, H * 0.36, W / 2, H / 2, H * 0.74); v.addColorStop(0, 'rgba(36,16,79,0)'); v.addColorStop(1, 'rgba(36,16,79,0.3)'); ctx.fillStyle = v; ctx.fillRect(0, 0, W, H); }), 0, 0);
+  ctx.restore();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'retro-80s',
+  paper: R80.paper,
+  // the poster board in colour c (hex, or rgb() mid-morph): an airbrushed top-to-bottom ramp and the dotted grid
+  backdrop(c) {
+    ctx.save(); screen(); ctx.fillStyle = r80V(0, H, [r80Tone(c, 0.3), c, r80Mix(c, R80.pink, 0.22)]); ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = r80DotPat(); ctx.fillRect(0, 0, W, H); ctx.restore();
+  },
+  // the era seen through a hole with a chrome rim; the rim thins onto the bridge object
+  window(P, key, src, o = {}) {
+    ctx.save(); trace(P, true); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    const u = o.u ?? 0, wd = 26 * (o.phase === 'grow' ? Math.min(1, u * 5) : Math.min(1, (1 - u) * 5)); if (wd < 1) return;
+    const bb = bbox(P); ctx.save(); ctx.lineJoin = 'round';
+    trace(P, true); ctx.strokeStyle = R80.indigo; ctx.lineWidth = wd + 10; ctx.stroke();
+    ctx.strokeStyle = r80V(Math.max(bb.y0, -200), Math.min(bb.y1, H + 200), R80_CHROME); ctx.lineWidth = wd; ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = wd * 0.14; ctx.stroke(); ctx.restore();
+  },
+  // the morphing shape: an airbrushed disc with a hard shadow; the sun's slats close and a record's grooves appear as u goes 0 -> 1
+  blob(P, c, key, u = 0) {
+    const ce = r80Centroid(P), bb = bbox(P), gaps = r80SunGaps(bb, EZ.io(u));
+    const k = EZ.io(u);   // the hard shadow slides out from under the disc (the sun has none, the record has one); never seen through the slats
+    ctx.save(); ctx.beginPath(); ctx.rect(-50, -50, W + 100, H + 100); P.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.clip('evenodd');
+    ctx.translate(14 * k, 16 * k); trace(P, true); ctx.fillStyle = R80.indigo; ctx.fill(); ctx.restore();
+    r80BandFill(P, gaps, r80V(bb.y0, bb.y1, r80Hot(c)));
+    ctx.save(); trace(P, true); ctx.clip();
+    r80Puff(lerp(bb.x0, bb.x1, 0.32), lerp(bb.y0, bb.y1, 0.25), (bb.x1 - bb.x0) * 0.38, (bb.y1 - bb.y0) * 0.25, '#ffffff', 0.34 * (1 - u));
+    ctx.strokeStyle = r80A(r80Tone(c, -0.45), 0.5 * u); ctx.lineWidth = 3;
+    for (const k of [0.5, 0.6, 0.7, 0.78, 0.86, 0.93]) { trace(P.map(([x, y]) => [ce[0] + (x - ce[0]) * k, ce[1] + (y - ce[1]) * k]), true); ctx.stroke(); }
+    ctx.restore();
+    const s = Math.sin(Math.PI * u);
+    r80Sparkle(lerp(bb.x0, bb.x1, 0.86), lerp(bb.y0, bb.y1, 0.12), 90 * s, { rot: u * 1.2, shadow: true });
+    r80Sparkle(lerp(bb.x0, bb.x1, 0.08), lerp(bb.y0, bb.y1, 0.8), 56 * s, { rot: -u, shadow: true });
+  },
+  hero(x, y, r, o = {}) { r80Hero(x, y, r * 0.8, { key: o.key, mood: o.mood }); },
+  heroColor: R80.teal,
+  heroPts(x, y, r) { return r80HeroPts(x, y, r * 0.8); },
+  post() { r80Post(); },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — retro-80s demo. World coordinates 1080x1920; time TT on 1s. Content inside x 60-940, y 250-1500.
+//  Era 1 "Senja": a sunset sky over a grid floor (horizon y = 1000). Era 2 "Pesta": a cream Memphis party wall
+//  over a pink dance floor (horizon y = 1232). The grid floor and Kaset are the thread through both.
+// =====================================================================
+const cu = TIMELINE.cues;
+const HY = 1000, HY2 = 1232;
+// the bridge objects: nothing else may overlap them at the bridge, or it shows in the morph window
+const SUN = { x: 520, y: 712, r: 200 };
+const REC = { x: 530, y: 800, r: 225 };
+const HERO_R = 104, FEET = 1292;                 // Kaset stands on y = FEET, clear of the caption bar (1338-1446)
+const heroY = FEET - 0.95 * HERO_R;
+// a damped squash after a landing at time t0
+const landQ = (t0, amt = 0.16) => (TT < t0 ? 0 : amt * Math.exp(-(TT - t0) * 9) * Math.cos((TT - t0) * 24));
+
+// ---- era 1: a cool 80s sunset
+const sunY = () => springMove(cu.rise, HY + 250, SUN.y, SPRING.heavy);
+const sunPts = () => r80SunPts(SUN.x, sunY(), SUN.r);
+const TRI = [[520, 368], [886, 968], [154, 968]], TRI_C = [520, 968];
+function sceneSenja() {
+  r80Sky(HY, { sun: { x: SUN.x, y: SUN.y } });
+  // sparkles popping on the beat, stripe clouds drifting, three gulls (background life)
+  r80Twinkles('senja', { box: [90, 290, 930, 600], n: 2, s: [26, 52], avoid: [[40, 230, 330, 360], [300, 340, 740, 620]] });
+  r80Cloud(196 + 10 * TT, 470, 230, { key: 'c1' });
+  r80Cloud(826 - 8 * TT, 410, 184, { key: 'c2' });
+  for (let i = 0; i < 3; i++) r80Bird(770 - 44 * TT + i * 62, 318 + i * 24 + 5 * Math.sin(TT * 3 + i), 20 - i * 3, Math.sin(TT * 9 + i * 1.3));
+  // a chrome triangle springs up behind the sun, then a shine sweeps across it
+  const tk = springEase(TT - cu.tri, 240, 17);
+  if (tk > 0.02) {
+    const sc = (P, k) => P.map(([x, y]) => [TRI_C[0] + (x - TRI_C[0]) * k, TRI_C[1] + (y - TRI_C[1]) * k]);
+    const ce = [520, 768], outer = sc(TRI, tk), inner = sc(TRI.map(([x, y]) => [ce[0] + (x - ce[0]) * 0.74, ce[1] + (y - ce[1]) * 0.74]), tk);
+    r80Chrome(outer, { hole: inner, bevel: 8, shine: seg(TT, cu.shine1, cu.shine1 + 0.6) });
+  }
+  // the sun rises from behind the horizon; its slats keep sliding down
+  r80Sun(SUN.x, sunY(), SUN.r, { clipY: HY });
+  // silhouette layers, each with its own parallax; they dip where the sun sits
+  r80Range('far', HY, { amp: 250, step: 112, x: -6 * TT, gap: [SUN.x, 440, 0.06], sunX: SUN.x, stops: ['#9a45d6', '#4a1d8f'] });
+  r80City('kota', HY, { amp: 150, x0: 650, x1: 1200, x: -12 * TT, stops: ['#5a22a6', '#2f1470'] });
+  r80Range('near', HY, { amp: 140, step: 84, x: -18 * TT, gap: [SUN.x, 400, 0.04], sunX: SUN.x, stops: ['#4a1d8f', R80.indigo], lit: '#ff7fc0' });
+  r80Floor(HY, { sun: { x: SUN.x }, speed: 1.1 });
+  r80Palm(118, 1034, 470, { key: 'p1', lean: 0.45 });
+  r80Palm(912, 1026, 390, { key: 'p2', lean: -0.55 });
+  r80Twinkle(TRI[0][0], TRI[0][1] + 8, 96, cu.shine1 + 0.45);                                   // the shine leaves a sparkle on the apex
+  r80Twinkle(SUN.x + SUN.r * 0.82, SUN.y - SUN.r * 0.82, 84, cu.jump);                          // one on the sun's rim (outside the disc)
+  // Kaset tumbles in from the left in two hops, lands with a squash, bops on the beat, then jumps for joy
+  const u = seg(TT, cu.roll, cu.land), e = EZ.o2(u), rolling = u < 1, jump = Math.sin(Math.PI * ev(cu.jump, 0.42));
+  const bop = TT > cu.land + 0.2 ? r80Beat(BEAT) : 0, sq = landQ(cu.land) + landQ(cu.jump + 0.42, 0.14) + 0.06 * bop - 0.09 * jump;
+  const wow = TT >= cu.jump && TT < cu.jump + 0.8;
+  r80Twinkle(330, FEET - 4, 64, cu.land - 0.04, { dur: 0.35 });
+  r80Hero(lerp(-160, 286, e), heroY, HERO_R, {
+    tilt: rolling ? -(1 - e) * TAU : 0.07 * Math.sin(TT * TAU) * (1 - jump), lift: (rolling ? Math.abs(Math.sin(u * TAU)) * 64 : 0) + 100 * jump,
+    sx: 1 + sq, sy: 1 / (1 + sq), step: rolling ? 0 : Math.sin(TT * TAU), mood: wow ? 'wow' : rolling ? 'happy' : 'smile', look: wow ? [0.6, -0.9] : [0.7, -0.4],
+  });
+  r80Tag('Senja');
+  r80Caption('Senja *keren* era 80-an');
+}
+
+// ---- era 2: time for a music party
+const recPts = () => r80SunPts(REC.x, REC.y, REC.r);
+function scenePesta() {
+  const t = TT - 3;
+  r80Wall();
+  r80Band(64, 96, 'check', { speed: 50 });
+  r80Floor(HY2, { stops: ['#ff7ab6', R80.mag, R80.purple], c: R80.yellow, hc: R80.indigo, speed: 1.4, gap: 210, w: 8 });
+  // Memphis confetti springs in on the 16ths, spins and pulses with the beat (background life)
+  r80Confetti('pesta', 10, {
+    box: [80, 370, 920, 1195], at: (i) => cu.pop + i * E16,
+    avoid: [[REC.x - REC.r, REC.y - REC.r, REC.x + REC.r, REC.y + REC.r], [250, 360, 800, 545], [690, 560, 930, 650], [140, 1040, 380, HY2], [50, 240, 310, 350], [800, 680, 890, 1080]],
+  });
+  // notes float up beside the record
+  if (t > 0.6) for (let i = 0; i < 3; i++) { const ph = mod((t - 0.6) * 0.45 + i / 3, 1); r80Note(838 + 26 * Math.sin(ph * TAU + i), lerp(1070, 700, ph), 64 * Math.sin(Math.PI * ph) ** 0.5, [R80.purple, R80.mag, R80.orange][i], 0.2 * Math.sin(ph * 9 + i)); }
+  // the record the sun became: it spins, and sparkles pop on its shine
+  r80Record(REC.x, REC.y, REC.r, { spin: t * 4 });
+  r80Twinkle(REC.x + REC.r * 0.6, REC.y - REC.r * 0.62, 90, 4.25, { shadow: true });
+  r80Twinkle(REC.x - REC.r * 0.62, REC.y + REC.r * 0.6, 70, 5.25, { shadow: true });
+  // chrome lettering drops in, a shine sweeps across it, then a brush-script word is written under it
+  const tk = springEase(TT - cu.title, 250, 15);
+  if (tk > 0.02) { ctx.save(); ctx.translate(520, 522); ctx.rotate(-0.035); ctx.scale(tk, tk); r80ChromeText('ASYIK!', 0, 0, 190, { shine: seg(TT, cu.shine2, cu.shine2 + 0.5) }); ctx.restore(); }
+  r80Twinkle(796, 388, 86, cu.shine2 + 0.4, { shadow: true });
+  r80Script('banget', 806, 626, 78, R80.mag, { reveal: seg(TT, cu.script, cu.script + 0.3), rot: -0.12 });
+  // Kaset dances: a bop on every beat, a sway, and a hop at the end
+  const hop = Math.sin(Math.PI * ev(cu.hop, 0.4)), bop = r80Beat(BEAT), sq = 0.07 * bop + landQ(cu.hop + 0.4, 0.15) - 0.08 * hop;
+  r80Hero(252, heroY + (HY2 + 60 - FEET), HERO_R, {
+    tilt: 0.12 * Math.sin(TT * TAU) * (1 - hop), lift: 12 * bop + 96 * hop, sx: 1 + sq, sy: 1 / (1 + sq), step: Math.sin(TT * TAU),
+    mood: t < 0.75 ? 'wow' : 'happy', look: [0.7, -0.5],
+  });
+  r80Tag('Pesta', { c: R80.yellow });
+  r80Caption('Saatnya *pesta* musik!');
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — retro-80s demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = ['#ff4f9e', '#ffd2b0'];
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.6, 2.3, { z: 1.05, p: [SUN.x, 860], to: [540, 860] });                                       // a slow push toward the sun
+  return camMix(camOf({ z: 1.1, p: [REC.x, REC.y], to: [REC.x, REC.y] }), CAM0, EZ.io(seg(t, 3.3, 4.3)));                      // open close on the record, settle back
+}
+const BRIDGES = [
+  // the sun (a disc) -> the record (a disc): the same proportions; orange -> hot pink
+  { tc: 3.0, A: () => ({ P: sunPts(), c: R80.orange }), B: () => ({ P: recPts(), c: R80.pink }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — retro-80s demo (inside buildScore(); see kit/score-head.js). Synth-pop: a saw pad, an octave bass on
+  // the 8ths, a bright 16th arpeggio, a kick / snare / hat kit that comes in fully at the party; sparkles are chimes.
+  const T = TIMELINE, q = T.cues;
+  const snare = (t, v) => { noiseHit(t, 0.15, 'bandpass', 1900, 0.8, v, 0, 0.35); blip(t, 230, 150, 0.07, v * 0.5); };
+  const hat = (t, v, pan = 0) => noiseHit(t, 0.035, 'highpass', 7500, 0.7, v, pan);
+  const spark = (t, v, pan = 0) => chime(t, [nz('E6'), nz('A6')], v, pan);
+  const pop = (t, f, v, pan = 0) => blip(t, f, f * 2.1, 0.06, v, pan);
+  const thud = (t, v, pan = 0) => { sub(t, v); noiseHit(t, 0.08, 'lowpass', 600, 0.7, v * 0.3, pan, 0.2); };
+  to = 'm';
+  pad(0.0, 3.1, ['A2', 'E3', 'A3', 'C4'], 0.045, { cut: 1300, att: 0.4, rel: 0.3, send: 0.4 });
+  pad(3.0, 4.55, ['C3', 'G3', 'C4', 'E4'], 0.06, { cut: 2000, att: 0.1, rel: 0.2, send: 0.4 });
+  pad(4.5, 6.05, ['F2', 'C3', 'A3', 'F4'], 0.06, { cut: 2000, att: 0.1, rel: 0.3, send: 0.4 });
+  for (let i = 0; i < 24; i++) { const t = i * E8, root = t < 3 ? 'A' : t < 4.5 ? 'C' : 'F'; bass(t, nz(root + (i % 2 ? '3' : '2')), t < 3 ? 0.075 : 0.095); }
+  const aA = ['A4', 'C5', 'E5', 'C5'], aC = ['C5', 'E5', 'G5', 'E5'], aF = ['C5', 'F5', 'A5', 'F5'];
+  for (let i = 0; i < 48; i++) { const t = i * E16; if (t < 1.0) continue; const A = t < 3 ? aA : t < 4.5 ? aC : aF; pluck(t, nz(A[i % 4]), t < 3 ? 0.04 : 0.055, i % 2 ? 0.3 : -0.3, 0.16, t < 3 ? 2600 : 4200, 0.25); }
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; if (t >= 1.0) sub(t, t < 3 ? 0.07 : 0.1); if (t >= 3 && i % 2) snare(t, 0.07); }
+  for (let i = 0; i < 24; i++) { const t = i * E8; if (t >= 1.0) hat(t, t < 3 ? 0.018 : 0.03, i % 2 ? 0.3 : -0.3); }
+  ['C4', 'E4', 'G4', 'C5'].forEach((n, i) => pluck(3.0, nz(n), 0.1, -0.3 + i * 0.2, 0.5, 4200, 0.35));                     // the payoff: the party
+  chime(3.0, [nz('C6'), nz('E6'), nz('G6')], 0.05, 0);
+  to = 's';
+  blip(q.rise + 0.02, 180, 620, 0.6, 0.03, 0);                                                                           // the sun rises
+  [0, 0.25, 0.5].forEach((d, i) => pop(q.roll + d, 300 + i * 70, 0.04, -0.6 + i * 0.25));                                // Kaset tumbles in
+  pop(q.tri, 520, 0.05, 0); noiseHit(q.tri, 0.1, 'bandpass', 2400, 1.2, 0.03, 0, 0.3);                                   // the chrome triangle springs up
+  thud(q.land, 0.1, -0.3);
+  sweep(q.shine1, q.shine1 + 0.5, 0.014, 2500, 9000, 0); spark(q.shine1 + 0.5, 0.045, 0);                                 // the shine and its sparkle
+  blip(q.jump, 420, 980, 0.2, 0.04, -0.3); spark(q.jump + 0.05, 0.04, 0.3); thud(q.jump + 0.42, 0.07, -0.3);              // the jump
+  riser(2.4, 3.0, 0.028);                                                                                                 // into the morph
+  sub(3.0, 0.12); noiseHit(3.0, 0.2, 'bandpass', 900, 3, 0.05, 0, 0.15, 3400);                                            // the record starts
+  for (let i = 0; i < 7; i++) pop(q.pop + i * E16, 560 + i * 90, 0.04, -0.5 + i * 0.16);                                   // confetti
+  thud(q.title, 0.12, 0); noiseHit(q.title, 0.12, 'highpass', 3000, 0.7, 0.04, 0, 0.3);                                   // the lettering slams in
+  spark(4.25, 0.04, 0.3);
+  sweep(q.shine2, q.shine2 + 0.45, 0.016, 2500, 9500, 0); spark(q.shine2 + 0.45, 0.045, 0.4);
+  blip(q.script, 900, 1500, 0.28, 0.03, 0.4);                                                                             // the brush word is written
+  spark(5.25, 0.035, -0.3);
+  blip(q.hop, 420, 980, 0.2, 0.04, -0.4); thud(q.hop + 0.4, 0.08, -0.4);                                                  // the last hop
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Origami demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2730; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ORIGAMI DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a pale blue table a white square lands on its crease pattern and
+//  is folded, one fold per beat, into a little boat: the top half comes down (indigo), two corners fold up (white),
+//  the sail stands (white). It rocks and drifts over two pleated paper waves. At 3.0s the boat flattens back into
+//  the square it came from, now vermilion on warm kraft, and that square is folded into the crane: in half, into a
+//  kite, opened (wings, neck and tail swing out), head down. It rocks on its base and flexes its wings while two
+//  stars fold open and a butterfly flaps.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/origami/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneBoat()], [3, 6, () => sceneCrane()]];
+const SHOTS = [
+  ['boat',  0, 0.0, 3.0, 'a white square lands on its crease pattern and is folded in three moves into a boat; it rocks and drifts over pleated waves'],
+  ['crane', 1, 3.0, 6.0, 'the boat flattens into a vermilion square that is folded into the crane; it rocks and flexes its wings; stars fold open, a butterfly flaps'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { land: 0.25, f1: 0.5, f2: 1.0, f3: 1.5, float: 1.95, c1: 3.4, c2: 3.75, open: 4.1, head: 4.5, star1: 4.5, star2: 4.75, flap1: 5.0, flap2: 5.5 },
+  acts: [
+    { name: '1 Boat',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Crane', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.1, title: 'a square, three folds: a boat', sound: 'soft plucks; a paper swish and a crease tick on every fold', next: 'the boat flattens back into the square' },
+    { t: 5.25, title: 'the same square folds into a crane', sound: 'the plucks open into a chord; swishes, a chime as the head folds down', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

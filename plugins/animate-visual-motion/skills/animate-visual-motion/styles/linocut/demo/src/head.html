@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linocut demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #141210; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LINOCUT DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A solid inked block. The knife carves a moon, stars, a ridge of
+//  grass and a sitting hare out of the black; the block is pressed and red poppies print a hair off register.
+//  At 3.0s the moon disc becomes the sun: the sky is cleared away around it (leaving chatter), hills are carved
+//  in rows that follow their ridges, the block is pressed again, and the hare hops.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/linocut/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneNight()], [3, 6, () => sceneDay()]];
+const SHOTS = [
+  ['night', 0, 0.0, 3.0, 'a moon, stars, a grassy ridge and a hare are carved out of the black block; it is pressed and poppies print red'],
+  ['day',   1, 3.0, 6.0, 'the moon becomes a red sun; the sky is cleared around it, hills are carved in rows, a second press, the hare hops'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { moon: 0.0, stars: 0.25, ridge: 0.5, hare: 0.75, grass: 1.0, poppy: 1.25, press: 1.75, twitch: 2.0, sky: 3.25, rays: 3.25, hills: 3.5, hare2: 4.0, poppy2: 4.25, press2: 4.75, hop1: 5.0, hop2: 5.5 },
+  acts: [
+    { name: '1 Night', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Day',   role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.25, title: 'carved out of the dark', sound: 'a low drone, knife scrapes in streams, the thud of the press', next: 'the moon becomes the sun' },
+    { t: 5.25, title: 'printed in daylight', sound: 'the tune opens to major; long clearing scrapes, a second press, two hops', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

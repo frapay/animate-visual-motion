@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07050f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  THERMAL DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A handheld infrared camera. A cold kitchen counter: a kettle pours,
+//  the mug fills and glows up the ramp from purple to white, heat creeps along a spoon, steam rises, a hand print
+//  cools on the table and cold pools round a glass of ice. At 3.0s the shutter clicks and the hot mug becomes a cat
+//  sitting in a hallway: paw prints fade behind it, a radiator warms fin by fin, a cold window leaks a draught and
+//  a mouse runs along the wall. The HUD's readings are measured from the picture.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/thermal/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneKitchen()], [3, 6, () => sceneHall()]];
+const SHOTS = [
+  ['kitchen', 0, 0.0, 3.0, 'a kettle pours into a cold mug: it fills and glows, steam rises, heat creeps up a spoon, a hand print cools, cold pools round a glass of ice'],
+  ['hall',    1, 3.0, 6.0, 'the hot mug becomes a cat: paw prints fade behind it, a radiator warms fin by fin, a window leaks cold, a mouse runs along the wall'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { frost: 0.0, pour: 0.5, fill: 0.75, steam: 1.0, spoon: 1.0, stop: 2.0, nuc: 3.0, rad: 3.5, draught: 3.5, mouse: 4.5, ear: 4.75, blink: 5.5 },
+  acts: [
+    { name: '1 Kitchen', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Hallway', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'pour the heat', sound: 'a cool pulse, a tone that rises as the mug fills, soft sensor ticks', next: 'the shutter clicks: the mug becomes the cat' },
+    { t: 5.25, title: 'find the cat', sound: 'the pulse warms to major; fins tick as they heat, a mouse squeaks, a purr', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

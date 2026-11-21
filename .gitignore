@@ -1,0 +1,21 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# dependencies
+node_modules/
+
+# render output (never commit — regenerate with tools/export.mjs)
+renders/
+review/
+frames/
+frames-*/
+*.mp4
+*.mov
+*.wav
+
+# user work made while testing the skill inside this repo
+/pieces/
+/dist/

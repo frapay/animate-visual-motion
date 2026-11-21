@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>String art demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c0a09; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  STRING ART DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A walnut board. Nails are tapped in along a sun, a sailing
+//  boat and three rows of waves; one thread end winds each of them on, strand by strand, and a small coral heart
+//  flies as a kite from the masthead. At 3.0s the sun's ring of nails becomes a hot-air balloon on a midnight
+//  board: peaks are laced, stars are wrapped, a second colour is wound over the balloon, and its first web is
+//  unpicked and re-strung as a cardioid. The heart beats by being re-strung on the last two beats.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/string-art/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneSea()], [3, 6, () => sceneSky()]];
+const SHOTS = [
+  ['sea', 0, 0.0, 3.0, 'nails are tapped in and one thread winds a sun, a sailing boat and waves; a coral heart flies as a kite from the mast'],
+  ['sky', 1, 3.0, 6.0, 'the sun becomes a hot-air balloon at night; peaks are laced, stars wrapped, the balloon is re-strung as a cardioid, the heart beats'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { sunNails: 0.0, boatNails: 0.0625, waveNails: 0.125, sun: 0.25, sails: 0.375, hull: 0.625, waves: 0.75, rays: 1.0, heartNails: 1.0, heart: 1.125, birds: 1.375, beat1: 1.5,
+          nails2: 3.3, peaks: 3.5, ropes: 3.5, stars: 3.75, gold: 3.75, heart2: 4.0, unpick: 4.5, restring: 4.75, beat2: 5.0, beat3: 5.5 },
+  acts: [
+    { name: '1 Sea', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Sky', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.25, title: 'nail by nail', sound: 'small hammer taps, then a plucked note for every strand that goes taut, climbing', next: 'the sun becomes a balloon' },
+    { t: 5.25, title: 'pull it taut', sound: 'the tune opens up; the web is unpicked with a zip and re-strung, the heart beats twice', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

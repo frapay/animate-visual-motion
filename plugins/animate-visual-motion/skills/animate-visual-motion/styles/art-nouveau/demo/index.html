@@ -1,0 +1,1682 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Art Nouveau demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2418; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ART NOUVEAU DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A lithographic poster draws itself: the border climbs from the
+//  bottom corners and meets at the top, a rose halo fills ring by ring, a lily stem grows up a whiplash curve and
+//  opens petal by petal while a dragonfly arrives. The lily folds away and at 3.0s the rose halo becomes a gold
+//  one: a mosaic sets itself round it, an iris rises and opens, peacock feathers unfurl, ginkgo leaves drift down.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/art-nouveau/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep what matters in x 60–940, y 250–1500
+const CX = 540;                                               // the poster's axis
+
+const ERA_LIST = [[0, 3, () => sceneLily()], [3, 6, () => sceneIris()]];
+const SHOTS = [
+  ['lily', 0, 0.0, 3.0, 'the border draws itself, a rose halo fills ring by ring, a lily grows and opens, a dragonfly arrives; the lily folds away'],
+  ['iris', 1, 3.0, 6.0, 'the halo turns gold and sets its mosaic; an iris rises and opens, peacock feathers unfurl, ginkgo leaves drift down'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { border: 0.0, rings: 0.3, stem: 0.2, fly: 0.75, bloom: 0.95, fold: 2.3, rings2: 3.25, stem2: 3.25, feather: 3.5, bloom2: 4.0, swoop: 4.75, leaves: 3.6 },
+  acts: [
+    { name: '1 Lily', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Iris', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'a lily opens', sound: 'a slow harp, a soft flute note as each petal opens', next: 'the rose halo turns gold' },
+    { t: 5.25, title: 'an iris in gold', sound: 'the harp widens; glassy ticks as the mosaic sets', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/art-nouveau/kit.js — ART NOUVEAU: a lithographic poster from around 1900, printed on cream paper.
+//  LINE is the star: a dark olive-brown contour of varying weight (thick on the outside of a form, hair-thin inside)
+//  around flat, muted, slightly chalky colour with at most ONE soft tonal step. Everything is organic: whiplash
+//  S-curves, stems that swell and taper, tendrils ending in tight spirals, lily / iris / poppy / ginkgo forms,
+//  dragonfly and peacock-feather motifs. The composition is architectural: a tall arched panel in an ornamental
+//  border, a big halo disc with a repeating pattern behind the subject, foliage in the corner spandrels, a plinth,
+//  and a lettering cartouche at the bottom.
+//  Motion on 1s, slow, ease-in-out only: stems GROW along their path with the thickness swelling behind the tip,
+//  tendrils curl into their spirals, leaves unfurl in sequence, flowers open petal by petal, the halo fills ring by
+//  ring, the border draws itself from the bottom corners up and meets at the top.
+//  Built on kit/core.js. Helpers are prefixed nou…; the palette is NOU. Needs from the piece head: W, H, FPS.
+// =====================================================================
+const NOU = {
+  paper: '#efe4c8',     // cream stock: the sheet, the ground of the morph
+  line: '#3b3220',      // the key drawing: dark olive-brown contour, lettering
+  cream: '#f6eeda',     // the lightest flat: lily petals, the cartouche, beads, highlights
+  sage: '#b3bd92',      // quiet green: spandrels, leaves, panel tints
+  olive: '#75803f',     // stems, the plinth, the deeper green
+  rose: '#d9a79b',      // dusty rose: the lily's halo, petals, buds
+  roseD: '#b9777a',     // the rose's one tonal step; the caption accent
+  ochre: '#d3a650',     // ochre: the iris's halo, beads, anthers
+  gold: '#b08428',      // old gold: the ochre's tonal step (flat, never shiny)
+  teal: '#3f807d',      // peacock teal: the hero, feather eyes, the second panel
+  tealL: '#8fb9ae',     // pale teal: wings, the teal's light step
+  aub: '#5b3a55',       // aubergine: iris falls, eyes, the darkest flat
+  mauve: '#8a6485',     // the aubergine's light step: iris falls
+  lilac: '#b9a0b6',     // the lightest violet: iris standards
+};
+const NOU_FONT = '"Cochin", "Big Caslon", "Hoefler Text", "Palatino Linotype", "Book Antiqua", "URW Palladio L", "P052", "Georgia", "DejaVu Serif", serif';
+// the poster plate: outer rounded plate, a band of beads, the arched panel inside it
+const NOU_PANEL = { x0: 44, x1: 1036, y0: 100, y1: 1812, r: 44, band: 36, spring: 600, apex: 150 };
+
+// ---------------------------------------------------------------------
+//  timing: ease-in-out everywhere. nouE(u) eases 0..1; nouIn(t0, d) = eased progress of a move starting at t0.
+// ---------------------------------------------------------------------
+const nouE = (u) => { u = clamp(u); return u * u * (3 - 2 * u); };
+const nouIn = (t0, d = 0.8) => nouE((TT - t0) / d);
+
+// ---------------------------------------------------------------------
+//  stone and paper: the chalky unevenness inside a flat (one seeded tile) and the litho grain over the sheet
+// ---------------------------------------------------------------------
+let NOU_CHALK = null, NOU_GRAIN = null;
+function nouChalk() {
+  if (NOU_CHALK) return NOU_CHALK;
+  const T = 256, c = document.createElement('canvas'); c.width = c.height = T;
+  const g = c.getContext('2d'), R = RNG('nouchalk');
+  for (let i = 0; i < 24; i++) { g.fillStyle = `rgba(246,238,218,${R.r(0.02, 0.05).toFixed(3)})`; const x = R.r(0, T), y = R.r(0, T), r = R.r(14, 46); for (const [ox, oy] of [[0, 0], [T, 0], [-T, 0], [0, T], [0, -T]]) { g.beginPath(); g.arc(x + ox, y + oy, r, 0, TAU); g.fill(); } }
+  for (let i = 0; i < 1500; i++) { g.fillStyle = R.f() < 0.78 ? `rgba(246,238,218,${R.r(0.12, 0.4).toFixed(3)})` : `rgba(59,50,32,${R.r(0.06, 0.14).toFixed(3)})`; const s = R.r(0.8, 2.2); g.fillRect(R.r(0, T), R.r(0, T), s, s * R.r(0.6, 1.5)); }
+  return (NOU_CHALK = g.createPattern(c, 'repeat'));
+}
+function nouGrain() {
+  if (NOU_GRAIN) return NOU_GRAIN;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d'), R = RNG('nougrain'), n = Math.round(W * H / 300);
+  g.fillStyle = 'rgba(59,50,32,0.085)'; g.beginPath(); for (let i = 0; i < n; i++) { const s = R.r(1, 2); g.rect(R.r(0, W), R.r(0, H), s, s); } g.fill();
+  g.fillStyle = 'rgba(255,250,232,0.17)'; g.beginPath(); for (let i = 0; i < n; i++) { const s = R.r(1, 2.2); g.rect(R.r(0, W), R.r(0, H), s, s); } g.fill();
+  g.fillStyle = 'rgba(59,50,32,0.05)'; for (let i = 0; i < 60; i++) { g.beginPath(); g.arc(R.r(0, W), R.r(0, H), R.r(1.5, 3.5), 0, TAU); g.fill(); }   // a few stone pits
+  return (NOU_GRAIN = c);
+}
+
+// ---------------------------------------------------------------------
+//  curves and paths
+//   nouCurve(C, n, closed)      a smooth curve through control points C (Catmull-Rom), n samples per span
+//   nouWhip(x0, y0, x1, y1, amp, n)   a whiplash S-curve from one point to another (amp = how far it swings)
+//   nouSpiral(Q, { r, turns, dir })   Q with a tightening spiral added to its end, tangent to it
+//   nouBend(Q, ang, pow)        Q bent progressively about its root (the tip turns by ang radians): sway
+//   nouAt(Q, f)                 [point, heading] at fraction f of Q's length
+//   nouAdd(P, sharp)            add the closed outline P to the current path (smoothed unless sharp)
+// ---------------------------------------------------------------------
+function nouCurve(C, n = 12, closed = false) {
+  const m = C.length, out = [], g = (i) => (closed ? C[mod(i, m)] : C[clamp(i, 0, m - 1)]), spans = closed ? m : m - 1;
+  for (let i = 0; i < spans; i++) {
+    const p0 = g(i - 1), p1 = g(i), p2 = g(i + 1), p3 = g(i + 2);
+    for (let j = 0; j < n; j++) {
+      const t = j / n, t2 = t * t, t3 = t2 * t, q = [0, 0];
+      for (const k of [0, 1]) q[k] = 0.5 * (2 * p1[k] + (p2[k] - p0[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2 + (3 * p1[k] - p0[k] - 3 * p2[k] + p3[k]) * t3);
+      out.push(q);
+    }
+  }
+  if (!closed) out.push(C[m - 1]);
+  return out;
+}
+function nouWhip(x0, y0, x1, y1, amp = 30, n = 40) {
+  const L = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / L, ny = (x1 - x0) / L, P = [];
+  for (let i = 0; i <= n; i++) { const t = i / n, o = amp * Math.sin(t * TAU) * (1 - 0.35 * t); P.push([lerp(x0, x1, t) + nx * o, lerp(y0, y1, t) + ny * o]); }
+  return P;
+}
+function nouSpiral(Q, sp = {}) {
+  const n = Q.length, a = Q[n - 2], b = Q[n - 1], th = Math.atan2(b[1] - a[1], b[0] - a[0]);
+  const dir = sp.dir ?? 1, r = sp.r ?? 30, turns = sp.turns ?? 1.6, a0 = th - dir * Math.PI / 2;
+  const cx = b[0] - Math.cos(a0) * r, cy = b[1] - Math.sin(a0) * r, m = Math.ceil(turns * 28), out = Q.slice();
+  for (let i = 1; i <= m; i++) { const u = i / m, ang = a0 + dir * u * turns * TAU, rr = r * (0.1 + 0.9 * (1 - u) ** 1.25); out.push([cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr]); }
+  return out;
+}
+function nouBend(Q, ang, pw = 2.2) {
+  const tot = pathLen(Q) || 1, out = [Q[0]]; let s = 0;
+  for (let i = 1; i < Q.length; i++) {
+    s += dist(Q[i - 1], Q[i]);
+    const a = ang * (s / tot) ** pw, c = Math.cos(a), sn = Math.sin(a), dx = Q[i][0] - Q[0][0], dy = Q[i][1] - Q[0][1];
+    out.push([Q[0][0] + dx * c - dy * sn, Q[0][1] + dx * sn + dy * c]);
+  }
+  return out;
+}
+function nouAt(Q, f) {
+  const S = subPath(Q, clamp(f)), n = S.length, b = S[n - 1];
+  let a = null; for (let j = n - 2; j >= 0 && !a; j--) if (dist(S[j], b) > 0.05) a = S[j];
+  if (!a) return [b, Math.atan2(Q[1][1] - Q[0][1], Q[1][0] - Q[0][0])];
+  return [b, Math.atan2(b[1] - a[1], b[0] - a[0])];
+}
+function nouAdd(P, sharp) {
+  const n = P.length; if (n < 3) return;
+  if (sharp) { ctx.moveTo(P[0][0], P[0][1]); for (let i = 1; i < n; i++) ctx.lineTo(P[i][0], P[i][1]); ctx.closePath(); return; }
+  ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+  for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+  ctx.closePath();
+}
+const nouCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+const nouScaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+
+// ---------------------------------------------------------------------
+//  THE LINE
+//   nouRibbon(P, wa, wb, c, tot)   a stroke of varying weight along the open path P: wa(f) / wb(f) = the half-widths
+//                                  on either side at fraction f (of `tot` px, default P's own length), filled with c
+//   nouContour(P, w, o)            the contour of a closed outline: thickest (w) where the edge faces o.light
+//                                  (radians, default down-right), thinning to o.thin * w on the far side
+// ---------------------------------------------------------------------
+function nouRibbon(P, wa, wb, c, tot) {
+  const n = P.length; if (n < 2) return;
+  const T = tot || pathLen(P) || 1, A = [], Bq = []; let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)];
+    let nx = a[1] - b[1], ny = b[0] - a[0]; const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    if (i) s += dist(P[i - 1], P[i]);
+    const f = s / T, w1 = wa(f), w2 = wb(f);
+    A.push([P[i][0] + nx * w1, P[i][1] + ny * w1]); Bq.push([P[i][0] - nx * w2, P[i][1] - ny * w2]);
+  }
+  ctx.beginPath(); ctx.moveTo(A[0][0], A[0][1]);
+  for (let i = 1; i < n; i++) ctx.lineTo(A[i][0], A[i][1]);
+  for (let i = n - 1; i >= 0; i--) ctx.lineTo(Bq[i][0], Bq[i][1]);
+  ctx.closePath(); ctx.fillStyle = c; ctx.fill();
+  const r0 = (wa(0) + wb(0)) / 2; if (r0 > 0.9) { ctx.beginPath(); ctx.arc(P[0][0], P[0][1], r0, 0, TAU); ctx.fill(); }   // a round root
+}
+function nouContour(P, w, o = {}) {
+  const n = P.length; if (n < 3 || w <= 0) return;
+  let A = 0; for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; A += p[0] * q[1] - q[0] * p[1]; }
+  const sg = A > 0 ? 1 : -1, th0 = o.light ?? 0.9, thin = o.thin ?? 0.42, O = [], I = [];
+  for (let i = 0; i < n; i++) {
+    const a = P[(i - 1 + n) % n], b = P[(i + 1) % n], dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy) || 1;
+    const nx = sg * dy / l, ny = -sg * dx / l, wi = w * (thin + (1 - thin) * (0.5 + 0.5 * Math.cos(Math.atan2(ny, nx) - th0)));
+    O.push([P[i][0] + nx * wi * 0.62, P[i][1] + ny * wi * 0.62]); I.push([P[i][0] - nx * wi * 0.38, P[i][1] - ny * wi * 0.38]);
+  }
+  ctx.beginPath(); nouAdd(O, o.sharp); nouAdd(I, o.sharp); ctx.fillStyle = o.line || NOU.line; ctx.fill('evenodd');
+}
+
+// ---------------------------------------------------------------------
+//  ANY OUTLINE IN THE MEDIUM: nouShape(P, o) draws the closed outline P as flat chalky colour inside a contour.
+//   o.c      the flat (hex or rgb()); omit for line only          o.line   contour colour (false = none)
+//   o.w      contour weight at its thickest (5)                   o.thin / o.light  see nouContour
+//   o.shade  the ONE tonal step: a second flat on the side away from the light; o.sh = [dx, dy] how far it reaches
+//   o.veins  open paths drawn hair-thin inside (midribs, folds); o.vw their weight (1.5)
+//   o.inside(bb)  draw more inside the shape (clipped): a pattern, a band
+//   o.chalk  false = no chalk texture (tiny parts)                o.sharp  true = keep corners (straight polygon)
+// ---------------------------------------------------------------------
+function nouShape(P, o = {}) {
+  if (P.length < 3) return;
+  if (o.c) {
+    ctx.beginPath(); nouAdd(P, o.sharp); ctx.fillStyle = o.c; ctx.fill();
+    if (o.shade || o.inside || o.chalk !== false) {
+      const bb = bbox(P, 8);
+      ctx.save(); ctx.clip();
+      if (o.shade) {
+        const d = Math.min(bb.x1 - bb.x0, bb.y1 - bb.y0) * 0.17, sh = o.sh ?? [-d, -d * 0.8];
+        ctx.beginPath(); ctx.rect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); nouAdd(P.map(([x, y]) => [x + sh[0], y + sh[1]]), o.sharp);
+        ctx.fillStyle = o.shade; ctx.fill('evenodd');
+      }
+      if (o.chalk !== false) { ctx.save(); ctx.globalAlpha *= 0.55; ctx.fillStyle = nouChalk(); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); ctx.restore(); }
+      if (o.inside) o.inside(bb);
+      ctx.restore();
+    }
+  }
+  if (o.veins) {
+    ctx.save(); ctx.strokeStyle = o.line || NOU.line; ctx.lineWidth = o.vw ?? 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const V of o.veins) if (V.length > 1) { trace(V, false); ctx.stroke(); }
+    ctx.restore();
+  }
+  if (o.line !== false) nouContour(P, o.w ?? 5, o);
+}
+
+// ---------------------------------------------------------------------
+//  outlines of the vocabulary (local coordinates: base at 0,0, pointing along +x; place them with nouPlace)
+//   nouLeafPts(len, w, o)   a leaf / petal / wing: o.bend (0.12: how far the midrib bows, as a fraction of len),
+//                           o.s (true = S-curved midrib), o.fat (0.8: <1 widest near the base, >1 near the tip),
+//                           o.round (1 = pointed ends, 0.5 = a broad rounded tip). Returns { P, rib }.
+//   nouGinkgoPts(r)         a ginkgo fan with its notch          nouCartPts(cx, cy, w, h)  the soft cartouche plate
+// ---------------------------------------------------------------------
+function nouLeafPts(len, w, o = {}) {
+  const n = o.n ?? 14, bend = (o.bend ?? 0.12) * len, q = o.fat ?? 0.8, e = o.round ?? 1, A = [], Bq = [], rib = [];
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, x = t * len, m = bend * Math.sin(t * Math.PI) * (o.s ? 1.7 * Math.cos(t * Math.PI) : 1), hw = (w / 2) * Math.sin(Math.PI * t ** q) ** e;
+    rib.push([x, m]); if (i > 0 && i < n) { A.push([x, m - hw]); Bq.push([x, m + hw]); }
+  }
+  return { P: [[0, 0], ...A, [len, 0], ...Bq.reverse()], rib };
+}
+const nouPlace = (L, x, y, rot = 0, s = 1) => ({ P: xform(L.P, x, y, rot, s), rib: xform(L.rib, x, y, rot, s) });
+function nouGinkgoPts(r, n = 26) {
+  const P = [[0, 0], [r * 0.2, -r * 0.02]];
+  for (let i = 0; i <= n; i++) { const t = i / n, a = (t - 0.5) * 1.95, rr = r * (0.93 + 0.05 * Math.cos(t * TAU * 4)) * (1 - 0.3 * Math.exp(-(((t - 0.5) / 0.04) ** 2))); P.push([Math.cos(a) * rr, Math.sin(a) * rr]); }
+  P.push([r * 0.2, r * 0.02]);
+  return P;
+}
+function nouCartPts(cx, cy, w, h, n = 72, p = 0.46) {
+  const P = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU, c = Math.cos(a), s = Math.sin(a); P.push([cx + (w / 2) * Math.sign(c) * Math.abs(c) ** p, cy + (h / 2) * Math.sign(s) * Math.abs(s) ** p]); }
+  return P;
+}
+
+// ---------------------------------------------------------------------
+//  leaves, buds, ginkgo (x, y = the base, rot = the way it points). All take o.c, o.shade, o.lw (contour weight).
+// ---------------------------------------------------------------------
+function nouLeaf(x, y, len, rot, o = {}) {
+  if (len < 3) return;
+  const L = nouPlace(nouLeafPts(len, o.w ?? len * 0.26, o), x, y, rot);
+  nouShape(L.P, { c: o.c ?? NOU.sage, shade: o.shade, sh: o.sh, w: o.lw ?? 3.6, veins: o.rib === false ? null : [L.rib.slice(1, -2)], vw: o.vw, chalk: o.chalk, light: o.light });
+}
+function nouBud(x, y, len, rot, o = {}) {
+  if (len < 3) return;
+  for (const sd of [-1, 1]) nouLeaf(x, y, len * 0.55, rot + sd * 0.55, { w: len * 0.2, c: o.calyx ?? NOU.sage, lw: 2, rib: false, chalk: false, bend: 0.1 * sd });
+  nouLeaf(x, y, len, rot, { w: o.w ?? len * 0.5, fat: 1.25, bend: 0.04, c: o.c ?? NOU.rose, shade: o.shade ?? NOU.roseD, lw: o.lw ?? 3 });
+}
+function nouGinkgo(x, y, r, rot, o = {}) {
+  if (r < 3) return;
+  const P = xform(nouGinkgoPts(r), x, y, rot), V = [];
+  for (const a of [-0.6, -0.3, 0.3, 0.6]) V.push(xform([[r * 0.22, 0], [Math.cos(a) * r * 0.78, Math.sin(a) * r * 0.78]], x, y, rot));
+  nouShape(P, { c: o.c ?? NOU.ochre, shade: o.shade, w: o.lw ?? 3, veins: o.rib === false ? null : V, vw: 1.2, chalk: o.chalk });
+}
+
+// ---------------------------------------------------------------------
+//  THE STEM: nouStem(C, o) grows a tapered stem along ANY path, from the root (the first point).
+//   C        control points (smoothed with nouCurve), or a ready polyline with o.raw
+//   o.grow   0..1: the tip travels along the path; the thickness swells behind it (o.swell = that zone, 0.3 of the length)
+//   o.w / o.tip   width at the root / at the tip (14 / 1.6); o.taper (1.6: higher = stays thick longer)
+//   o.c      the stem's flat colour inside the contour (omit: a plain dark tendril); o.lw contour weight (3)
+//   o.spiral { r, turns, dir: 1 | -1 }   the tip curls into a tight spiral (drawn last, as the growth arrives)
+//   o.sway   radians: the tip leans this far (pass a slow sine for idle life); o.swayPow (2.2: higher = only the tip moves)
+//   o.leaves [{ at: 0..1 along the stem body, side: 1 | -1, len, ang (0.8), w, kind: 'leaf' | 'bud' | 'ginkgo',
+//              c, shade, d (0.2: how much growth it takes to unfurl), draw(p, heading, u) }] — each unfurls as the tip passes
+//   Returns { Q (the full path), tip, ang (heading at the tip), grow, at(f) -> [point, heading] }: hang a flower on the tip.
+// ---------------------------------------------------------------------
+function nouStem(C, o = {}) {
+  const g = clamp(o.grow ?? 1);
+  let Q = o.raw ? C : nouCurve(C, o.n ?? 12);
+  const body = pathLen(Q);
+  if (o.spiral) Q = nouSpiral(Q, o.spiral);
+  if (o.sway) Q = nouBend(Q, o.sway, o.swayPow ?? 2.2);
+  const tot = pathLen(Q) || 1, res = { Q, tip: Q[0], ang: Math.atan2(Q[1][1] - Q[0][1], Q[1][0] - Q[0][0]), grow: g, at: (f) => nouAt(Q, f) };
+  if (g <= 0) return res;
+  const S = subPath(Q, g), w0 = o.w ?? 14, w1 = o.tip ?? 1.6, tp = o.taper ?? 1.6, sw = o.swell ?? 0.3, line = o.line ?? NOU.line;
+  [res.tip, res.ang] = nouAt(Q, g);
+  const wAt = (f) => lerp(w1 * 0.7, w1 + (w0 - w1) * (1 - Math.min(1, f) ** tp), nouE((g - f) / sw + 0.04)) / 2;
+  for (const lf of o.leaves || []) {
+    const f = lf.at * body / tot, u = nouE((g - f) / (lf.d ?? 0.2)); if (u <= 0) continue;
+    const [p, th] = nouAt(Q, f), a = th + lf.side * lerp(0.12, lf.ang ?? 0.8, u);
+    if (lf.draw) lf.draw(p, th, u);
+    else if (lf.kind === 'bud') nouBud(p[0], p[1], lf.len * (0.3 + 0.7 * u), a, lf);
+    else if (lf.kind === 'ginkgo') nouGinkgo(p[0], p[1], lf.len * u, a, lf);
+    else nouLeaf(p[0], p[1], lf.len * (0.2 + 0.8 * u), a, { ...lf, w: (lf.w ?? lf.len * 0.26) * (0.3 + 0.7 * u), bend: (lf.bend ?? 0.14) * lf.side });
+  }
+  if (o.c) {
+    const lo = o.lw ?? 3;
+    nouRibbon(S, (f) => wAt(f) + lo, (f) => wAt(f) + lo * 0.45, line, tot);
+    nouRibbon(S, wAt, wAt, o.c, tot);
+  } else nouRibbon(S, wAt, wAt, line, tot);
+  return res;
+}
+
+// ---------------------------------------------------------------------
+//  flowers (x, y = where the stem ends, s = petal length, o.rot = the way the flower faces, default up).
+//  o.open 0..1 opens it petal by petal from a closed bud; o.breathe (-1..1, a slow sine) lets the petals breathe.
+// ---------------------------------------------------------------------
+const nouSeq = (op, i, n, lap = 0.6) => nouE(op * (1 + (n - 1) * lap) - i * lap);
+function nouLily(x, y, s, o = {}) {
+  const op = clamp(o.open ?? 1), ax = o.rot ?? -Math.PI / 2, br = o.breathe ?? 0, c = o.c ?? NOU.cream, sh = o.shade ?? NOU.rose;
+  const OFF = [0, 2.2, -2.2, 1.08, -1.08, Math.PI * 0.94];   // three outer tepals, then three inner
+  OFF.forEach((off, i) => {
+    const u = nouSeq(op, i, 6), a = ax + off * lerp(0.07, 1 + br * 0.025, u), len = s * (i < 3 ? 1 : 0.9) * (0.52 + 0.48 * u) * (1 + br * 0.015);
+    const L = nouPlace(nouLeafPts(len, s * 0.38 * (0.42 + 0.58 * u), { fat: 0.92, bend: 0.1 * u * (off > 0 ? 1 : -1), n: 16 }), x, y, a);
+    nouShape(L.P, { c, shade: sh, w: 4.2, veins: [L.rib.slice(1, -3)], vw: 1.3 });
+  });
+  const k = nouE((op - 0.72) / 0.28); if (k <= 0) return;
+  for (let j = 0; j < 5; j++) {   // stamens: hair-thin filaments, ochre anthers
+    const a = ax + (j - 2) * 0.3 + br * 0.02 * (j - 2), l = s * 0.5 * k, ex = x + Math.cos(a) * l, ey = y + Math.sin(a) * l;
+    ctx.save(); ctx.strokeStyle = NOU.line; ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(x + Math.cos(ax) * l * 0.6, y + Math.sin(ax) * l * 0.6, ex, ey); ctx.stroke(); ctx.restore();
+    nouShape(ellipsePts(ex, ey, s * 0.055 * k, s * 0.026 * k, a + 1.2, 12), { c: o.anther ?? NOU.gold, w: 1.8, chalk: false });
+  }
+  nouShape(ellipsePts(x, y, s * 0.06, s * 0.06, 0, 12), { c: NOU.sage, w: 2, chalk: false });
+}
+function nouIris(x, y, s, o = {}) {
+  const op = clamp(o.open ?? 1), ax = o.rot ?? -Math.PI / 2, br = o.breathe ?? 0, c = o.c ?? NOU.mauve, c2 = o.c2 ?? NOU.lilac, sh = o.shade ?? NOU.aub;
+  const part = (i, off, len, w, col, shade, bend, beard) => {
+    const u = nouSeq(op, i, 6), a = ax + off * lerp(0.05, 1 + br * 0.03, u), l = s * len * (0.5 + 0.5 * u);
+    const L = nouPlace(nouLeafPts(l, s * w * (0.3 + 0.7 * u), { fat: lerp(0.9, 1.5, u), round: lerp(1, 0.62, u), bend: bend * u, n: 16 }), x, y, a);
+    nouShape(L.P, { c: col, shade, w: 4.2, veins: [L.rib.slice(1, -4)], vw: 1.3 });
+    if (beard && u > 0.3) { const Bd = nouPlace(nouLeafPts(l * 0.5, s * 0.1 * u, { bend: bend * u * 0.5, n: 8 }), x, y, a); nouShape(Bd.P, { c: NOU.ochre, w: 1.6, chalk: false }); }
+  };
+  part(0, 1.72, 1.06, 0.6, c, sh, 0.3, true);         // falls: left and right arch out and droop
+  part(1, -1.72, 1.06, 0.6, c, sh, -0.3, true);
+  part(3, 0.5, 0.92, 0.5, c2, c, -0.2);             // standards: two leaning out and curling back in, then the tall middle one
+  part(4, -0.5, 0.92, 0.5, c2, c, 0.2);
+  part(5, 0, 1.06, 0.54, c2, c, 0.03);
+  part(2, Math.PI, 0.86, 0.52, c, sh, 0.02, true);  // the fall hanging in front
+}
+function nouPoppy(x, y, s, o = {}) {
+  const op = clamp(o.open ?? 1), ax = o.rot ?? -Math.PI / 2, br = o.breathe ?? 0, c = o.c ?? NOU.rose, sh = o.shade ?? NOU.roseD;
+  [Math.PI, 0, 1.55, -1.55].forEach((off, i) => {
+    const u = nouSeq(op, i, 4), a = ax + off * lerp(0.06, 1, u), L = nouPlace(nouLeafPts(s * (0.5 + 0.5 * u) * (1 + br * 0.02), s * 1.15 * (0.3 + 0.7 * u), { fat: 1.7, round: 0.5, bend: 0.03, n: 16 }), x, y, a);
+    nouShape(L.P, { c, shade: sh, w: 3.8, veins: [L.rib.slice(2, -5)], vw: 1.2 });
+  });
+  const k = nouE((op - 0.6) / 0.4); if (k <= 0) return;
+  nouShape(ellipsePts(x, y, s * 0.2 * k, s * 0.2 * k, 0, 20), { c: o.eye ?? NOU.aub, w: 2.4, chalk: false });
+  ctx.save(); ctx.strokeStyle = NOU.cream; ctx.lineWidth = 1.4; ctx.beginPath();
+  for (let j = 0; j < 8; j++) { const a = j / 8 * TAU; ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * s * 0.15 * k, y + Math.sin(a) * s * 0.15 * k); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the peacock feather: a thin stem (control points C) with barbs, ending in the eye. o.grow 0..1 (the stem first,
+//  then the eye opens ring by ring), o.s (1 = an eye 150 px long), o.sway, o.cols [fringe, ring, heart, core]
+// ---------------------------------------------------------------------
+function nouFeather(C, o = {}) {
+  const g = clamp(o.grow ?? 1), s = o.s ?? 1, cols = o.cols ?? [NOU.sage, NOU.ochre, NOU.teal, NOU.aub];
+  const st = nouStem(C, { grow: nouE(g / 0.7), w: 5 * s, tip: 2, taper: 1, sway: o.sway, swayPow: 2 });
+  if (g <= 0) return st;
+  const hair = nouE((g - 0.35) / 0.4);
+  if (hair > 0) {
+    ctx.save(); ctx.strokeStyle = NOU.line; ctx.lineWidth = 1.2; ctx.lineCap = 'round'; ctx.beginPath();
+    for (let j = 0; j < 15; j++) {
+      const [p, th] = nouAt(st.Q, 0.985 - j * 0.032), l = (50 - j * 2.6) * s * nouE(hair * 2 - j / 15);
+      for (const sd of [-1, 1]) { const a = th + sd * 0.8; ctx.moveTo(p[0], p[1]); ctx.quadraticCurveTo(p[0] + Math.cos(th) * l * 0.55, p[1] + Math.sin(th) * l * 0.55, p[0] + Math.cos(a) * l, p[1] + Math.sin(a) * l); }
+    }
+    ctx.stroke(); ctx.restore();
+  }
+  const k = (g - 0.55) / 0.45; if (k <= 0) return st;
+  const [tip, th] = nouAt(st.Q, 1), ex = tip[0] + Math.cos(th) * 62 * s, ey = tip[1] + Math.sin(th) * 62 * s;
+  [[150, 100, 0], [104, 70, 1], [70, 48, 2], [40, 30, 3]].forEach(([len, w, i]) => {
+    const u = nouE(k * 2.2 - i * 0.4); if (u <= 0) return;
+    const l = len * s * u, L = nouPlace(nouLeafPts(l, w * s * u, { fat: 1.25, round: 0.72, bend: 0, n: 16 }), ex - Math.cos(th) * l * 0.52, ey - Math.sin(th) * l * 0.52, th);
+    const V = [];
+    if (i === 0) for (let j = 2; j < 8; j++) { V.push([[ex, ey], L.P[j * 2 - 1]]); V.push([[ex, ey], L.P[L.P.length - (j * 2 - 1)]]); }   // the fringe's barbs
+    nouShape(L.P, { c: cols[i], w: i === 0 ? 3.2 : 2, veins: V, vw: 1, chalk: i < 2 });
+  });
+  return st;
+}
+
+// ---------------------------------------------------------------------
+//  the halo: a big disc behind the subject, filled with a repeating pattern that sets itself ring by ring.
+//   nouDisc(P, c, o)       the halo's base for ANY outline: flat colour, a rim band one tonal step down, beads
+//                          (the morph blob uses it, so a bare halo and the blob match). o.rim (0.86), o.beads (36), o.bead
+//   nouHalo(x, y, r, o)    o.c (base), o.kind 'floral' (rings of petals) | 'mosaic' (rings of tesserae),
+//                          o.cols (pattern colours), o.rings (3), o.in 0..1 (rings fill from the centre out, each ring
+//                          going round), o.key, plus nouDisc's options
+// ---------------------------------------------------------------------
+function nouDisc(P, c, o = {}) {
+  const ce = nouCentroid(P), k = o.rim ?? 0.86, In = nouScaled(P, ce, k), R = P.reduce((a, p) => a + Math.hypot(p[0] - ce[0], p[1] - ce[1]) / P.length, 0);
+  nouShape(P, { c, w: o.w ?? 6.5, inside: (bb) => { ctx.beginPath(); ctx.rect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); nouAdd(In); ctx.fillStyle = 'rgba(59,50,32,0.17)'; ctx.fill('evenodd'); } });
+  ctx.save(); ctx.beginPath(); nouAdd(In); ctx.strokeStyle = NOU.line; ctx.lineWidth = 2; ctx.stroke();
+  const M = resample(nouScaled(P, ce, (1 + k) / 2), true, 3), n = o.beads ?? 36, br = Math.max(2, R * (1 - k) * 0.27);
+  ctx.beginPath(); for (let i = 0; i < n; i++) { const p = M[Math.floor(i / n * M.length)]; ctx.moveTo(p[0] + br, p[1]); ctx.arc(p[0], p[1], br, 0, TAU); }
+  ctx.fillStyle = o.bead ?? NOU.cream; ctx.fill(); ctx.lineWidth = 1.5; ctx.stroke(); ctx.restore();
+}
+function nouHalo(x, y, r, o = {}) {
+  if (r < 4) return;
+  nouDisc(ellipsePts(x, y, r, r, 0, 72), o.c ?? NOU.rose, o);
+  const u = clamp(o.in ?? 1), rings = o.rings ?? 3, r0 = r * 0.17, r1 = r * (o.rim ?? 0.86) * 0.97, cols = o.cols ?? [NOU.cream, NOU.roseD, NOU.ochre], mosaic = o.kind === 'mosaic';
+  if (u <= 0) return;
+  ctx.save(); ctx.lineWidth = 1.5; ctx.strokeStyle = NOU.line; ctx.lineJoin = 'round';
+  for (let i = 0; i < rings; i++) {
+    const ui = clamp(u * rings - i); if (ui <= 0) continue;
+    const ra = lerp(r0, r1, i / rings) + 3, rb = lerp(r0, r1, (i + 1) / rings) - 3, rm = (ra + rb) / 2, n = Math.max(6, Math.round(rm * TAU / ((rb - ra) * (mosaic ? 0.8 : 0.6)))), dir = i % 2 ? -1 : 1, pit = TAU / n;
+    const S = mosaic ? RNG('noumos', o.key ?? 'h', i) : null;
+    for (let j = 0; j < n; j++) {
+      const col = mosaic ? S.pick(cols) : cols[(j + i) % cols.length], m = nouE(ui * n - j); if (m <= 0) continue;
+      const a = -Math.PI / 2 + dir * (j + 0.5) * pit, ia = lerp(rm, ra, m), ob = lerp(rm, rb, m);
+      ctx.beginPath();
+      if (mosaic) { const h = pit * 0.43 * m, j1 = S.n(1.6), j2 = S.n(0.05) * pit; ctx.arc(x, y, ob + j1, a - h + j2, a + h + j2); ctx.arc(x, y, ia + j1, a + h + j2, a - h + j2, true); ctx.closePath(); }
+      else { const h = pit * 0.86; ctx.moveTo(x + Math.cos(a) * ia, y + Math.sin(a) * ia); ctx.quadraticCurveTo(x + Math.cos(a - h) * rm, y + Math.sin(a - h) * rm, x + Math.cos(a) * ob, y + Math.sin(a) * ob); ctx.quadraticCurveTo(x + Math.cos(a + h) * rm, y + Math.sin(a + h) * rm, x + Math.cos(a) * ia, y + Math.sin(a) * ia); }
+      ctx.fillStyle = col; ctx.fill(); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(x, y, rb + 3, -Math.PI / 2, -Math.PI / 2 + dir * ui * TAU, dir < 0); ctx.stroke();   // the ring's hairline goes round with it
+  }
+  ctx.restore();
+  const kc = nouE(u * rings * 1.5);
+  nouShape(ellipsePts(x, y, r0 * kc, r0 * kc, 0, 24), { c: cols[0], w: 3, chalk: false });
+  nouShape(ellipsePts(x, y, r0 * kc * 0.45, r0 * kc * 0.45, 0, 16), { c: cols[cols.length - 1], w: 2, chalk: false });
+}
+
+// ---------------------------------------------------------------------
+//  the architecture (all take o.geo, a panel geometry like NOU_PANEL)
+//   nouPanel(o)        the plate, the bead band, the corner spandrel flats and the arched panel's tint are printed first
+//                      (flat colour); then the key drawing draws itself with o.in 0..1: every line starts at a bottom
+//                      corner, climbs and meets its mirror at the top; beads are set as the line passes.
+//                      o.tint (panel), o.sp (spandrels), o.frame (band), o.bead
+//   nouSpandrel(side, o)   curling foliage growing into a top corner (side -1 left | 1 right): o.in, o.c (stem),
+//                      o.leaf, o.bud, o.variant (0 | 1: the two corners are cousins, not mirror images)
+//   nouPlinth(o)       the base band inside the panel: a shallow arched top edge and a frieze. o.c, o.y (1520), o.n,
+//                      o.motif(x, y, i) draws one frieze motif (default: ginkgo fans), o.cols
+// ---------------------------------------------------------------------
+function nouPanelGeo(g = NOU_PANEL) { const xa = g.x0 + g.band, xb = g.x1 - g.band, ya = g.y0 + g.band, yb = g.y1 - g.band; return { ...g, xa, xb, ya, yb, cx: (xa + xb) / 2, rx: (xb - xa) / 2, ry: g.spring - g.apex }; }
+function nouArchPts(geo, step = 34) {
+  const G = nouPanelGeo(geo), P = [[G.xa, G.yb], [G.xa, G.spring]];
+  for (let i = 1; i < 44; i++) { const a = Math.PI + Math.PI * i / 44; P.push([G.cx + Math.cos(a) * G.rx, G.spring + Math.sin(a) * G.ry]); }
+  P.push([G.xb, G.spring], [G.xb, G.yb]);
+  return resample(P, true, step);
+}
+function nouPanel(o = {}) {
+  const G = nouPanelGeo(o.geo), u = clamp(o.in ?? 1), line = o.line ?? NOU.line;
+  nouShape(resample(rrectPts(G.x0, G.y0, G.x1 - G.x0, G.y1 - G.y0, G.r, 8), true, 30), { c: o.frame ?? NOU.cream, line: false });
+  nouShape([[G.xa, G.ya], [G.xb, G.ya], [G.xb, G.spring + 8], [G.xa, G.spring + 8]], { c: o.sp ?? NOU.sage, line: false, sharp: true });
+  nouShape(nouArchPts(o.geo), { c: o.tint ?? '#e3e0c2', line: false });
+  if (u <= 0) return;
+  const e = nouE(u), mir = (P) => P.map(([x, y]) => [2 * G.cx - x, y]);
+  const draw = (P, w, k = e) => { if (k <= 0) return; for (const Q of [P, mir(P)]) { const wf = (f) => (w / 2) * (1 - 0.28 * f) * (0.4 + 0.6 * nouE((k - f) / 0.12 + 0.05)); nouRibbon(subPath(Q, k), wf, wf, line, pathLen(Q)); } };
+  const r = G.r, outer = resample([...arcPts(G.x0 + r, G.y1 - r, r, Math.PI / 2, Math.PI, 6), ...arcPts(G.x0 + r, G.y0 + r, r, Math.PI, 1.5 * Math.PI, 6), [G.cx, G.y0]], false, 26);
+  const inner = resample([[G.xa, G.yb], [G.xa, G.ya + 6], [G.xa + 6, G.ya], [G.cx, G.ya]], false, 26), fS = (G.yb - G.spring) / pathLen(inner);
+  draw(outer, 8); draw([[G.x0 + r, G.y1], [G.cx, G.y1]], 8, nouE(u * 2.2));
+  draw(inner, 3.2); draw([[G.xa, G.yb], [G.cx, G.yb]], 3.2, nouE(u * 2.2));
+  draw(arcPts(G.cx, G.spring, G.rx, Math.PI, 1.5 * Math.PI, 40, G.ry / G.rx), 5.5, clamp((e - fS) / (1 - fS)));
+  // beads in the band, set as the line climbs past them
+  const beads = [], gap = 46, mx = G.x0 + G.band / 2, hh = G.y1 - G.y0;
+  for (let y = G.yb - 4; y > G.ya; y -= gap) for (const x of [mx, 2 * G.cx - mx]) beads.push([x, y]);
+  for (let x = G.xa + gap / 2; x < G.xb; x += gap) { beads.push([x, G.y1 - G.band / 2]); beads.push([x, G.y0 + G.band / 2]); }
+  ctx.save(); ctx.beginPath();
+  for (const [x, y] of beads) { const k = nouE((e - (G.y1 - y) / hh * 0.9) / 0.08), br = 6.5 * k; if (br > 0.6) { ctx.moveTo(x + br, y); ctx.arc(x, y, br, 0, TAU); } }
+  ctx.fillStyle = o.bead ?? NOU.ochre; ctx.fill(); ctx.strokeStyle = line; ctx.lineWidth = 1.5; ctx.stroke(); ctx.restore();
+}
+function nouSpandrel(side, o = {}) {
+  const G = nouPanelGeo(o.geo), g = clamp(o.in ?? 1); if (g <= 0) return;
+  const bw = G.cx - G.xa, bh = G.spring - G.ya, X = (u) => G.xa + u * bw, Y = (v) => G.ya + v * bh, pts = (A) => A.map(([u, v]) => [X(u), Y(v)]), v1 = o.variant ? 1 : 0;
+  const c = o.c ?? NOU.olive, leaf = o.leaf ?? NOU.cream, bud = o.bud ?? NOU.rose, k = bw / 460;
+  ctx.save();
+  if (side > 0) { ctx.translate(2 * G.cx, 0); ctx.scale(-1, 1); }
+  ctx.beginPath(); ctx.rect(G.xa, G.ya, bw, bh); ctx.clip();
+  ctx.beginPath(); ctx.rect(G.x0, G.y0, G.x1 - G.x0, G.y1 - G.y0); nouAdd(nouArchPts(o.geo)); ctx.clip('evenodd');
+  // the corner tendril first (behind), then the main stem sweeping along the arch to its spiral
+  nouStem(pts(v1 ? [[0.06, 0.66], [0.035, 0.44], [0.075, 0.25], [0.15, 0.13]] : [[0.07, 0.62], [0.04, 0.4], [0.07, 0.21], [0.17, 0.1]]), {
+    grow: nouE((g - 0.25) / 0.75), w: 7 * k, tip: 1.6, c, lw: 2.4, spiral: { r: (v1 ? 30 : 25) * k, turns: v1 ? 1.5 : 1.8, dir: 1 }, sway: o.sway,
+    leaves: [{ at: 0.42, side: -1, len: 50 * k, kind: 'bud', c: bud, ang: 0.5 }],
+  });
+  nouStem(pts([[0.03, 0.99], [0.05, 0.72], [0.1, 0.46], [0.22, 0.265], [0.38, 0.145], [0.55, 0.078]]), {
+    grow: nouE(g / 0.85), w: 12 * k, tip: 1.8, c, lw: 2.8, spiral: { r: 15 * k, turns: 1.4, dir: -1 },
+    leaves: [
+      { at: 0.16, side: 1, len: 84 * k, ang: 0.75, c: leaf, w: 26 * k }, { at: v1 ? 0.36 : 0.3, side: 1, len: 96 * k, ang: 0.7, c: leaf, w: 30 * k },
+      { at: 0.52, side: -1, len: 74 * k, ang: 0.8, c: leaf, w: 24 * k }, { at: v1 ? 0.62 : 0.7, side: 1, len: 60 * k, ang: 0.6, c: leaf, w: 20 * k },
+      { at: 0.84, side: -1, len: 42 * k, kind: 'bud', c: bud, ang: 0.6 },
+    ],
+  });
+  ctx.restore();
+}
+function nouPlinth(o = {}) {
+  const G = nouPanelGeo(o.geo), y = o.y ?? 1520, rise = o.rise ?? 28, n = o.n ?? 7, cols = o.cols ?? [NOU.sage, NOU.ochre], top = [];
+  for (let i = 0; i <= 28; i++) { const t = i / 28; top.push([lerp(G.xa, G.xb, t), y - rise * Math.sin(t * Math.PI)]); }
+  ctx.save(); ctx.beginPath(); nouAdd(nouArchPts(o.geo)); ctx.clip();
+  nouShape([...top, [G.xb, G.yb + 4], [G.xa, G.yb + 4]], { c: o.c ?? NOU.olive, line: false, sharp: true });
+  for (let i = 0; i < n; i++) {
+    const x = lerp(G.xa, G.xb, (i + 0.5) / n), my = lerp(y, G.yb, 0.74);
+    if (o.motif) o.motif(x, my, i); else nouGinkgo(x, my, (i % 2 ? 92 : 118), -Math.PI / 2, { c: cols[i % cols.length], lw: 2.8 });
+  }
+  nouRibbon(top, (f) => 1 + 2.8 * Math.sin(f * Math.PI), (f) => 1 + 2.8 * Math.sin(f * Math.PI), NOU.line);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  idle life
+//   nouFall(key, n, o)   n petals / ginkgo leaves drifting down on S-curves inside o.box { x0, x1, y0, y1 }.
+//        o.kind 'petal' | 'ginkgo', o.c, o.shade, o.s (size, 26), o.speed (px/s, 90), o.t0 (they start falling then,
+//        one after another, from above the box; omit = they are already in the air and wrap round)
+//   nouHover(key, amp)   [dx, dy, tilt]: a slow figure-of-eight for something that hovers
+// ---------------------------------------------------------------------
+function nouFall(key, n, o = {}) {
+  const box = o.box ?? { x0: 110, x1: 970, y0: 200, y1: 1500 }, span = box.y1 - box.y0 + 80, sp = o.speed ?? 90;
+  for (let i = 0; i < n; i++) {
+    const R = RNG('noufall', key, i), x0 = R.r(box.x0, box.x1), ph = R.r(0, TAU), v = sp * R.r(0.75, 1.3), A = R.r(22, 52), per = R.r(2.2, 3.4), s = (o.s ?? 26) * R.r(0.75, 1.2), off = R.f(), tilt = R.n(0.5);
+    let yy;
+    if (o.t0 != null) { yy = v * (TT - o.t0 - i * (o.every ?? 0.3) - off * 0.2); if (yy < 0 || yy > span) continue; } else yy = mod(v * TT + off * span, span);
+    const w = TT * TAU / per + ph, x = x0 + A * Math.sin(w), y = box.y0 - 40 + yy, rot = Math.PI / 2 + 0.9 * Math.cos(w) + tilt;
+    if (o.kind === 'ginkgo') nouGinkgo(x, y, s * 1.25, rot, { c: o.c ?? NOU.ochre, shade: o.shade, lw: 2.2, chalk: false });
+    else nouLeaf(x, y, s * 1.7, rot, { w: s * 0.95, fat: 1.1, bend: 0.16, c: o.c ?? NOU.rose, shade: o.shade, lw: 2.2, rib: false, chalk: false });
+  }
+}
+const nouHover = (key, amp = 10) => { const p = (hash('nouhover', key) % 100) / 100 * TAU; return [amp * Math.sin(TT * 1.7 + p), amp * 0.7 * Math.sin(TT * 3.4 + p), 0.07 * Math.sin(TT * 1.3 + p)]; };
+
+// ---------------------------------------------------------------------
+//  the hero: LIBEL, a dragonfly seen from above, built from the same tapered contour and flat fills.
+//   (x, y) = the thorax, r = half its size (the wings reach r to either side, the tail 1.15 r behind).
+//   o: rot (heading: 0 = up, radians), flap (-1..1: the wings' beat; pass a fast sine), curl (-1..1: the tail's bend),
+//      c (body: teal), wing (pale teal), key
+// ---------------------------------------------------------------------
+const nouHeroPts = (x, y, r, n = 96) => ellipsePts(x, y + r * 0.2, r, r * 0.86, 0, n);
+function nouDragonfly(x, y, r, o = {}) {
+  const fl = o.flap ?? 0, c = o.c ?? NOU.teal, wing = o.wing ?? NOU.tealL, cu = o.curl ?? 0;
+  SPARK_AT = toScreen(x, y);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(o.rot ?? 0); ctx.scale(r / 100, r / 100);
+  for (const [oy, len, wd, a0, sgn] of [[2, 90, 31, 0.36, 1], [-18, 100, 27, -0.2, -1]]) {   // hind pair, then fore pair
+    for (const sd of [-1, 1]) {
+      const a = a0 + sgn * fl * 0.2, L = nouPlace(nouLeafPts(len * (1 - 0.1 * Math.abs(fl)), wd, { fat: 1.5, round: 0.55, bend: 0.05 * sd, n: 14 }), sd * 5, oy, sd > 0 ? a : Math.PI - a);
+      const V = [L.rib.slice(1, -1)]; for (const i of [5, 8, 11]) V.push([L.P[i], L.P[28 - i]]);
+      nouShape(L.P, { c: wing, w: 2.8, veins: V, vw: 1, chalk: false });
+      const sp = L.rib[12]; nouShape(ellipsePts(sp[0], sp[1] - 4, 5.5, 3.2, sd > 0 ? a : Math.PI - a, 10), { c: NOU.ochre, w: 1.3, chalk: false });   // the wing spot
+    }
+  }
+  const tail = nouStem([[0, 4], [5 * cu, 40], [-7 * cu, 80], [4 * cu, 116]], { w: 13, tip: 4.5, taper: 1.1, c, lw: 2.6 });
+  ctx.strokeStyle = NOU.line; ctx.lineWidth = 1.3; ctx.beginPath();
+  for (let j = 1; j <= 5; j++) { const [p, th] = nouAt(tail.Q, j / 6), hw = 6.4 - j * 0.6; ctx.moveTo(p[0] - Math.sin(th) * hw, p[1] + Math.cos(th) * hw); ctx.lineTo(p[0] + Math.sin(th) * hw, p[1] - Math.cos(th) * hw); }
+  ctx.stroke();
+  nouShape(ellipsePts(0, -9, 12.5, 22, 0, 24), { c, shade: '#2f6563', w: 3.2, chalk: false });
+  nouShape(ellipsePts(0, -36, 10, 8, 0, 16), { c: NOU.olive, w: 2.6, chalk: false });
+  for (const sd of [-1, 1]) nouShape(ellipsePts(sd * 9, -39, 7.2, 7.8, sd * 0.3, 16), { c: NOU.aub, w: 2.2, chalk: false });
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  lettering: period display caps drawn from a system serif — bold, widely tracked, stretched a little taller.
+//   nouText(str, x, y, size, c, o)   y = the baseline. o: align ('center' | 'left' | 'right'), track (em, 0.14),
+//                                    tall (1.16), reveal (0..1, wiped on left to right), weight (700), caps (true)
+//   nouFlourish(x0, x1, y, o)        the hand-drawn underline: a whiplash stroke, thick at its root, ending in a curl.
+//                                    o.grow, o.amp (6), o.w (5), o.c
+// ---------------------------------------------------------------------
+function nouFont(size, weight = 700, track = 0.14) { ctx.font = `${weight} ${size}px ${NOU_FONT}`; if ('letterSpacing' in ctx) ctx.letterSpacing = `${(size * track).toFixed(2)}px`; }
+function nouTextW(str, size, o = {}) { ctx.save(); nouFont(size, o.weight, o.track); const w = ctx.measureText(o.caps === false ? str : str.toUpperCase()).width - size * (o.track ?? 0.14); ctx.restore(); return w; }
+function nouText(str, x, y, size, c, o = {}) {
+  const s = o.caps === false ? str : str.toUpperCase(), rv = o.reveal ?? 1, w = nouTextW(str, size, o), tall = o.tall ?? 1.16;
+  if (rv <= 0) return w;
+  const ax = (o.align ?? 'center') === 'center' ? -w / 2 : o.align === 'right' ? -w : 0;
+  ctx.save(); nouFont(size, o.weight, o.track); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.translate(x, y);
+  if (rv < 1) { ctx.beginPath(); ctx.rect(ax - size * 0.1, -size * 1.2, (w + size * 0.2) * rv, size * 1.7); ctx.clip(); }
+  ctx.scale(1, tall); ctx.fillStyle = c; ctx.fillText(s, ax, 0);
+  ctx.restore(); return w;
+}
+function nouFlourish(x0, x1, y, o = {}) {
+  return nouStem(nouWhip(x0, y, x1, y, o.amp ?? 6, 48), { raw: true, grow: o.grow ?? 1, w: o.w ?? 5, tip: 1.2, taper: 1, swell: 0.2, line: o.c ?? NOU.line, spiral: { r: o.curl ?? 9, turns: 1.3, dir: -1 } });
+}
+
+// ---------------------------------------------------------------------
+//  the caption (through DEFER: after the camera, at screen size): a bordered cartouche at the bottom of the panel.
+//  The plate unrolls from its middle, the words are wiped on, the underline flourish grows under them and curls.
+//  One *word* may be printed in the accent colour. It rolls shut as a bridge starts and opens again in the next era.
+//   o: x (540: centre), y (1410: centre), w (800), h (148), size (58; shrinks to fit), hi (accent: roseD),
+//      c (plate: cream), col (lettering), at (seconds after the era starts, 0.5)
+// ---------------------------------------------------------------------
+function nouBridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - nouE(seg(TT, r.tc - d - 0.001, r.tc - d + 0.25));
+    if (TT >= r.tc && TT < r.tc + d) return 0;
+  }
+  return 1;
+}
+function nouCaptionNow(str, o = {}) {
+  const at = E0 + (o.at ?? 0.5), k = nouBridgeK(); if (k <= 0 || TT < at) return;
+  const cx = o.x ?? 540, cy = o.y ?? 1410, w = o.w ?? 800, h = o.h ?? 148, a = nouE((TT - at) / 0.5) * k, ww = w * (0.06 + 0.94 * a), hh = h * (0.5 + 0.5 * a);
+  const P = nouCartPts(cx, cy, ww, hh);
+  nouShape(P, { c: o.c ?? NOU.cream, w: 6.5 });
+  if (a > 0.5) {
+    nouShape(nouCartPts(cx, cy, ww - 22, hh - 22), { w: 1.6, thin: 1 });
+    for (const sd of [-1, 1]) nouShape(ellipsePts(cx + sd * (ww / 2 - 30), cy, 7, 7, 0, 14), { c: o.hi ?? NOU.roseD, w: 1.8, chalk: false });
+  }
+  const rv = nouE((TT - at - 0.35) / 0.6); if (rv <= 0) return;
+  const plain = str.replace(/\*/g, ''), maxW = w - 170;
+  let size = o.size ?? 58, tw = nouTextW(plain, size); if (tw > maxW) { size *= maxW / tw; tw = nouTextW(plain, size); }
+  const x0 = cx - tw / 2, by = cy + size * 0.2, xl = Math.max(x0 - 12, cx - ww / 2 + 30), xr = Math.min(x0 - 12 + (tw + 24) * rv, cx + ww / 2 - 30);
+  if (xr <= xl) return;
+  ctx.save(); ctx.beginPath(); ctx.rect(xl, cy - h / 2, xr - xl, h); ctx.clip();
+  let pre = '';
+  str.split('*').forEach((tok, i) => {
+    if (tok) { const px = pre ? nouTextW(pre + '.', size) - nouTextW('.', size) : 0; nouText(tok, x0 + px, by, size, i % 2 ? (o.hi ?? NOU.roseD) : (o.col ?? NOU.line), { align: 'left' }); }
+    pre += tok;
+  });
+  nouFlourish(x0 - 6, x0 + tw - 4, by + size * 0.36, { grow: nouE((TT - at - 0.6) / 0.7) });
+  ctx.restore();
+}
+const nouCaption = (str, o = {}) => { const f = () => nouCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'art-nouveau',
+  paper: NOU.paper,
+  // the bare sheet in colour c (hex, or rgb() mid-morph) with the plate's hairline on it
+  backdrop(c) {
+    ctx.save(); screen(); ctx.fillStyle = c; ctx.fillRect(0, 0, W, H);
+    const G = NOU_PANEL; nouShape(resample(rrectPts(G.x0, G.y0, G.x1 - G.x0, G.y1 - G.y0, G.r, 8), true, 30), { w: 2.4 });
+    ctx.restore();
+  },
+  // the era seen through the bridge shape, inside a border: a band in the bridge colour between two dark contours;
+  // the band thins away as the window closes onto the object
+  window(P, key, src, o = {}) {
+    ctx.save(); ctx.beginPath(); nouAdd(P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    const u = o.u ?? 0, k = o.phase === 'grow' ? nouE(u * 4) : nouE((1 - u) * 4), band = 26 * k;
+    ctx.save(); ctx.lineJoin = 'round';
+    ctx.beginPath(); nouAdd(P); ctx.strokeStyle = NOU.line; ctx.lineWidth = band + 9; ctx.stroke();
+    if (band > 1) { ctx.beginPath(); nouAdd(P); ctx.strokeStyle = o.c ?? NOU.rose; ctx.lineWidth = band; ctx.stroke(); }
+    ctx.restore();
+  },
+  // the morphing shape: a bare halo (flat colour, rim band, beads) with tendrils that curl out of its edge and back
+  blob(P, c, key, u = 0) {
+    const ce = nouCentroid(P), q = Math.sin(Math.PI * clamp(u)), n = P.length;
+    ctx.save();
+    for (let i = 0; i < 6; i++) {
+      const p = P[Math.floor((i + 0.5) / 6 * n)], dx = p[0] - ce[0], dy = p[1] - ce[1], l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l, sd = i % 2 ? 1 : -1;
+      nouStem([[p[0] - ux * 8, p[1] - uy * 8], [p[0] + ux * 34 - uy * 22 * sd, p[1] + uy * 34 + ux * 22 * sd], [p[0] + ux * 78 - uy * 8 * sd, p[1] + uy * 78 + ux * 8 * sd]], { grow: q, w: 9, tip: 1.6, c: NOU.olive, lw: 2.4, spiral: { r: 20, turns: 1.5, dir: sd } });
+    }
+    nouDisc(P, c);
+    ctx.restore();
+  },
+  hero(x, y, r, o = {}) { nouDragonfly(x, y, r, { key: o.key, flap: Math.sin(TT * TAU * 6) }); },
+  heroColor: NOU.teal,
+  heroPts(x, y, r) { return nouHeroPts(x, y, r); },
+  // the stone's grain over the finished print (static: a print holds still)
+  post() { ctx.save(); screen(); ctx.drawImage(nouGrain(), 0, 0); ctx.restore(); },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — art nouveau demo. World coordinates 1080x1920; time TT on 1s. The poster plate is NOU_PANEL; what
+//  matters sits inside x 100-940, y 250-1300; the cartouche owns y 1335-1485; the plinth below it is ornament.
+// =====================================================================
+const cu = TIMELINE.cues;
+// the bridge objects: at the bridge nothing may lie over them (era 1 folds its lily away and empties the rings first;
+// era 2 only starts growing once the window is open)
+const HALO1 = { x: 540, y: 660, r: 300 }, HALO2 = { x: 540, y: 720, r: 330 };
+const FLY = { x: 790, y: 1085, r: 122 };                     // where the dragonfly hovers (both eras: it carries across)
+const breath = () => Math.sin(TT * 2.3);
+
+// ---- era 1: a lily in sage and rose
+function sceneLily() {
+  const fold = nouIn(cu.fold + 0.04, 0.44);                  // before the bridge: the flower closes, the stem draws back, the rings empty
+  nouPanel({ in: TT / 1.4, tint: '#e3e0c2', sp: NOU.sage, bead: NOU.ochre });
+  nouSpandrel(-1, { in: (TT - 0.5) / 1.3, sway: 0.05 * Math.sin(TT * 1.6) });
+  nouSpandrel(1, { in: (TT - 0.75) / 1.3, variant: 1, sway: 0.05 * Math.sin(TT * 1.6 + 2) });
+  nouHalo(HALO1.x, HALO1.y, HALO1.r * (0.3 + 0.7 * nouIn(0, 0.6)), { c: NOU.rose, kind: 'floral', cols: [NOU.cream, NOU.roseD, NOU.ochre], in: nouIn(cu.rings, 1.35) * (1 - fold), key: 'h1' });
+  // petals drifting down the two sides (background life)
+  nouFall('pl', 3, { box: { x0: 120, x1: 215, y0: 470, y1: 1480 }, c: NOU.rose, shade: NOU.roseD, speed: 80 });
+  nouFall('pr', 3, { box: { x0: 865, x1: 960, y0: 470, y1: 1480 }, c: NOU.cream, shade: NOU.rose, speed: 70 });
+  // side tendrils: they curl into their spirals and the tips sway (background life)
+  nouStem([[150, 1560], [112, 1330], [196, 1150], [128, 985], [176, 880]], {
+    grow: nouIn(cu.stem + 0.1, 1.5), w: 11, c: NOU.olive, spiral: { r: 38, turns: 1.8, dir: 1 }, sway: 0.11 * Math.sin(TT * 1.9), swayPow: 2.6,
+    leaves: [{ at: 0.2, side: -1, len: 120, c: NOU.sage, shade: NOU.olive }, { at: 0.42, side: 1, len: 64, kind: 'bud' }, { at: 0.62, side: -1, len: 100, c: NOU.sage, shade: NOU.olive }, { at: 0.84, side: 1, len: 56, kind: 'bud' }],
+  });
+  nouStem([[930, 1560], [972, 1420], [905, 1310], [948, 1235]], {
+    grow: nouIn(cu.stem + 0.3, 1.3), w: 9, c: NOU.olive, spiral: { r: 30, turns: 1.6, dir: -1 }, sway: -0.12 * Math.sin(TT * 1.7 + 1), swayPow: 2.4,
+    leaves: [{ at: 0.3, side: 1, len: 90, c: NOU.sage, shade: NOU.olive }, { at: 0.7, side: -1, len: 52, kind: 'bud' }],
+  });
+  // the lily: the stem grows up a whiplash curve, leaves unfurl as the tip passes, the flower opens petal by petal
+  const g = nouIn(cu.stem, 0.95) * lerp(1, 0.56, fold);
+  const st = nouStem([[505, 1570], [566, 1390], [468, 1190], [580, 965], [540, 760]], {
+    grow: g, w: 22, tip: 6, c: NOU.olive, lw: 3.6, taper: 2.2,
+    leaves: [{ at: 0.16, side: -1, len: 250, w: 62, ang: 0.62, c: NOU.sage, shade: NOU.olive, lw: 4 }, { at: 0.3, side: 1, len: 230, w: 56, ang: 0.6, c: NOU.sage, shade: NOU.olive, lw: 4 }, { at: 0.47, side: -1, len: 150, w: 40, ang: 0.7, c: NOU.sage, shade: NOU.olive }],
+  });
+  const fk = nouE((g - 0.8) / 0.2);
+  if (fk > 0) nouLily(st.tip[0], st.tip[1], 225 * fk, { rot: st.ang, open: nouIn(cu.bloom, 0.95) * (1 - fold), breathe: breath() });
+  nouPlinth({ c: NOU.olive, cols: [NOU.sage, NOU.ochre] });
+  // the dragonfly glides in on an S-curve and hovers (the hero)
+  const a = nouIn(cu.fly, 1.0), path = nouCurve([[1160, 760], [1010, 980], [900, 960], [FLY.x, FLY.y]], 14), [p, th] = nouAt(path, Math.max(0.02, a)), hv = nouHover('fly', 9);
+  nouDragonfly(p[0] + hv[0] * a, p[1] + hv[1] * a, FLY.r, { rot: lerp(th + Math.PI / 2, -0.5, a) + hv[2], flap: Math.sin(TT * TAU * 6), curl: Math.sin(TT * 2.1) });
+  nouCaption('The *lily* opens', { hi: NOU.roseD });
+}
+
+// ---- era 2: an iris in teal and gold
+function sceneIris() {
+  nouPanel({ tint: '#d3ddca', sp: NOU.tealL, bead: NOU.rose });
+  nouSpandrel(-1, { c: NOU.teal, leaf: NOU.cream, bud: NOU.ochre, variant: 1, sway: 0.05 * Math.sin(TT * 1.6) });
+  nouSpandrel(1, { c: NOU.teal, leaf: NOU.cream, bud: NOU.ochre, sway: 0.05 * Math.sin(TT * 1.6 + 2) });
+  nouHalo(HALO2.x, HALO2.y, HALO2.r, { c: NOU.ochre, kind: 'mosaic', cols: [NOU.teal, NOU.cream, NOU.gold, NOU.tealL, NOU.teal, NOU.gold], in: nouIn(cu.rings2, 1.7), key: 'h2', bead: NOU.cream, rings: 5 });
+  // ginkgo leaves start to drift down once the panel is open (background life)
+  nouFall('gk', 6, { kind: 'ginkgo', c: NOU.ochre, t0: cu.leaves, every: 0.32, speed: 150, box: { x0: 130, x1: 950, y0: 330, y1: 1500 }, s: 34 });
+  // peacock feathers: the stems grow, the eyes open ring by ring, the tips sway (background life)
+  nouFeather([[172, 1560], [120, 1370], [192, 1200], [136, 1050], [152, 975]], { grow: nouIn(cu.feather, 1.5), sway: 0.06 * Math.sin(TT * 1.8), s: 1.12 });
+  nouFeather([[925, 1560], [972, 1470], [922, 1380], [952, 1310]], { grow: nouIn(cu.feather + 0.35, 1.4), sway: -0.08 * Math.sin(TT * 1.6 + 1), s: 0.72 });
+  // the iris: sword leaves and the stem rise together; the falls drop one by one, then the standards lift
+  const lg = nouIn(cu.stem2, 1.1);
+  nouLeaf(500, 1570, 620 * lg, -Math.PI / 2 - 0.2, { w: 92, fat: 0.62, bend: -0.1, c: NOU.tealL, shade: '#6fa49b', sh: [-14, -4], lw: 4.2 });
+  nouLeaf(592, 1570, 540 * lg, -Math.PI / 2 + 0.24, { w: 84, fat: 0.62, bend: 0.12, c: NOU.tealL, shade: '#6fa49b', sh: [-13, -4], lw: 4.2 });
+  const st = nouStem([[548, 1570], [526, 1380], [566, 1180], [534, 990], [540, 830]], { grow: nouIn(cu.stem2 + 0.05, 1.0), w: 20, tip: 7, c: NOU.olive, lw: 3.6, taper: 2.4 });
+  const fk = nouE((st.grow - 0.8) / 0.2);
+  if (fk > 0) nouIris(st.tip[0], st.tip[1], 235 * fk, { rot: st.ang, open: nouIn(cu.bloom2, 1.3), breathe: breath() });
+  nouPlinth({ c: NOU.teal, n: 5, motif: (x, y, i) => nouPoppy(x, y - 4, i % 2 ? 62 : 78, { c: i % 2 ? NOU.ochre : NOU.rose, shade: i % 2 ? NOU.gold : NOU.roseD, breathe: breath() }) });
+  // the dragonfly is where it was; it loops once towards the flower and settles again
+  const sw = Math.sin(Math.PI * nouIn(cu.swoop, 1.1)), hv = nouHover('fly', 9);
+  nouDragonfly(FLY.x + hv[0] - 70 * sw, FLY.y + hv[1] - 90 * sw, FLY.r, { rot: -0.5 - 0.5 * sw + hv[2], flap: Math.sin(TT * TAU * 6), curl: Math.sin(TT * 2.1) });
+  nouCaption('An *iris* in gold', { hi: NOU.teal, at: 0.75 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — art nouveau demo (read by kit/morph.js). No camera moves: it is a printed poster.
+// =====================================================================
+const ERA_BG = ['#e3e0c2', '#d3ddca'];
+const BRIDGES = [
+  // halo disc -> halo disc: the rose halo (emptied of its rings, the lily folded away) becomes the gold one
+  { tc: 3.0, A: () => ({ P: ellipsePts(HALO1.x, HALO1.y, HALO1.r, HALO1.r, 0, 96), c: NOU.rose }), B: () => ({ P: ellipsePts(HALO2.x, HALO2.y, HALO2.r, HALO2.r, 0, 96), c: NOU.ochre }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — art nouveau demo (inside buildScore(); see kit/score-head.js). Slow and flowing: a harp rolling up
+  // and down a chord in 8ths, a soft held pad, a low bass on the half bars, a flute-like note as each petal opens,
+  // glassy ticks as the mosaic sets, a faint flutter for the dragonfly. Nothing percussive.
+  const T = TIMELINE, q = T.cues;
+  const flute = (t, n, vel, pan = 0, dur = 0.5) => { blip(t, nz(n) * 0.995, nz(n), dur, vel, pan); noiseHit(t, 0.12, 'bandpass', nz(n) * 2, 3, vel * 0.25, pan, 0.3); };
+  const glass = (t, f, vel, pan = 0) => blip(t, f, f * 1.01, 0.1, vel, pan);
+  const flutter = (t0, t1, vel, pan) => { for (let t = t0; t < t1; t += 0.042) noiseHit(t, 0.016, 'bandpass', 2600, 2.5, vel, pan + 0.1 * Math.sin(t * 9)); };
+  to = 'm';
+  pad(0.0, 3.1, ['D3', 'A3', 'F4', 'E4'], 0.04, { type: 'triangle', cut: 1000, att: 0.5, rel: 0.4, send: 0.5 });
+  pad(3.0, 6.05, ['Bb2', 'F3', 'D4', 'A4', 'C5'], 0.06, { type: 'triangle', cut: 1700, att: 0.25, rel: 0.5, send: 0.55 });
+  const hA = ['D3', 'A3', 'D4', 'F4', 'A4', 'E5', 'A4', 'F4'], hB = ['Bb2', 'F3', 'Bb3', 'D4', 'F4', 'A4', 'C5', 'A4'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; pluck(t, nz((t < 3 ? hA : hB)[i % 8]), (t < 3 ? 0.05 : 0.064) * (i % 8 === 0 ? 1.3 : 1), i % 2 ? 0.28 : -0.28, 0.6, t < 3 ? 2200 : 3000, 0.45); }
+  for (let i = 0; i < 6; i++) { const t = i * BEAT * 2; bass(t, nz(t < 3 ? (i % 2 ? 'A2' : 'D2') : (i % 2 ? 'F2' : 'Bb1')) * (t < 3 ? 1 : 2), t < 3 ? 0.07 : 0.085); }
+  ['Bb3', 'D4', 'F4', 'A4', 'D5'].forEach((n, i) => pluck(3.0 + i * 0.035, nz(n), 0.09, -0.3 + i * 0.15, 0.8, 3400, 0.5));   // the payoff: the gold halo
+  sub(3.0, 0.07);
+  chime(3.0, [nz('F5'), nz('A5'), nz('D6')], 0.05, 0);
+  to = 's';
+  sweep(q.border, q.border + 1.4, 0.008, 400, 2600, 0);                                                                // the border climbs and meets
+  chime(1.45, [nz('A5'), nz('E6')], 0.02, 0);
+  sweep(q.stem, q.stem + 1.0, 0.01, 300, 1400, -0.1);                                                                  // the stem grows
+  ['F5', 'A5', 'D6', 'E6', 'A5', 'F6'].forEach((n, i) => flute(q.bloom + 0.05 + i * 0.15, n, 0.022, -0.3 + i * 0.12, 0.3));   // six petals
+  flutter(q.fly, q.fly + 1.0, 0.006, 0.5);                                                                             // the dragonfly glides in
+  sweep(q.fold, 3.0, 0.014, 2200, 500, 0);                                                                             // the lily folds away, into the morph
+  for (let i = 0; i < 16; i++) glass(q.rings2 + i * 0.1, 1500 + (i * 7 % 5) * 260, 0.012, i % 2 ? 0.4 : -0.4);         // the mosaic sets
+  sweep(q.stem2, q.stem2 + 1.0, 0.01, 300, 1500, 0.1);                                                                 // the iris rises
+  ['D5', 'F5', 'A5', 'Bb5', 'D6', 'F6'].forEach((n, i) => flute(q.bloom2 + 0.1 + i * 0.2, n, 0.026, 0.3 - i * 0.12, 0.36));   // falls and standards
+  chime(q.feather + 1.3, [nz('C6'), nz('F6')], 0.03, -0.5);                                                            // the feather's eye opens
+  flutter(q.swoop, q.swoop + 1.1, 0.007, 0.45);                                                                        // the dragonfly loops
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

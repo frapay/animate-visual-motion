@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Low poly demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d2a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LOW POLY DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Dawn: under a faceted sky a mountain assembles facet by facet while
+//  the sun climbs out from behind the ridges; pines pop up, birds cross, the lake twinkles and a fox sits watching.
+//  At 3.0s the sun (a cut gem) re-triangulates into the moon and the same world opens at night: stars pop in,
+//  crystals shoot up, fireflies drift, the fox lifts its head. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/low-poly/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneDawn()], [3, 6, () => sceneNight()]];
+const SHOTS = [
+  ['pagi',  0, 0.0, 3.0, 'a mountain assembles facet by facet; the sun rises; pines pop up; birds cross; a fox watches'],
+  ['malam', 1, 3.0, 6.0, 'the sun becomes the moon; the same world at night: stars, crystals, fireflies; the fox looks up'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 16th grid (0.125s = 3 frames at 24fps, 120 BPM); the big ones on beats
+  cues: { peak: 0.0, tree: 0.25, sun: 0.5, birds: 1.0, cap: 1.0, stars: 3.5, crystal: 3.75, look: 4.5, twitch: 5.0 },
+  acts: [
+    { name: '1 Pagi',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Malam', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the sun is up over the finished mountain', sound: 'a warm pad, a pluck per facet row, a chime for the sun', next: 'the sun becomes the moon' },
+    { t: 5.2, title: 'night: moon, stars, crystals, the fox looking up', sound: 'the payoff stab + sub at 3.0, then a soft night groove', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

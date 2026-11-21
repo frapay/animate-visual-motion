@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neo-brutal demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  NEO-BRUTAL DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A launch graphic for an invented, unnamed product ("the thing,
+//  v2.0"). Era 1, the drop: "IT'S HERE!" slams in on a yellow ground that hard-cuts to cream as the orange mascot
+//  block lands; marquee strips cross the frame at an angle, a NEW seal and a v2.0 sticker are slapped on. At 3.0s
+//  the mascot block becomes a feature card on electric blue: a toggle snaps on, a slider fills, a big pink button
+//  slams up and is pressed on the beat three times; on the second press the ground cuts to yellow.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/neo-brutal/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneDrop()], [3, 6, () => sceneCard()]];
+const SHOTS = [
+  ['drop', 0, 0.0, 3.0, "IT'S HERE! slams in; the ground cuts yellow to cream as the mascot block lands; marquees cross at an angle; a NEW seal and a v2.0 sticker are slapped on"],
+  ['card', 1, 3.0, 6.0, 'the mascot block becomes a feature card on blue: a toggle snaps on, a slider fills, the big pink button is pressed on the beat and the ground cuts to yellow'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { its: 0.0, here: 0.25, land: 0.5, strip1: 0.75, seal: 1.0, ver: 1.25, strip2: 1.5, bolt: 1.75, wow: 2.0, morph: 3.0,
+          strip3: 3.5, btn: 3.75, toggle: 4.0, free: 4.25, press1: 4.5, press2: 5.0, press3: 5.5 },
+  acts: [
+    { name: '1 The drop', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 The button', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: "it's here", sound: 'four-on-the-floor kick, claps, a fat bass riff; a thud per slam, a slap per sticker', next: 'the mascot block becomes the feature card' },
+    { t: 5.0, title: 'press the button', sound: 'the riff turns major; a switch click, three button clicks on the beat, a chime on the second', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

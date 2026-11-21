@@ -1,0 +1,1740 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mosaic demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #261c18; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  MOSAIC DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Inside a meander border a sea of teal fan-pattern tiles is laid over
+//  the mortar; waves, seaweed and a scallop shell with a pearl are laid in; Sisik, the little terracotta fish,
+//  swims up and nudges the pearl, which rises out of the shell. At 3.0s the pearl is re-laid as a golden sun
+//  medallion over a tiled garden: its rays are laid one by one, fruit ripens on the tree, and Sisik leaps out of
+//  the pond. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/mosaic/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneLaut()], [3, 6, () => sceneMatahari()]];
+const SHOTS = [
+  ['laut',     0, 0.0, 3.0, 'a sea of fan-pattern tiles is laid; waves, a shell and a pearl; the fish nudges the pearl and it rises'],
+  ['matahari', 1, 3.0, 6.0, 'the pearl is re-laid as a sun medallion over a garden; rays and fruit are laid; the fish leaps from the pond'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { sea: 0.0, waves: 0.75, shell: 0.75, pearl: 1.25, swim: 1.0, nudge: 2.0, rays: 3.75, f1: 4.0, f2: 4.25, f3: 4.5, leap: 4.75, splash: 5.25, leap2: 5.5, splash2: 5.875 },
+  acts: [
+    { name: '1 Laut',     role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Matahari', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'a pearl in the sea', sound: 'soft pad, plucked strings, a stream of tile clicks', next: 'the pearl is re-laid as the sun' },
+    { t: 5.0, title: 'it shines like the sun', sound: 'bright pad, plucks, clicks for the rays, a splash', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/mosaic/kit.js — MOSAIC: an ancient floor / wall mosaic that is laid while you watch. Every picture is
+//  built from small hand-cut tesserae (slightly irregular quadrilaterals, 13–22 px at 1080 wide) with pale sandy
+//  grout between them. Tiles follow the form: mosFill() tiles ANY outline with rows that trace its contour and
+//  fill inward (opus vermiculatum), mosLine() runs rows along a path, mosField() lays a ground in straight rows
+//  or in the scallop "fan" pattern (opus tessellatum), mosBorder() / mosGuilloche() make meander and wave bands.
+//  Each tile's colour varies a little around its area's colour, has a faint bevel (lit top-left, dark bottom-right),
+//  and a few are gold glass that glint in a slow sweep. Tiles click into place one by one, in row order.
+//  How it stays fast: an area's tile list is computed once (seeded, cached by key); settled tiles are painted into
+//  an offscreen canvas that only ever grows in tile order; per frame only the tiles landing right now are drawn.
+//  Things that move are rigid groups of tiles (mosGroup / mosStamp) stepping on 2s.
+//  Built on kit/core.js. Motion on 1s (the laying); movers step on 2s. Helpers are prefixed mos…; the palette is
+//  MOS. Needs from the piece head: CX.
+// =====================================================================
+const MOS = {
+  paper: '#ece2cc',                                    // the plain marble floor a morph happens on
+  grout: '#d8c8a6',                                    // pale sandy grout / the bare mortar bed
+  marble: '#f3ecdc', sand: '#e2cc9c',                  // off-white marble; warm sand (skies, shells)
+  ochre: '#c9953c', gold: '#e3b23c',                   // ochre stone; gold glass (the tiles that glint)
+  terra: '#c85f3c',                                    // TERRACOTTA: reserved for the hero
+  umber: '#70492f', char: '#3b342f',                   // trunks, rims, dark outlines; letters
+  olive: '#7f8f4a', oliveD: '#566a39',                 // leaves, gardens
+  teal: '#2c7c85', tealD: '#1d5a67', turq: '#5cb8b0',  // the sea, water
+  lapis: '#27507f', rose: '#d9a48c',                   // borders and tags; shell pink
+  sinopia: '#a8543a',                                  // the under-drawing sketched on the mortar
+};
+const MOS_SERIF = '"Palatino Linotype", Palatino, "Book Antiqua", "Iowan Old Style", "Hoefler Text", Georgia, "Times New Roman", "DejaVu Serif", serif';
+const MOS_SWEEP = { t0: 1.3, v: 900, per: 2700 };      // the gold glint: a diagonal band crossing the frame (start s, px/s, period px)
+
+// ---------------------------------------------------------------------
+//  colour (hex or rgb() in), small helpers
+// ---------------------------------------------------------------------
+const mosRGB = (c) => { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); const m = c.match(/[\d.]+/g); return [+m[0], +m[1], +m[2]]; };
+const mosCSS = (r) => `rgb(${Math.round(clamp(r[0], 0, 255))},${Math.round(clamp(r[1], 0, 255))},${Math.round(clamp(r[2], 0, 255))})`;
+const mosMix = (a, b, u) => { const x = mosRGB(a), y = mosRGB(b); return mosCSS(x.map((v, i) => lerp(v, y[i], u))); };
+const mosTone = (c, k) => mosMix(c, k > 0 ? '#fff6e0' : '#261c18', Math.abs(k));   // k > 0 lighter, k < 0 deeper
+const mosLum = (c) => { const r = mosRGB(c); return (0.299 * r[0] + 0.587 * r[1] + 0.114 * r[2]) / 255; };
+const mosZoom = () => { const m = ctx.getTransform(); return Math.hypot(m.a, m.b) || 1; };
+const mosT2 = () => B * 2 / FPS;                        // the time on 2s: what every moving group steps on
+function mosCanvas(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function mosPath(g, P, closed = true) { g.beginPath(); g.moveTo(P[0][0], P[0][1]); for (let i = 1; i < P.length; i++) g.lineTo(P[i][0], P[i][1]); if (closed) g.closePath(); }
+function mosHashPts(P) { let h = 2166136261 >>> 0; for (const p of P) { h ^= Math.round(p[0] * 4) & 0xffff; h = Math.imul(h, 16777619); h ^= Math.round(p[1] * 4) & 0xffff; h = Math.imul(h, 16777619); } return (h >>> 0) + ':' + P.length; }
+function mosOffset(P, d, closed) {
+  const n = P.length;
+  return P.map((p, i) => { const a = P[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = P[closed ? (i + 1) % n : Math.min(n - 1, i + 1)], l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1; return [p[0] - (b[1] - a[1]) / l * d, p[1] + (b[0] - a[0]) / l * d]; });
+}
+// a cache of static, seeded things (tile lists and the canvases they are painted into); the oldest entry goes first
+const MOS_CACHE = new Map();
+function mosEntry(key, build) {
+  let e = MOS_CACHE.get(key);
+  if (!e) { if (MOS_CACHE.size > 320) MOS_CACHE.delete(MOS_CACHE.keys().next().value); e = build(); MOS_CACHE.set(key, e); }
+  return e;
+}
+let MOS_DIRECT = false, MOS_LOG = null;                 // true while a rigid group (or a morph frame) is painted straight to ctx
+
+// ---------------------------------------------------------------------
+//  one tessera. q = 8 numbers (4 corners); its colour varies around rgb; hi / lo = the bevel's lit and dark edges
+// ---------------------------------------------------------------------
+function mosMk(q, rgb, R, o = {}) {
+  const jit = o.jit ?? 1, vary = o.vary ?? 0.1;
+  for (let i = 0; i < 8; i++) q[i] += R.n(jit);
+  const cx = (q[0] + q[2] + q[4] + q[6]) / 4, cy = (q[1] + q[3] + q[5] + q[7]) / 4;
+  const gold = !!o.gold && R.f() < o.gold;
+  if (gold) rgb = [227, 178, 60];
+  const k = 1 + R.n(vary), w = R.n(vary * 90), col = [rgb[0] * k + w, rgb[1] * k, rgb[2] * k - w];
+  const hi = [], lo = [];
+  for (let i = 0; i < 4; i++) {
+    const x1 = q[i * 2], y1 = q[i * 2 + 1], x2 = q[(i * 2 + 2) % 8], y2 = q[(i * 2 + 3) % 8];
+    const mx = (x1 + x2) / 2 - cx, my = (y1 + y2) / 2 - cy, d = (mx * -0.55 + my * -0.83) / (Math.hypot(mx, my) || 1);
+    if (Math.abs(d) < 0.3) continue;
+    (d > 0 ? hi : lo).push(x1 + (cx - x1) * 0.13, y1 + (cy - y1) * 0.13, x2 + (cx - x2) * 0.13, y2 + (cy - y2) * 0.13);
+  }
+  return { q, cx, cy, c: mosCSS(col), lt: mosCSS(col.map((v) => v + (255 - v) * (gold ? 0.55 : 0.3))), dk: mosCSS(col.map((v) => v * 0.7)), hi, lo, gold };
+}
+function mosQuad(g, q) { g.beginPath(); g.moveTo(q[0], q[1]); g.lineTo(q[2], q[3]); g.lineTo(q[4], q[5]); g.lineTo(q[6], q[7]); g.closePath(); }
+function mosPaint(g, t) {
+  if (t.poly) { mosPath(g, t.poly); g.fillStyle = t.c; g.fill(); return; }      // a patch of fresh mortar (fan beds)
+  mosQuad(g, t.q); g.fillStyle = t.c; g.fill();
+  let e = t.hi;
+  if (e.length) { g.beginPath(); for (let i = 0; i < e.length; i += 4) { g.moveTo(e[i], e[i + 1]); g.lineTo(e[i + 2], e[i + 3]); } g.strokeStyle = t.lt; g.stroke(); }
+  e = t.lo;
+  if (e.length) { g.beginPath(); for (let i = 0; i < e.length; i += 4) { g.moveTo(e[i], e[i + 1]); g.lineTo(e[i + 2], e[i + 3]); } g.strokeStyle = t.dk; g.stroke(); }
+}
+// a tile on its way down: p = 0 just let go (lifted, a touch bigger, its shadow thrown down-right) … 1 settled
+function mosLand(t, p) {
+  if (t.poly) return mosPaint(ctx, t);
+  const k = 1 - clamp(p), s = 1 + 0.2 * k;
+  ctx.save(); ctx.translate(t.cx + 2 + 6 * k, t.cy + 3 + 8 * k); ctx.scale(s, s); ctx.translate(-t.cx, -t.cy); mosQuad(ctx, t.q); ctx.fillStyle = 'rgba(38,26,18,0.34)'; ctx.fill(); ctx.restore();
+  ctx.save(); ctx.translate(t.cx, t.cy - 10 * k); ctx.scale(s, s); ctx.translate(-t.cx, -t.cy); mosPaint(ctx, t); ctx.restore();
+}
+// is the glint band over screen point (x, y)? 0 no, 1 edge of the band, 2 its bright middle (stepping on 2s)
+function mosGlintK(x, y) {
+  const d = x * 0.8 + y * 0.6 - (mod((mosT2() - MOS_SWEEP.t0) * MOS_SWEEP.v, MOS_SWEEP.per) - 200);
+  return d > -70 && d < 90 ? (d > -20 && d < 40 ? 2 : 1) : 0;
+}
+function mosGlint(q, cx, cy) {
+  const [sx, sy] = toScreen(cx, cy), k = mosGlintK(sx, sy); if (!k) return;
+  mosQuad(ctx, q); ctx.fillStyle = k === 2 ? '#fffbe2' : '#f6dc82'; ctx.fill();
+  if (k === 2) star4(cx, cy, 15, '#fffdf0');
+}
+
+// ---------------------------------------------------------------------
+//  laying an area. e = { tiles, x0, y0, w, h, under(g) } from mosEntry. o: at (the second the laying starts) + rate
+//  (tiles per second, 420), out + outDur (the second it is lifted again), or reveal (0..1) + land (tiles in the air).
+//  Returns how much of it is laid (0..1).
+// ---------------------------------------------------------------------
+function mosLay(e, o = {}) {
+  const N = e.tiles.length; if (!N) return 1;
+  if (MOS_DIRECT) {
+    if (e.under) e.under(ctx);
+    ctx.lineWidth = 1.4; ctx.lineCap = 'butt';
+    for (const t of e.tiles) { mosPaint(ctx, t); if (t.gold && MOS_LOG) MOS_LOG.push(t); }
+    return 1;
+  }
+  let n = N, m = N;
+  if (o.at != null) {
+    const rate = o.rate ?? 420; n = (TT - o.at) * rate + 1e-6; m = n - rate * 2 / FPS;
+    if (o.out != null && TT > o.out) { n = Math.min(n, N * (1 - (TT - o.out) / (o.outDur ?? 0.2))); m = Math.min(m, n); }
+  } else if (o.reveal != null && o.reveal < 1) { n = o.reveal * N; m = n - (o.land ?? Math.max(2, N * 0.04)); }
+  n = clamp(Math.floor(n), 0, N); m = clamp(Math.floor(m), 0, n);
+  if (n <= 0) return 0;
+  if (!e.cv) { e.cv = mosCanvas(e.w, e.h); e.g = e.cv.getContext('2d'); e.n = -1; if (!e.goldT) e.goldT = e.tiles.filter((t) => t.gold); }
+  if (e.n < 0 || e.n > m) {     // (re)start the settled layer: the mortar bed first, then the tiles in order
+    e.g.setTransform(1, 0, 0, 1, 0, 0); e.g.clearRect(0, 0, e.cv.width, e.cv.height); e.g.setTransform(1, 0, 0, 1, -e.x0, -e.y0);
+    e.g.lineWidth = 1.4; e.g.lineCap = 'butt'; if (e.under) e.under(e.g); e.n = 0;
+  }
+  while (e.n < m) mosPaint(e.g, e.tiles[e.n++]);
+  ctx.drawImage(e.cv, e.x0, e.y0);
+  if (m < n) {
+    ctx.save(); ctx.lineWidth = 1.4; ctx.lineCap = 'butt';
+    if (e.clip) { ctx.beginPath(); ctx.rect(e.x0, e.y0, e.w, e.h); ctx.clip(); }
+    for (let i = m; i < n; i++) mosLand(e.tiles[i], (n - i - 0.5) / (n - m));
+    ctx.restore();
+  } else if (m >= N && o.glint !== false) for (const t of e.goldT) mosGlint(t.q, t.cx, t.cy);
+  return n / N;
+}
+
+// ---------------------------------------------------------------------
+//  a row of tiles along a path Q (closed loop or open), row height hgt, tile length ~s. Pushes onto out.
+// ---------------------------------------------------------------------
+function mosAlong(out, Q, closed, hgt, s, gap, rgb, R, o = {}) {
+  const n0 = Q.length, m = closed ? n0 : n0 - 1, cum = [0];
+  for (let i = 0; i < m; i++) cum.push(cum[i] + dist(Q[i], Q[(i + 1) % n0]));
+  const Lp = cum[m]; if (!(Lp > 1)) return;
+  const at = (a) => {
+    a = closed ? mod(a, Lp) : clamp(a, 0, Lp);
+    let lo = 0, hi = m; while (hi - lo > 1) { const md = (lo + hi) >> 1; if (cum[md] <= a) lo = md; else hi = md; }
+    const p = Q[lo], q = Q[(lo + 1) % n0], u = (a - cum[lo]) / ((cum[lo + 1] - cum[lo]) || 1);
+    return [p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u];
+  };
+  const hh = Math.max(1, (hgt - gap) / 2);
+  if (closed && Lp < s * 2.5) {                         // the loop is too small for a ring: one tile in the middle
+    if (Lp < s * 0.8) return;
+    const c = Q.reduce((a, p) => [a[0] + p[0] / n0, a[1] + p[1] / n0], [0, 0]), d = Math.min(hgt, Lp / 3) * 0.6, a0 = R.r(0, TAU), q = [];
+    for (let i = 0; i < 4; i++) q.push(c[0] + Math.cos(a0 + i * TAU / 4) * d, c[1] + Math.sin(a0 + i * TAU / 4) * d);
+    out.push(mosMk(q, rgb, R, o)); return;
+  }
+  const n = Math.max(closed ? 3 : 1, Math.round(Lp / s)), wts = []; let tot = 0;
+  for (let i = 0; i < n; i++) { const w = 1 + R.n(o.irr ?? 0.2); wts.push(w); tot += w; }
+  const d = Math.min(3, hgt * 0.3), g2 = Math.min(gap / 2, Lp / n * 0.2);
+  const nrm = (a) => { const p = at(a - d), q = at(a + d), l = Math.hypot(q[0] - p[0], q[1] - p[1]) || 1; return [-(q[1] - p[1]) / l * hh, (q[0] - p[0]) / l * hh]; };
+  let a = closed ? R.f() * Lp : 0;
+  for (let i = 0; i < n; i++) {
+    const a1 = a + wts[i] / tot * Lp, p0 = at(a + g2), p1 = at(a1 - g2), u = nrm(a + g2), v = nrm(a1 - g2);
+    out.push(mosMk([p0[0] + u[0], p0[1] + u[1], p1[0] + v[0], p1[1] + v[1], p1[0] - v[0], p1[1] - v[1], p0[0] - u[0], p0[1] - u[1]], rgb, R, o));
+    a = a1;
+  }
+}
+
+// ---------------------------------------------------------------------
+//  contour rows for any outline: a signed distance field on a coarse grid, then its iso-lines at half a row,
+//  a row and a half, … traced by marching squares and chained into loops. Rows outside the shape (levels < 0)
+//  are the halo: the ground's own tiles running once around a figure.
+// ---------------------------------------------------------------------
+function mosIso(D, nx, ny, g, bx, by, L) {
+  const segs = [], pts = new Map(), adj = new Map();
+  const pt = (id, i0, j0, i1, j1) => { if (!pts.has(id)) { const a = D[j0 * nx + i0], b = D[j1 * nx + i1], u = (L - a) / ((b - a) || 1e-9); pts.set(id, [bx + (i0 + (i1 - i0) * u) * g, by + (j0 + (j1 - j0) * u) * g]); } return id; };
+  const add = (a, b) => { const k = segs.length; segs.push([a, b]); for (const id of [a, b]) { const l = adj.get(id); if (l) l.push(k); else adj.set(id, [k]); } };
+  for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    const m = (D[j * nx + i] > L ? 1 : 0) | (D[j * nx + i + 1] > L ? 2 : 0) | (D[(j + 1) * nx + i + 1] > L ? 4 : 0) | (D[(j + 1) * nx + i] > L ? 8 : 0);
+    if (m === 0 || m === 15) continue;
+    const T = () => pt((j * nx + i) * 2, i, j, i + 1, j), Rt = () => pt((j * nx + i + 1) * 2 + 1, i + 1, j, i + 1, j + 1);
+    const Bt = () => pt(((j + 1) * nx + i) * 2, i, j + 1, i + 1, j + 1), Lf = () => pt((j * nx + i) * 2 + 1, i, j, i, j + 1);
+    if (m === 1 || m === 14) add(Lf(), T()); else if (m === 2 || m === 13) add(T(), Rt()); else if (m === 3 || m === 12) add(Lf(), Rt());
+    else if (m === 4 || m === 11) add(Rt(), Bt()); else if (m === 6 || m === 9) add(T(), Bt()); else if (m === 7 || m === 8) add(Lf(), Bt());
+    else if (m === 5) { add(Lf(), T()); add(Rt(), Bt()); } else { add(T(), Rt()); add(Lf(), Bt()); }
+  }
+  const used = new Uint8Array(segs.length), loops = [];
+  const grow = (chain, end) => {       // follow unused segments from one end; true when the loop closes
+    for (;;) {
+      const cur = end ? chain[chain.length - 1] : chain[0], k = adj.get(cur).find((q) => !used[q]); if (k == null) return false;
+      used[k] = 1; const nxt = segs[k][0] === cur ? segs[k][1] : segs[k][0];
+      if (nxt === (end ? chain[0] : chain[chain.length - 1])) return true;
+      if (end) chain.push(nxt); else chain.unshift(nxt);
+    }
+  };
+  for (let k = 0; k < segs.length; k++) {
+    if (used[k]) continue; used[k] = 1;
+    const chain = [segs[k][0], segs[k][1]], closed = grow(chain, true) || grow(chain, false);
+    if (chain.length >= 3) loops.push({ P: chain.map((id) => pts.get(id)), closed });
+  }
+  return loops;
+}
+function mosContour(P, col, o, key) {
+  const s = o.s ?? 17, gap = o.gap ?? 2.2, hr = o.halo ? (o.haloRows ?? 1) : 0, pad = Math.ceil(hr * s + 6);
+  const bb = bbox(P, pad), bx = Math.floor(bb.x0), by = Math.floor(bb.y0), g = clamp(s / 5, 2.2, 4), n = P.length;
+  const nx = Math.ceil((bb.x1 - bx) / g) + 2, ny = Math.ceil((bb.y1 - by) / g) + 2, D = new Float32Array(nx * ny);
+  const ax = new Float64Array(n), ay = new Float64Array(n), ex = new Float64Array(n), ey = new Float64Array(n), il = new Float64Array(n);
+  for (let i = 0; i < n; i++) { const a = P[i], b = P[(i + 1) % n]; ax[i] = a[0]; ay[i] = a[1]; ex[i] = b[0] - a[0]; ey[i] = b[1] - a[1]; il[i] = 1 / ((ex[i] * ex[i] + ey[i] * ey[i]) || 1e-9); }
+  let dmax = 0;
+  for (let j = 0; j < ny; j++) {
+    const y = by + j * g + 0.0137, xs = [];
+    for (let i = 0; i < n; i++) if ((ay[i] > y) !== (ay[i] + ey[i] > y)) xs.push(ax[i] + (y - ay[i]) / ey[i] * ex[i]);
+    xs.sort((p, q) => p - q);
+    let xi = 0;
+    for (let i = 0; i < nx; i++) {
+      const x = bx + i * g; while (xi < xs.length && xs[xi] < x) xi++;
+      let best = 1e18;
+      for (let e = 0; e < n; e++) { const px = x - ax[e], py = y - ay[e]; let u = (px * ex[e] + py * ey[e]) * il[e]; u = u < 0 ? 0 : u > 1 ? 1 : u; const qx = px - ex[e] * u, qy = py - ey[e] * u, d2 = qx * qx + qy * qy; if (d2 < best) best = d2; }
+      const d = Math.sqrt(best) * (xi & 1 ? 1 : -1); D[j * nx + i] = d; if (d > dmax) dmax = d;
+    }
+  }
+  const nrows = Math.max(1, Math.round(dmax / s)), h = dmax / nrows, rr = o.rim ? (o.rimRows ?? 1) : 0, R = RNG('mosfill', key), tiles = [];
+  const rowCol = (k) => (k < rr ? o.rim : typeof o.rows === 'function' ? o.rows(k - rr, nrows - rr) : o.rows ? o.rows[Math.min(k - rr, o.rows.length - 1)] : col);
+  for (let k = 0; k < nrows; k++) {
+    const rgb = mosRGB(rowCol(k)), oo = k < rr ? { ...o, gold: 0 } : o;
+    for (const lp of mosIso(D, nx, ny, g, bx, by, (k + 0.5) * h)) mosAlong(tiles, lp.P, lp.closed, Math.min(h, s * 1.5), Math.min(s, Math.max(h, s * 0.7)) * 1.05, gap, rgb, R, oo);
+  }
+  for (let k = 0; k < hr; k++) for (const lp of mosIso(D, nx, ny, g, bx, by, -(k + 0.5) * s)) mosAlong(tiles, lp.P, lp.closed, s, s * 1.05, gap, mosRGB(o.halo), R, { ...o, gold: 0 });
+  const bed = o.bed ?? mosMix(MOS.grout, o.rim ?? col, 0.3);
+  return { tiles, x0: bx, y0: by, w: nx * g, h: ny * g, under: (c2) => {
+    if (hr) { mosPath(c2, P); c2.lineJoin = 'round'; c2.lineWidth = 2 * hr * s + 2; c2.strokeStyle = MOS.grout; c2.stroke(); c2.lineWidth = 1.4; }
+    mosPath(c2, P); c2.fillStyle = bed; c2.fill();
+  } };
+}
+//  mosFill(outline, colour, opts): tile ANY closed outline with contour-following rows.
+//   o: key (seeds the cut of the tiles: keep it stable), s (tile size, 17), gap (grout, 2.2), rim (colour of the
+//      outline row), rimRows (1), rows ([colours] from the outside in after the rim, or (k, n) => colour),
+//      halo (colour of rows laid around the outside) + haloRows (1), gold (chance of a gold-glass tile), vary (0.1),
+//      bed (mortar colour), and the laying: at + rate, out + outDur, or reveal (see mosLay). A static outline only:
+//      something that moves is a mosGroup.
+function mosFill(P, col, o = {}) {
+  const id = 'fill:' + (o.key ?? '') + mosHashPts(P) + col + (o.rim ?? '') + (o.halo ?? '') + (o.s ?? '') + (typeof o.rows === 'object' ? o.rows.join('') : '');
+  if (o.nocache) return mosLay(mosContour(P, col, o, o.key ?? col), o);
+  return mosLay(mosEntry(id, () => mosContour(P, col, o, o.key ?? col)), o);
+}
+//  mosLine(path, colour, opts): rows of tiles along an open path (a wave, a stem, a ray). o: rows (1), s, key, + laying
+function mosLine(P, col, o = {}) {
+  const s = o.s ?? 15, gap = o.gap ?? 2.2, nr = o.rows ?? 1, id = 'line:' + (o.key ?? '') + mosHashPts(P) + col + s + nr;
+  return mosLay(mosEntry(id, () => {
+    const R = RNG('mosline', o.key ?? col), Q = resample(P, false, 6), tiles = [], bb = bbox(P, nr * s + 6), x0 = Math.floor(bb.x0), y0 = Math.floor(bb.y0);
+    for (let r = 0; r < nr; r++) mosAlong(tiles, nr > 1 ? mosOffset(Q, (r - (nr - 1) / 2) * s, false) : Q, false, s, s * 1.05, gap, mosRGB(Array.isArray(col) ? col[r % col.length] : col), R, o);
+    return { tiles, x0, y0, w: bb.x1 - x0, h: bb.y1 - y0, under: (g) => { mosPath(g, Q, false); g.lineJoin = 'round'; g.lineCap = 'butt'; g.lineWidth = nr * s + 1; g.strokeStyle = o.bed ?? MOS.grout; g.stroke(); g.lineWidth = 1.4; } };
+  }), o);
+}
+//  one loose tessera, drawn straight (bubbles, drops, sparkles, eyes). o: w, h, rot, key, at (lands at that second),
+//  lift (0..1: held above the floor with a shadow), gold (it glints)
+function mosChip(x, y, sz, col, o = {}) {
+  const w = (o.w ?? sz) / 2, h = (o.h ?? sz) / 2, c = Math.cos(o.rot ?? 0), s = Math.sin(o.rot ?? 0), q = [];
+  for (const [u, v] of [[-w, -h], [w, -h], [w, h], [-w, h]]) q.push(x + u * c - v * s, y + u * s + v * c);
+  const t = mosMk(q, mosRGB(col), RNG('moschip', o.key ?? col), { vary: o.vary ?? 0.04, jit: sz * 0.05 });
+  ctx.lineWidth = 1.4; ctx.lineCap = 'butt';
+  if (o.at != null) { const p = (TT - o.at) * FPS / 2 + 0.25; if (p < 0.2) return; if (p < 1) return mosLand(t, p); }
+  if (o.lift) mosLand(t, 1 - o.lift); else mosPaint(ctx, t);
+  if (o.gold && !MOS_DIRECT) mosGlint(t.q, x, y);
+}
+
+// ---------------------------------------------------------------------
+//  grounds: straight rows, or the fan (scallop) pattern; frames and bands
+// ---------------------------------------------------------------------
+function mosRowsGen(x, y, w, h, col, o, R) {
+  const s = o.s ?? 17, gap = (o.gap ?? 2.2) / 2, nr = Math.max(1, Math.round(h / s)), rh = h / nr, tiles = [], c1 = mosRGB(col), c2 = o.c2 ? mosRGB(o.c2) : c1, wv = o.wavy ?? 0;
+  for (let r = 0; r < nr; r++) {
+    const row = [], y0 = y + r * rh; let xx = x, first = true;
+    while (xx < x + w - 0.5) {
+      let x1 = xx + s * (1 + R.n(0.24)) * (first ? R.r(0.45, 1) : 1); first = false; if (x + w - x1 < s * 0.5) x1 = x + w;
+      const f = (px) => (wv ? wv * Math.sin(px * 0.011 + r * 0.33) : 0);
+      row.push(mosMk([xx + gap, y0 + gap + f(xx), x1 - gap, y0 + gap + f(x1), x1 - gap, y0 + rh - gap + f(x1), xx + gap, y0 + rh - gap + f(xx)], o.mix && R.f() < o.mix ? c2 : c1, R, o));
+      xx = x1;
+    }
+    if (r % 2) row.reverse();
+    for (const t of row) tiles.push(t);
+  }
+  return tiles;
+}
+function mosFanGen(x, y, w, h, col, o, R) {
+  const s = o.s ?? 17, gap = o.gap ?? 2.2, rings = o.rings ?? 6, RR = rings * s, hh = (s - gap) / 2, tiles = [];
+  const c1 = mosRGB(col), c2 = mosRGB(o.c2 ?? col), c3 = mosRGB(o.c3 ?? col), nj = Math.ceil(h / RR) + 2, ni = Math.ceil(w / (2 * RR)) + 2;
+  for (let j = 0; j <= nj; j++) for (let ii = -1; ii <= ni; ii++) {
+    const cx = x + (ii + (j % 2) * 0.5) * 2 * RR, cy = y + (j - 0.4) * RR;
+    if (cx < x - RR || cx > x + w + RR || cy - RR > y + h) continue;
+    tiles.push({ poly: ellipsePts(cx, cy, RR, RR, 0, 30), c: MOS.grout, cx, cy });      // this fan's mortar, over the row above
+    for (let k = 0; k < rings; k++) {
+      const r = RR - (k + 0.5) * s, n = Math.max(3, Math.round(TAU * r / (s * 1.04))), off = R.f() * TAU / n, da = Math.PI / n - gap / (2 * r), rgb = k === 0 ? c2 : k === rings - 1 ? c3 : c1;
+      for (let t = 0; t < n; t++) {
+        const a = Math.PI + off + t * TAU / n, px = cx + Math.cos(a) * r, py = cy + Math.sin(a) * r;
+        if (px < x - s || px > x + w + s || py < y - s || py > y + h + s) continue;
+        if (Math.hypot(px - cx - RR, py - cy - RR) < RR - s * 0.5 || Math.hypot(px - cx + RR, py - cy - RR) < RR - s * 0.5) continue;   // under the next row's fans
+        const q = []; for (const [rr, aa] of [[r + hh, a - da], [r + hh, a + da], [r - hh, a + da], [r - hh, a - da]]) q.push(cx + Math.cos(aa) * rr, cy + Math.sin(aa) * rr);
+        tiles.push(mosMk(q, rgb, R, o));
+      }
+    }
+  }
+  return tiles;
+}
+//  mosField(x, y, w, h, colour, opts): a rectangular ground. o: pattern ('rows' | 'fan'), key, s, c2 (rows: a second
+//   colour mixed in with chance `mix`; fan: the outer arc of every fan), c3 (fan: the innermost ring), rings (6 per fan),
+//   wavy (rows undulate by this many px), gold, vary, bed (false = no mortar painted under the rows), + laying.
+//   A fan field brings its own mortar fan by fan, so whatever was sketched on the bed stays visible until it is covered.
+function mosField(x, y, w, h, col, o = {}) {
+  x = Math.round(x); y = Math.round(y); w = Math.round(w); h = Math.round(h);
+  const pat = o.pattern ?? 'rows', id = 'fld:' + [o.key ?? '', pat, x, y, w, h, col, o.c2 ?? '', o.s ?? ''].join(',');
+  return mosLay(mosEntry(id, () => {
+    const R = RNG('mosfld', o.key ?? pat, col);
+    return { tiles: (pat === 'fan' ? mosFanGen : mosRowsGen)(x, y, w, h, col, o, R), x0: x, y0: y, w, h, clip: true, under: pat === 'fan' || o.bed === false ? null : (g) => { g.fillStyle = MOS.grout; g.fillRect(x, y, w, h); } };
+  }), o);
+}
+// border patterns, read from the outside in; '#' = the dark stone
+const MOS_PAT = {
+  meander: ['......', '#####.', '#...#.', '#.###.', '#.....', '######'],
+  checker: ['#.', '.#', '#.'],
+  dentil: ['....', '##..', '##..', '####'],
+  wave: ['........', '.##.....', '####....', '#####..#', '########'],
+};
+//  mosBorder(x, y, w, h, opts): a frame band around that rectangle (the band lies inside it). o: kind ('meander' |
+//   'checker' | 'dentil' | 'wave'), s (13), c (dark), c2 (light), key, + laying. mosBorderW(o) = the band's thickness.
+const mosBorderW = (o = {}) => MOS_PAT[o.kind ?? 'meander'].length * (o.s ?? 13);
+function mosBorder(x, y, w, h, o = {}) {
+  const kind = o.kind ?? 'meander', s = o.s ?? 13, id = 'brd:' + [o.key ?? '', kind, x, y, w, h, s, o.c ?? '', o.c2 ?? ''].join(',');
+  return mosLay(mosEntry(id, () => {
+    const pat = MOS_PAT[kind], nr = pat.length, per = pat[0].length, th = nr * s, g2 = (o.gap ?? 2) / 2, R = RNG('mosbrd', o.key ?? kind), tiles = [];
+    const c1 = mosRGB(o.c ?? MOS.lapis), c0 = mosRGB(o.c2 ?? MOS.marble), gd = mosRGB(MOS.gold);
+    const cell = (ox, oy, ux, uy, vx, vy, u0, u1, v0, v1, rgb) => { const q = []; for (const [u, v] of [[u0 + g2, v0 + g2], [u1 - g2, v0 + g2], [u1 - g2, v1 - g2], [u0 + g2, v1 - g2]]) q.push(ox + ux * u + vx * v, oy + uy * u + vy * v); tiles.push(mosMk(q, rgb, R, { vary: o.vary ?? 0.08, jit: 0.8 })); };
+    const corner = (ox, oy, ux, uy, vx, vy) => { for (let c = 0; c < nr; c++) for (let r = 0; r < nr; r++) { const k = Math.min(r, c, nr - 1 - r, nr - 1 - c); cell(ox, oy, ux, uy, vx, vy, c * s, c * s + s, r * s, r * s + s, k === (nr >> 1) - 1 + (nr % 2) ? gd : k % 2 ? c1 : c0); } };
+    const side = (ox, oy, ux, uy, vx, vy, len) => { const nc = Math.max(per, Math.round(len / s / per) * per), cw = len / nc; corner(ox - ux * th, oy - uy * th, ux, uy, vx, vy); for (let c = 0; c < nc; c++) for (let r = 0; r < nr; r++) cell(ox, oy, ux, uy, vx, vy, c * cw, c * cw + cw, r * s, r * s + s, pat[r][c % per] === '#' ? c1 : c0); };
+    side(x + th, y, 1, 0, 0, 1, w - 2 * th); side(x + w, y + th, 0, 1, -1, 0, h - 2 * th); side(x + w - th, y + h, -1, 0, 0, -1, w - 2 * th); side(x, y + h - th, 0, -1, 1, 0, h - 2 * th);
+    return { tiles, x0: x, y0: y, w, h, under: (g) => { g.fillStyle = MOS.grout; g.fillRect(x, y, w, th); g.fillRect(x, y + h - th, w, th); g.fillRect(x, y, th, h); g.fillRect(x + w - th, y, th, h); } };
+  }), o);
+}
+//  mosGuilloche(x, y, w, opts): a horizontal band with two plaited wave rows and a gold stud in every eye.
+//   o: s (13), c (ground), c1 / c2 (the two strands), key, + laying. The band is 5 tiles tall, its top edge at y.
+function mosGuilloche(x, y, w, o = {}) {
+  const s = o.s ?? 13, th = 5 * s, per = Math.round(th * 1.9), key = o.key ?? 'gui';
+  const k = mosField(x, y, w, th, o.c ?? MOS.lapis, { ...o, s, key: key + 'g' });
+  const strand = (ph) => { const P = []; for (let px = 0; px <= w; px += 6) P.push([x + px, y + th / 2 + Math.sin(px / per * TAU + ph) * th * 0.3]); return P; };
+  const lo = o.at != null ? { at: o.at + 0.12, rate: o.rate } : { reveal: o.reveal };
+  mosLine(strand(0), o.c1 ?? MOS.marble, { ...lo, s: s - 1, key: key + 'a' }); mosLine(strand(Math.PI), o.c2 ?? MOS.ochre, { ...lo, s: s - 1, key: key + 'b' });
+  if (k >= 1) for (let px = per / 4; px < w - s; px += per / 2) mosChip(x + px, y + th / 2, s - 2, MOS.gold, { key: key + px, gold: true });
+  return k;
+}
+// the plain floor (grout + bevels + a little tone per tile, see-through where the stone is): any colour shows through it
+function mosFloorCv() {
+  return mosEntry('floor', () => {
+    const cv = mosCanvas(W, H), g = cv.getContext('2d'), R = RNG('mosfloor');
+    g.fillStyle = MOS.grout; g.fillRect(0, 0, W, H); g.lineWidth = 1.6;
+    for (const t of mosRowsGen(0, 0, W, H, '#808080', { s: 24, gap: 2.6, jit: 1.2 }, R)) {
+      mosQuad(g, t.q); g.globalCompositeOperation = 'destination-out'; g.fillStyle = '#000'; g.fill(); g.globalCompositeOperation = 'source-over';
+      const k = R.n(0.1); g.fillStyle = k > 0 ? `rgba(255,248,230,${k})` : `rgba(40,26,16,${-k})`; g.fill();
+      const ln = (e, c) => { if (!e.length) return; g.beginPath(); for (let i = 0; i < e.length; i += 4) { g.moveTo(e[i], e[i + 1]); g.lineTo(e[i + 2], e[i + 3]); } g.strokeStyle = c; g.stroke(); };
+      ln(t.hi, 'rgba(255,250,236,0.42)'); ln(t.lo, 'rgba(40,26,16,0.2)');
+    }
+    return { cv };
+  }).cv;
+}
+function mosFloor(c = MOS.paper) { ctx.fillStyle = c; ctx.fillRect(0, 0, W, H); ctx.drawImage(mosFloorCv(), 0, 0); }
+// the bare mortar bed a picture is laid on (speckled), and the sinopia: the under-drawing sketched on it
+function mosBed(x, y, w, h) {
+  const e = mosEntry('bed:' + [x, y, w, h].join(','), () => {
+    const cv = mosCanvas(w, h), g = cv.getContext('2d'), R = RNG('mosbed', w, h);
+    g.fillStyle = MOS.grout; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < w * h / 260; i++) { g.fillStyle = R.f() < 0.5 ? 'rgba(120,96,62,0.16)' : 'rgba(255,250,236,0.3)'; g.fillRect(R.r(0, w), R.r(0, h), R.r(1.5, 3.5), R.r(1.5, 3.5)); }
+    return { cv };
+  });
+  ctx.drawImage(e.cv, x, y);
+}
+function mosSketch(P, o = {}) {
+  ctx.save(); ctx.strokeStyle = o.c ?? MOS.sinopia; ctx.globalAlpha = o.al ?? 0.6; ctx.lineWidth = (o.w ?? 3.5) / mosZoom(); ctx.setLineDash([16, 8]); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  mosPath(ctx, P, o.closed ?? true); ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  rigid groups: tiles painted once into their own canvas, then moved as one piece (with a small shadow)
+//  mosGroup(key, w, h, ox, oy, draw): draw() is called once with world point (ox, oy) at the canvas centre
+//  mosStamp(group, x, y, { rot, flip, lift, shadow }): put it down with (ox, oy) at (x, y)
+// ---------------------------------------------------------------------
+function mosGroup(key, w, h, ox, oy, draw) {
+  return mosEntry('grp:' + key, () => {
+    const cv = mosCanvas(w, h), keep = ctx, kd = MOS_DIRECT, kl = MOS_LOG;
+    ctx = cv.getContext('2d'); ctx.translate(Math.round(cv.width / 2) - ox, Math.round(cv.height / 2) - oy); MOS_DIRECT = true; MOS_LOG = [];
+    draw();
+    const gold = MOS_LOG.map((t) => ({ q: t.q.map((v, i) => v - (i % 2 ? oy : ox)), cx: t.cx - ox, cy: t.cy - oy }));
+    ctx = keep; MOS_DIRECT = kd; MOS_LOG = kl;
+    const sh = mosCanvas(w, h), sg = sh.getContext('2d'); sg.drawImage(cv, 0, 0); sg.globalCompositeOperation = 'source-in'; sg.fillStyle = 'rgb(38,26,18)'; sg.fillRect(0, 0, sh.width, sh.height);
+    return { cv, sh, hw: Math.round(cv.width / 2), hh: Math.round(cv.height / 2), gold };
+  });
+}
+function mosPut(grp, x, y, rot = 0, flip = 1, shadow = false) {
+  ctx.save(); ctx.translate(x, y); if (flip < 0) ctx.scale(-1, 1); if (rot) ctx.rotate(rot);
+  ctx.drawImage(shadow ? grp.sh : grp.cv, -grp.hw, -grp.hh);
+  if (!shadow) for (const t of grp.gold) mosGlint(t.q, t.cx, t.cy);
+  ctx.restore();
+}
+function mosStamp(grp, x, y, o = {}) {
+  const lift = o.lift ?? 0;
+  if (o.shadow !== false) { ctx.save(); ctx.globalAlpha = 0.3; mosPut(grp, x + 4 + lift * 0.6, y + 6 + lift, o.rot, o.flip, true); ctx.restore(); }
+  mosPut(grp, x, y, o.rot, o.flip);
+}
+
+// ---------------------------------------------------------------------
+//  type: sturdy roman letters cut into tesserae (the glyphs are sliced by grout lines and toned cell by cell)
+// ---------------------------------------------------------------------
+let MOS_MEAS = null;
+const mosFont = (size) => `700 ${size}px ${MOS_SERIF}`;
+function mosTextW(str, size) { MOS_MEAS = MOS_MEAS || mosCanvas(4, 4).getContext('2d'); MOS_MEAS.font = mosFont(size); return MOS_MEAS.measureText(str).width; }
+function mosTextCv(str, size, col) {
+  return mosEntry('txt:' + [str, size, col].join('|'), () => {
+    const pad = Math.ceil(size * 0.16), w = Math.ceil(mosTextW(str, size)) + 2 * pad, h = Math.ceil(size * 1.5), cv = mosCanvas(w, h), g = cv.getContext('2d'), R = RNG('mostxt', str, size);
+    g.font = mosFont(size); g.textBaseline = 'alphabetic'; g.fillStyle = col; g.fillText(str, pad, size * 1.08);
+    const c = size * 0.2; g.globalCompositeOperation = 'source-atop';
+    for (let yy = 0; yy < h; yy += c) for (let xx = 0; xx < w; xx += c) { const k = R.n(0.13); g.fillStyle = k > 0 ? `rgba(255,246,224,${k})` : `rgba(20,14,10,${-k})`; g.fillRect(xx, yy, c + 1, c + 1); }
+    g.globalCompositeOperation = 'destination-out'; g.strokeStyle = 'rgba(0,0,0,0.5)'; g.lineWidth = Math.max(1.1, size * 0.02); g.beginPath();
+    for (let xx = c; xx < w; xx += c) { g.moveTo(xx + R.n(1), 0); g.lineTo(xx + R.n(1), h); }
+    for (let yy = c * 0.6; yy < h; yy += c) { g.moveTo(0, yy + R.n(0.8)); g.lineTo(w, yy + R.n(0.8)); }
+    g.stroke();
+    return { cv, pad, base: size * 1.08, w };
+  });
+}
+//  mosText(str, x, y, size, colour, { align: 'left' | 'center' | 'right' }): y is the baseline
+function mosText(str, x, y, size, col, o = {}) {
+  const e = mosTextCv(str, size, col), tw = e.w - 2 * e.pad, x0 = o.align === 'center' ? x - tw / 2 : o.align === 'right' ? x - tw : x;
+  ctx.drawImage(e.cv, Math.round(x0 - e.pad), Math.round(y - e.base)); return tw;
+}
+
+// ---------------------------------------------------------------------
+//  captions and tags (through DEFER: after the camera, at screen size). A caption is a band of plain marble tiles
+//  inside a darker tile border, fully opaque, laid column by column with its letters; the *word* sits on an inlaid
+//  panel of light coloured tiles (gold, turquoise, rose). A tag is a small gold band with an umber border. Both are lifted again just before a
+//  bridge and are not laid until a bridge is over.
+// ---------------------------------------------------------------------
+function mosBand(key, x0, y0, nc, nr, s, field, edge, tabs, hi) {
+  return mosEntry('band:' + [key, x0, y0, nc, nr, s, field, edge, hi].join(','), () => {
+    const R = RNG('mosband', key), tiles = [], g2 = 1.1, cf = mosRGB(field), ce = mosRGB(edge), ch = mosRGB(hi ?? field);
+    for (let c = 0; c < nc; c++) for (let rr = -1; rr < nr; rr++) {
+      if (rr < 0) { const xa = x0 + c * s; tiles.push({ poly: [[xa, y0], [xa + s, y0], [xa + s, y0 + nr * s], [xa, y0 + nr * s]], c: MOS.grout, cx: xa, cy: y0 }); continue; }   // this column's mortar
+      const r = c % 2 ? nr - 1 - rr : rr, rim = c === 0 || c === nc - 1 || r === 0 || r === nr - 1, xa = x0 + c * s, ya = y0 + r * s;
+      const tab = !rim && tabs.some(([a, b]) => xa + s / 2 > a && xa + s / 2 < b);
+      tiles.push(mosMk([xa + g2, ya + g2, xa + s - g2, ya + g2, xa + s - g2, ya + s - g2, xa + g2, ya + s - g2], rim ? ce : tab ? ch : cf, R, { vary: rim ? 0.09 : 0.035, jit: 0.7 }));
+    }
+    return { tiles, x0, y0, w: nc * s, h: nr * s, clip: true };
+  });
+}
+function mosBridgeTimes(at) {     // when this era's overlay may start (after an opening bridge) and when it is lifted (before the next one)
+  let t0 = E0 + at, out = null;
+  if (typeof BRIDGES !== 'undefined') for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (Math.abs(r.tc - E0) < 1e-6) t0 = Math.max(t0, r.tc + d + 1 / FPS);
+    else if (r.tc > E0 && (out == null || r.tc - d - 0.06 < out)) out = r.tc - d - 0.06;
+  }
+  return { t0, out };
+}
+//   o: y (the band's centre, 1392), x (CX), size (60), at (seconds after the era starts, 0.5), field, edge, hi (panel), col
+function mosCaptionNow(str, o = {}) {
+  const size = o.size ?? 60, s = 20, nr = 6, cx = o.x ?? CX, cy = o.y ?? 1392, field = o.field ?? MOS.marble, hi = o.hi ?? MOS.turq, col = o.col ?? MOS.char, { t0, out } = mosBridgeTimes(o.at ?? 0.5);
+  if (TT < t0) return;
+  const toks = str.split('*').map((t, i) => ({ s: t.trim(), hi: i % 2 === 1 })).filter((t) => t.s), pad = s * 0.7;
+  toks.forEach((t, i) => { t.w = mosTextW(t.s, size); t.gap = i === 0 ? 0 : (/^[!?.,]/.test(t.s) ? size * 0.05 : size * 0.27) + (t.hi || toks[i - 1].hi ? pad : 0); });
+  const tw = toks.reduce((a, t) => a + t.w + t.gap, 0), nc = Math.ceil((tw + size * 1.5) / s), x0 = Math.round(cx - nc * s / 2), y0 = Math.round(cy - nr * s / 2);
+  let xx = cx - tw / 2; const tabs = [];
+  for (const t of toks) { xx += t.gap; t.x = xx; if (t.hi) tabs.push([t.x - pad, t.x + t.w + pad]); xx += t.w; }
+  const e = mosBand('cap' + str, x0, y0, nc, nr, s, field, o.edge ?? MOS.umber, tabs, hi), N = e.tiles.length;
+  const k = mosLay(e, { at: t0, rate: N / 0.36, out, outDur: 0.2, glint: false }); if (k <= 0) return;
+  ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, Math.floor(k * nc) * s, nr * s); ctx.clip();
+  for (const t of toks) mosText(t.s, t.x, cy + size * 0.33, size, t.hi ? (mosLum(hi) > 0.55 ? MOS.char : MOS.marble) : col);
+  ctx.restore();
+}
+//   o: x (70, the left edge), y (300, the centre), size (46), at (0.25), c (the band: a light colour), edge, col
+function mosTagNow(str, o = {}) {
+  const size = o.size ?? 46, s = 17, nr = 5, c = o.c ?? MOS.gold, { t0, out } = mosBridgeTimes(o.at ?? 0.25);
+  if (TT < t0) return;
+  const tw = mosTextW(str, size), nc = Math.ceil((tw + size * 1.3) / s), x0 = Math.round(o.x ?? 70), y0 = Math.round((o.y ?? 300) - nr * s / 2);
+  const e = mosBand('tag' + str, x0, y0, nc, nr, s, c, o.edge ?? MOS.umber, [], null), N = e.tiles.length;
+  const k = mosLay(e, { at: t0, rate: N / 0.25, out, outDur: 0.16, glint: false }); if (k <= 0) return;
+  ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, Math.floor(k * nc) * s, nr * s); ctx.clip();
+  mosText(str, x0 + nc * s / 2, y0 + nr * s / 2 + size * 0.33, size, o.col ?? (mosLum(c) > 0.55 ? MOS.char : MOS.marble), { align: 'center' });
+  ctx.restore();
+}
+const mosCaption = (str, o = {}) => { const f = () => mosCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const mosTag = (str, o = {}) => { const f = () => mosTagNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---------------------------------------------------------------------
+//  the hero: Sisik, a small terracotta fish of ~60 tiles with one gold tile for an eye. Body and tail are two
+//  rigid groups; the tail flips between two angles on 2s. (x, y) = the body centre, r = half its length.
+//   o: flip (-1 faces left), tilt (rad, nose up < 0), lift (px above the floor: the shadow moves away), mood
+//      ('smile' | 'wow' | 'happy'), tail (-1..1, default a slow wag), c (body colour: other fish), key, eye (false = none)
+// ---------------------------------------------------------------------
+function mosFishBody(r) { const P = []; for (let i = 0; i < 44; i++) { const a = i / 44 * TAU, c = Math.cos(a); P.push([(0.16 + 0.62 * c) * r, 0.42 * Math.sin(a) * r * (0.4 + 0.6 * Math.pow(0.5 + 0.5 * c, 0.55))]); } return P; }
+const mosFishTail = (r) => [[0.1, -0.05], [-0.5, -0.44], [-0.36, 0], [-0.5, 0.44], [0.1, 0.05]].map(([x, y]) => [x * r, y * r]);
+function mosHeroPts(x, y, r) {
+  const b = mosFishBody(r), P = [];
+  for (let i = 0; i < 44; i++) { const a = i / 44 * TAU; if (Math.abs(a - Math.PI) < 0.42) { if (!P.tail) { P.tail = 1; P.push([x - 0.92 * r, y + 0.44 * r], [x - 0.78 * r, y], [x - 0.92 * r, y - 0.44 * r]); } } else P.push([x + b[i][0], y + b[i][1]]); }
+  return P;
+}
+function mosHero(x, y, r, o = {}) {
+  r = Math.max(20, Math.round(r));
+  const c = o.c ?? MOS.terra, s = clamp(r * 0.125, 11, 18), key = 'fish' + r + c, flip = o.flip ?? 1, tilt = o.tilt ?? 0, lift = o.lift ?? 0, mood = o.mood ?? 'smile';
+  const body = mosGroup(key + 'b', r * 1.8, r * 1.3, 0, 0, () => {
+    mosFill(mosFishBody(r), c, { key: key + 'b', s, rim: mosTone(c, -0.38), rows: [mosTone(c, 0.12), c, mosTone(c, 0.3)], vary: 0.09 });
+    mosChip(-0.02 * r, -0.37 * r, s, mosTone(c, -0.3), { key: key + 'f1', w: s * 1.5, rot: -0.25 }); mosChip(0.08 * r, 0.38 * r, s * 0.9, mosTone(c, -0.3), { key: key + 'f2', w: s * 1.3, rot: 0.3 });
+    if (o.eye !== false) mosChip(0.47 * r, -0.07 * r, s * 1.5, MOS.char, { key: key + 'e0' });
+  });
+  const tail = mosGroup(key + 't', r * 1.5, r * 1.5, 0, 0, () => mosFill(mosFishTail(r), mosTone(c, -0.12), { key: key + 't', s, rim: mosTone(c, -0.38), vary: 0.09 }));
+  const wag = (o.tail ?? ((B % 4) < 2 ? 1 : -1)) * (mood === 'happy' ? 0.5 : 0.3);
+  const parts = (sh) => { ctx.save(); ctx.translate(-0.4 * r, 0); ctx.rotate(wag); ctx.drawImage(sh ? tail.sh : tail.cv, -tail.hw, -tail.hh); ctx.restore(); ctx.drawImage(sh ? body.sh : body.cv, -body.hw, -body.hh); };
+  ctx.save(); ctx.translate(x + 4 + lift * 0.6, y + 6 + lift); ctx.scale(flip, 1); ctx.rotate(tilt); ctx.globalAlpha = 0.3; parts(true); ctx.restore();
+  ctx.save(); ctx.translate(x, y); ctx.scale(flip, 1); ctx.rotate(tilt); parts(false);
+  if (o.eye !== false) {
+    const blink = mod(B + hash(o.key ?? 'sisik') % 31, 36) === 35, es = s * (mood === 'wow' ? 1.25 : 0.95);
+    if (!blink) mosChip(0.47 * r, -0.07 * r, es, MOS.gold, { key: key + 'e1', gold: true });
+    if (mood !== 'smile') for (let i = 0; i < 3; i++) {     // little gold chips thrown up beside the head: surprise / joy
+      const a = -1.9 + i * 0.5 + (mood === 'happy' ? 0.25 * ((B % 2) ? 1 : -1) : 0), d = r * (1.02 + 0.12 * ((B + i) % 2));
+      mosChip(0.3 * r + Math.cos(a) * d, Math.sin(a) * d, s * 0.62, MOS.gold, { key: key + 'sp' + i, rot: a, lift: 0.5 });
+    }
+  }
+  ctx.restore();
+  SPARK_AT = toScreen(x, y);
+}
+
+// ---------------------------------------------------------------------
+//  props
+// ---------------------------------------------------------------------
+// a medallion: a disc whose contour rows are rings. Pearls, suns, fruit. The same rule gives the morphing blob its rows.
+const mosMedRows = (c) => [c, mosTone(c, -0.17), c, mosTone(c, 0.38), c, mosTone(c, -0.1)];
+const mosDiscPts = (x, y, r) => ellipsePts(x, y, r, r, 0, 72);
+function mosMedallion(x, y, r, c, o = {}) { return mosFill(mosDiscPts(x, y, r), c, { rim: mosTone(c, -0.45), rows: mosMedRows(c), ...o, key: o.key ?? 'med' }); }
+// a wavy row of pale tiles that slides along in 8 steps. o: amp (15), len (150), c, rows, key, + laying
+function mosWave(x0, x1, y, o = {}) {
+  const amp = o.amp ?? 15, len = o.len ?? 150, ph = (Math.floor(B / 3) % 8) / 8 * TAU * (o.dir ?? 1), P = [];
+  for (let x = x0; x <= x1; x += 10) P.push([x, y + amp * Math.sin((x - x0) / len * TAU - ph) + amp * 0.35 * Math.sin((x - x0) / len * TAU * 2 - ph)]);
+  return mosLine(P, o.c ?? MOS.marble, { s: 15, ...o, key: (o.key ?? 'wave') });
+}
+const mosWavePts = (x0, x1, y, amp = 15, len = 150) => { const P = []; for (let x = x0; x <= x1; x += 10) P.push([x, y + amp * Math.sin((x - x0) / len * TAU)]); return P; };
+// a scallop shell standing on its hinge at (x, y); r = its height. Ribs are laid after the body.
+function mosShellPts(x, y, r) {
+  const P = [[x - 0.15 * r, y], [x - 0.2 * r, y - 0.1 * r]];
+  for (let i = 0; i <= 56; i++) { const a = (-166 + 152 * i / 56) * DEG, k = r * (0.93 + 0.07 * Math.abs(Math.cos((i / 56) * Math.PI * 7))); P.push([x + Math.cos(a) * k, y - 0.06 * r + Math.sin(a) * k]); }
+  P.push([x + 0.2 * r, y - 0.1 * r], [x + 0.15 * r, y]);
+  return P;
+}
+function mosShell(x, y, r, o = {}) {
+  const key = o.key ?? 'shell', lay = (d) => (o.at != null ? { at: o.at + d, rate: o.rate ?? 520 } : {});
+  const k = mosFill(mosShellPts(x, y, r), MOS.sand, { key, rim: MOS.umber, rows: [MOS.rose, MOS.sand, MOS.marble, MOS.sand, MOS.rose], halo: o.halo, ...lay(0) });
+  for (let i = 0; i < 5; i++) { const a = (-150 + 30 * i) * DEG; mosLine([[x + Math.cos(a) * r * 0.2, y - 0.06 * r + Math.sin(a) * r * 0.2], [x + Math.cos(a) * r * 0.84, y - 0.06 * r + Math.sin(a) * r * 0.84]], MOS.ochre, { key: key + 'rib' + i, s: 12, ...lay(0.45 + i * 0.03) }); }
+  return k;
+}
+// seaweed: fronds of olive tiles that lean left and right on 2s. (x, y) = the root, h = height
+function mosSeaweed(x, y, h, o = {}) {
+  const pose = (Math.floor(B / 4) % 2) ? 1 : -1, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const hh = h * (1 - 0.22 * Math.abs(i - (n - 1) / 2) - 0.1 * (i % 2)), bx = x + (i - (n - 1) / 2) * 34, P = [];
+    for (let k = 0; k <= 10; k++) { const u = k / 10; P.push([bx + Math.sin(u * 4.2 + i * 1.7) * 16 * u + pose * 15 * u * u, y - hh * u]); }
+    mosLine(P, i % 2 ? MOS.oliveD : MOS.olive, { s: 14, ...o, key: (o.key ?? 'weed') + i });
+  }
+}
+// bubbles: loose round-ish marble chips rising in steps from (x, y). o: n (4), rise (260), speed, key
+function mosBubbles(x, y, o = {}) {
+  const n = o.n ?? 4, rise = o.rise ?? 260, T = mosT2();
+  for (let i = 0; i < n; i++) {
+    const R = RNG('mosbub', o.key ?? 'b', i), u = mod(T * (o.speed ?? 0.42) + i / n + R.f() * 0.2, 1); if (T < (o.from ?? 0) + i * 0.12) continue;
+    mosChip(x + R.n(26) + Math.sin(u * 9 + i) * 10, y - u * rise, 11 + 9 * R.f(), i % 2 ? MOS.marble : MOS.turq, { key: 'bub' + (o.key ?? '') + i, rot: 0.6 + u * 2, lift: 0.45 });
+  }
+}
+// a five-armed starfish
+function mosStar(x, y, r, o = {}) { return mosFill(starPts(x, y, r, 5, o.rot ?? -Math.PI / 2, 80), o.c ?? MOS.ochre, { s: 13, rim: MOS.umber, rows: [MOS.ochre, MOS.gold], gold: 0.25, ...o, key: o.key ?? 'star' }); }
+// a tree: an umber trunk from (x, base) into a bumpy olive crown { x, y, r }
+function mosCrownPts(cx, cy, r, key = 'crown') { const R = RNG('moscrown', key), P = [], ph = R.r(0, TAU); for (let i = 0; i < 80; i++) { const a = i / 80 * TAU; P.push([cx + Math.cos(a) * r * (0.9 + 0.1 * Math.cos(a * 7 + ph)), cy + Math.sin(a) * r * 0.94 * (0.9 + 0.1 * Math.cos(a * 7 + ph))]); } return P; }
+function mosTree(x, base, crown, o = {}) {
+  const key = o.key ?? 'tree';
+  mosLine([[x, base], [x + 6, (base + crown.y) / 2], [crown.x, crown.y + crown.r * 0.3]], [MOS.umber, mosTone(MOS.umber, 0.16), MOS.umber], { key: key + 'tr', rows: 3, s: 14, ...o });
+  return mosFill(mosCrownPts(crown.x, crown.y, crown.r, key), MOS.olive, { key: key + 'cr', rim: MOS.oliveD, rows: [MOS.olive, mosTone(MOS.olive, 0.16), MOS.olive, mosTone(MOS.olive, 0.3)], halo: o.halo, ...o });
+}
+// the sun's rays: n wedges of gold and ochre tiles around a medallion of radius r, laid one after another from o.at
+function mosRays(x, y, r, o = {}) {
+  const n = o.n ?? 12, len = o.len ?? r * 0.56, w = o.w ?? r * 0.21;
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + i / n * TAU, c = Math.cos(a), s = Math.sin(a), r0 = r + 34, L = i % 2 ? len * 0.7 : len;
+    const P = [[x + c * r0 - s * w, y + s * r0 + c * w], [x + c * (r0 + L), y + s * (r0 + L)], [x + c * r0 + s * w, y + s * r0 - c * w]];
+    mosFill(P, i % 2 ? MOS.ochre : MOS.gold, { key: (o.key ?? 'ray') + i, s: 14, rim: i % 2 ? mosTone(MOS.ochre, -0.2) : MOS.ochre, gold: i % 2 ? 0.15 : 0.5, ...(o.at != null ? { at: o.at + i * (o.step ?? 0.042), rate: o.rate ?? 260 } : {}) });
+  }
+}
+// a pond: teal contour rows inside a marble rim, with a ring of pale tiles spreading on it in 4 steps
+function mosPond(x, y, rx, ry, o = {}) {
+  const k = mosFill(ellipsePts(x, y, rx, ry, 0, 72), MOS.teal, { key: o.key ?? 'pond', rim: MOS.marble, rows: [MOS.tealD, MOS.teal, MOS.turq, MOS.teal], gold: 0.02, halo: o.halo, ...o });
+  if (k >= 1 && o.ripple !== false) { const st = Math.floor(B / 3) % 4, u = 0.3 + st * 0.13; mosLine(ellipsePts(x + (o.rx0 ?? 0), y, rx * u, ry * u, 0, 40, -2.6, -0.5), MOS.marble, { s: 11, key: (o.key ?? 'pond') + 'rp' + st }); }
+  return k;
+}
+// a fountain jet: two arcs of water chips leaping from (x, y), stepping along on 2s
+function mosJet(x, y, h, o = {}) {
+  const T = mosT2();
+  for (const sd of [-1, 1]) for (let i = 0; i < 5; i++) {
+    const u = mod(i / 5 + T * 0.9, 1), px = x + sd * (o.w ?? h * 0.42) * u, py = y - h * 4 * u * (1 - u) * (1 - 0.25 * u);
+    mosChip(px, py, 14 - 4 * u, (i + (sd > 0 ? 1 : 0)) % 2 ? MOS.turq : MOS.marble, { key: 'jet' + sd + i, rot: u * 3 * sd, lift: 0.4 });
+  }
+}
+// a splash: chips thrown up from (x, y), t seconds after the impact (drawn for 0.5 s)
+function mosSplash(x, y, t, o = {}) {
+  if (t < 0 || t > 0.5) return; const n = o.n ?? 7, u = Math.floor(t * 12) / 6;
+  for (let i = 0; i < n; i++) { const R = RNG('mossplash', o.key ?? 's', i), vx = (i - (n - 1) / 2) * 34 + R.n(10), vy = 200 + R.r(0, 130); mosChip(x + vx * u, y - vy * u + 290 * u * u, 13 - 4 * u, (o.c ?? [MOS.marble, MOS.turq])[i % 2], { key: 'spl' + (o.key ?? '') + i, rot: i + u * 4, lift: 0.5 }); }
+}
+// a butterfly: four wing chips that open and close on 2s
+function mosFlutter(x, y, s, o = {}) {
+  const open = B % 2 === 0, w = open ? s : s * 0.42, c = o.c ?? MOS.rose, key = o.key ?? 'kupu';
+  for (const sd of [-1, 1]) { mosChip(x + sd * (w * 0.5 + 2), y - s * 0.3, s, c, { key: key + sd, w, rot: sd * 0.35, lift: 0.5 }); mosChip(x + sd * (w * 0.42 + 2), y + s * 0.42, s * 0.75, mosTone(c, 0.3), { key: key + 'b' + sd, w: w * 0.75, rot: -sd * 0.3, lift: 0.5 }); }
+  mosChip(x, y, s * 1.1, MOS.char, { key: key + 'body', w: s * 0.28 });
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'mosaic',
+  paper: MOS.paper,
+  // a plain floor of square-cut tiles in colour c (hex, or rgb() mid-morph)
+  backdrop(c) { ctx.save(); screen(); mosFloor(c); ctx.restore(); },
+  // the era seen through a hole edged by rows of tiles laid around it: a dark row in the bridge colour, a marble row outside
+  window(P, key, src, o = {}) {
+    ctx.save(); mosPath(ctx, P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    let ar = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; ar += a[0] * b[1] - b[0] * a[1]; }
+    const s = 18, sg = ar > 0 ? -1 : 1, c = o.c ?? MOS.umber, R = RNG('moswin', key), tiles = [], Q = resample(P, true, 8);
+    mosAlong(tiles, mosOffset(Q, sg * s * 0.5, true), true, s, s * 1.05, 2.2, mosRGB(mosTone(c, -0.4)), R, {});
+    mosAlong(tiles, mosOffset(Q, sg * s * 1.5, true), true, s, s * 1.05, 2.2, mosRGB(MOS.marble), R, {});
+    ctx.save(); mosPath(ctx, mosOffset(Q, sg * s, true)); ctx.lineWidth = 2 * s + 2; ctx.lineJoin = 'round'; ctx.strokeStyle = MOS.grout; ctx.stroke();
+    ctx.lineWidth = 1.4; ctx.lineCap = 'butt';
+    for (const t of tiles) if (t.cx > -30 && t.cx < W + 30 && t.cy > -30 && t.cy < H + 30) mosPaint(ctx, t);
+    ctx.restore();
+  },
+  // the morphing shape: the outline is re-laid every frame as a medallion in the blended colour, a deeper row around it
+  blob(P, c, key) {
+    const kd = MOS_DIRECT, kl = MOS_LOG; MOS_DIRECT = true; MOS_LOG = null;
+    ctx.save(); mosFill(P, c, { key: 'med', nocache: true, rim: mosTone(c, -0.45), rows: mosMedRows(c), halo: mosTone(c, -0.24) }); ctx.restore();
+    MOS_DIRECT = kd; MOS_LOG = kl;
+  },
+  hero(x, y, r, o = {}) { mosHero(x, y, r, { key: o.key, mood: o.mood }); },
+  heroColor: MOS.terra,
+  heroPts(x, y, r) { return mosHeroPts(x, y, r); },
+  // stone dust and a soft darkening toward the corners (static: a wall does not flicker)
+  post() {
+    const e = mosEntry('post', () => {
+      const cv = mosCanvas(W, H), g = cv.getContext('2d'), R = RNG('mosdust');
+      for (let i = 0; i < 9000; i++) { g.fillStyle = R.f() < 0.5 ? 'rgba(60,40,24,0.10)' : 'rgba(255,250,236,0.13)'; g.fillRect(R.r(0, W), R.r(0, H), R.r(1, 2.6), R.r(1, 2.6)); }
+      const v = g.createRadialGradient(W / 2, H * 0.46, H * 0.3, W / 2, H * 0.5, H * 0.72); v.addColorStop(0, 'rgba(40,26,16,0)'); v.addColorStop(1, 'rgba(40,26,16,0.2)'); g.fillStyle = v; g.fillRect(0, 0, W, H);
+      return { cv };
+    });
+    ctx.save(); screen(); ctx.drawImage(e.cv, 0, 0); ctx.restore();
+  },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — mosaic demo. World coordinates 1080x1920; TT on 1s (the laying), moving groups on 2s (mosT2()).
+//  Content inside x 60-940, y 250-1500. Both eras are pictures inside the same meander frame on a marble floor.
+//  Era 1: a teal sea in the fan pattern. Era 2: a sand sky in straight rows over an olive garden.
+// =====================================================================
+const cu = TIMELINE.cues;
+const FR = { x: 36, y: 170, w: 1008, h: 1438 };                       // the frame band's outer edge
+const IN = { x: 114, y: 248, w: 852, h: 1282 };                       // the picture inside it
+// the bridge objects: nothing else may overlap them at the bridge, or it shows in the morph window
+const PEARL = { x: 540, y0: 1168, y1: 760, r: 86 };
+const SUN = { x: 540, y: 640, r: 186 };
+const SHELL = { x: 540, y: 1300, r: 236 };
+const HERO_R = 120;
+const inPicture = (fn) => { ctx.save(); ctx.beginPath(); ctx.rect(IN.x, IN.y, IN.w, IN.h); ctx.clip(); fn(); ctx.restore(); };
+
+// ---- era 1: a pearl in the sea
+const pearlY = () => Math.round(lerp(PEARL.y0, PEARL.y1, EZ.o3(seg(mosT2(), cu.nudge + 1 / 12, cu.nudge + 0.4))));
+const pearlPts = () => mosDiscPts(PEARL.x, pearlY(), PEARL.r);
+const pearlLay = (o) => mosMedallion(PEARL.x, PEARL.y0, PEARL.r, MOS.marble, { key: 'pearl', gold: 0.07, ...o });
+function sceneLaut() {
+  mosFloor();
+  mosBed(IN.x, IN.y, IN.w, IN.h);
+  // the sinopia: what is about to be laid, sketched on the mortar
+  mosSketch(mosShellPts(SHELL.x, SHELL.y, SHELL.r)); mosSketch(mosDiscPts(PEARL.x, PEARL.y0, PEARL.r));
+  mosSketch(mosWavePts(150, 930, 430), { closed: false }); mosSketch(mosWavePts(150, 930, 610), { closed: false });
+  // the sea: fans of teal tiles, laid fan by fan from the top
+  mosField(IN.x, IN.y, IN.w, IN.h, MOS.teal, { pattern: 'fan', key: 'sea', c2: MOS.turq, c3: MOS.tealD, gold: 0.012, at: cu.sea - 0.1, rate: 8400 });
+  mosBorder(FR.x, FR.y, FR.w, FR.h, { key: 'frame', c: MOS.lapis });
+  // waves that slide, seaweed that leans, a starfish, bubbles (background life)
+  mosWave(150, 930, 430, { key: 'w1', at: cu.waves, rate: 420 });
+  mosWave(150, 930, 610, { key: 'w2', c: mosTone(MOS.turq, 0.5), dir: -1, at: cu.waves + 0.125, rate: 420 });
+  mosSeaweed(196, 1322, 250, { key: 'wd1', at: 0.9, rate: 300 });
+  mosSeaweed(872, 1322, 190, { key: 'wd2', n: 2, at: 1.05, rate: 300 });
+  mosStar(852, 1010, 54, { key: 'bintang', at: 1.2, rate: 300, halo: MOS.tealD });
+  // the scallop shell, then the pearl in it
+  mosShell(SHELL.x, SHELL.y, SHELL.r, { at: cu.shell, rate: 1100, halo: MOS.tealD });
+  if (TT < cu.nudge + 1 / 12) pearlLay({ at: cu.pearl, rate: 330 });
+  inPicture(() => {
+    mosBubbles(200, 1050, { key: 'b1', from: 1.2, rise: 330 }); mosBubbles(872, 1110, { key: 'b2', n: 3, from: 1.4, rise: 300, speed: 0.36 });
+    // a school of pale minnows crossing above (they stay clear of where the pearl ends up)
+    const T = mosT2();
+    for (let i = 0; i < 3; i++) mosHero(1100 + i * 96 - 230 * (T - 0.9), 520 + [0, -30, 26][i] + 5 * Math.sin(T * 5 + i * 2), 46, { c: i === 1 ? MOS.sand : MOS.marble, flip: -1, eye: false, key: 'mn' + i });
+    // Sisik swims in, dips to the shell and nudges the pearl; the pearl rises and Sisik watches it go
+    const u = EZ.o2(seg(T, cu.swim, cu.swim + 0.85)), dart = Math.sin(Math.PI * seg(T, cu.nudge - 0.08, cu.nudge + 0.25)), up = T >= cu.nudge + 0.1;
+    const hx = lerp(-40, 330, u) + 24 * dart, hy = lerp(900, 1172, EZ.io(u)) + (u < 1 ? 14 * Math.sin(T * 9) : 3 * Math.sin(T * 4));
+    if (TT >= cu.nudge + 1 / 12) mosStamp(mosGroup('pearl', 2 * PEARL.r + 70, 2 * PEARL.r + 70, PEARL.x, PEARL.y0, () => pearlLay({})), PEARL.x, pearlY(), { lift: pearlY() > PEARL.y1 ? 10 : 0 });
+    mosHero(hx, hy, HERO_R, { key: 'sisik', tilt: up ? -0.5 : 0.32 * (1 - u), mood: up ? 'wow' : 'smile' });
+  });
+  mosTag('Laut');
+  mosCaption('Sebutir *mutiara* di laut', { hi: MOS.turq });
+}
+
+// ---- era 2: it shines like the sun
+const sunPts = () => mosDiscPts(SUN.x, SUN.y, SUN.r);
+const CROWN = { x: 250, y: 962, r: 112 }, POND = { x: 700, y: 1222, rx: 204, ry: 72 };
+const FRUIT = [[208, 932], [304, 950], [252, 1014]];
+function flower(x, y, at, c) {
+  for (let i = 0; i < 4; i++) { const a = i * TAU / 4 + 0.4; mosChip(x + Math.cos(a) * 15, y + Math.sin(a) * 15, 14, c, { key: 'fl' + x + i, rot: a, at: at + i / 24 }); }
+  mosChip(x, y, 12, MOS.gold, { key: 'flc' + x, at: at + 5 / 24, gold: true });
+}
+function sceneMatahari() {
+  const T = mosT2();
+  mosFloor();
+  // the ground of the picture: a sand sky in gently waving rows, a plaited band, an olive garden
+  mosField(IN.x, IN.y, IN.w, 780, MOS.sand, { key: 'sky', c2: MOS.marble, mix: 0.1, wavy: 4, s: 18, gold: 0.006, vary: 0.07 });
+  mosField(IN.x, 1093, IN.w, 437, MOS.olive, { key: 'garden', c2: MOS.oliveD, mix: 0.22, s: 18 });
+  mosGuilloche(IN.x, 1028, IN.w, { key: 'plait' });
+  mosBorder(FR.x, FR.y, FR.w, FR.h, { key: 'frame', c: MOS.umber });
+  // the sun medallion (the bridge object) and its rays, laid one after another
+  mosMedallion(SUN.x, SUN.y, SUN.r, MOS.gold, { key: 'sun', gold: 0.3, halo: MOS.sand });
+  mosRays(SUN.x, SUN.y, SUN.r, { key: 'ray', at: cu.rays });
+  // the tree: three fruit ripen on it, tile by tile
+  mosTree(205, 1300, CROWN, { key: 'pohon', halo: MOS.sand });
+  FRUIT.forEach(([x, y], i) => mosMedallion(x, y, 25, MOS.ochre, { key: 'buah' + i, s: 12, gold: 0.2, at: [cu.f1, cu.f2, cu.f3][i], rate: 110 }));
+  // flowers, a butterfly, the pond with its ripple and a little fountain (background life)
+  flower(158, 1196, 3.9, MOS.marble); flower(404, 1178, 4.4, MOS.rose); flower(452, 1296, 5.0, MOS.marble);
+  mosPond(POND.x, POND.y, POND.rx, POND.ry, { key: 'kolam', halo: MOS.oliveD, rx0: -30 });
+  mosJet(852, 1206, 120, { w: 44 });
+  mosFlutter(880 + 26 * Math.sin(T * 2.1), 470 + 58 * Math.sin(T * 1.3 + 1), 27, { key: 'kupu' });
+  // Sisik looks up at the sun from the pond, then leaps for joy (twice) with a splash
+  const l1 = seg(T, cu.leap, cu.splash), l2 = seg(T, cu.leap2, cu.splash2), air = (l1 > 0 && l1 < 1) || (l2 > 0 && l2 < 1);
+  const arc = l1 > 0 && l1 < 1 ? [l1, 205] : l2 > 0 && l2 < 1 ? [l2, 120] : [0, 0], hop = Math.sin(Math.PI * arc[0]);
+  mosSplash(650, 1205, T - cu.leap, { key: 'a', n: 5 }); mosSplash(640, 1210, T - cu.splash, { key: 'b' }); mosSplash(640, 1210, T - cu.splash2, { key: 'c', n: 5 });
+  mosHero(684 - 44 * EZ.io(seg(T, cu.leap, cu.splash)), 1216 - arc[1] * hop + (air ? 0 : 3 * Math.sin(T * 4)), HERO_R, { key: 'sisik', flip: -1,
+    tilt: air ? lerp(-0.95, 0.8, arc[0]) : T < cu.leap ? -0.3 : -0.12, lift: 34 * hop, mood: air || T >= cu.splash ? 'happy' : T >= 3.7 ? 'wow' : 'smile' });
+  mosTag('Matahari', { c: MOS.turq });
+  mosCaption('bersinar bagai *matahari!*', { hi: MOS.gold });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — mosaic demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [MOS.teal, MOS.sand];
+function pieceCam() { return null; }          // a wall does not move: the tiles stay crisp, the laying is the motion
+const BRIDGES = [
+  // the pearl (a round marble medallion) -> the sun (a round gold medallion): same proportions; marble -> gold
+  { tc: 3.0, A: () => ({ P: pearlPts(), c: MOS.marble }), B: () => ({ P: sunPts(), c: MOS.gold }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — mosaic demo (inside buildScore(); see kit/score-head.js). A courtyard tune: a soft pad, plucked
+  // strings in D minor that open into F major, a small bass; every tile is a dry stone click, in streams while
+  // an area is being laid; water is a falling blip, gold is a chime.
+  const T = TIMELINE, q = T.cues;
+  const click = (t, vel, pan = 0, f = 3200) => { noiseHit(t, 0.014, 'bandpass', f, 3, vel, pan, 0.08); blip(t, f * 0.62, f * 0.5, 0.012, vel * 0.5, pan); };   // one tessera set
+  const lay = (t0, t1, vel, pan0 = -0.4, pan1 = 0.4, every = E16 / 2) => { let i = 0; for (let t = t0; t < t1 - 1e-6; t += every, i++) click(t + (i % 3) * 0.004, vel * (0.7 + 0.3 * ((i * 7) % 5) / 4), lerp(pan0, pan1, (t - t0) / (t1 - t0)), 2600 + ((i * 5) % 7) * 260); };
+  const drop = (t, f, vel, pan = 0) => blip(t, f, f * 0.5, 0.09, vel, pan);
+  const thud = (t, vel, pan = 0) => { sub(t, vel); noiseHit(t, 0.08, 'lowpass', 600, 0.7, vel * 0.3, pan, 0.2); };
+  to = 'm';
+  pad(0.0, 3.1, ['D3', 'A3', 'F4'], 0.06, { type: 'triangle', cut: 1300, att: 0.3, rel: 0.3, send: 0.45 });
+  pad(3.0, 6.05, ['F2', 'C3', 'A3', 'E4'], 0.085, { type: 'triangle', cut: 1800, att: 0.15, rel: 0.3, send: 0.45 });
+  const mA = ['D4', 'F4', 'A4', 'G4', 'F4', 'E4', 'D4', 'A3'], mB = ['A4', 'C5', 'F5', 'E5', 'G5', 'F5', 'C5', 'A4'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; if (t < 0.5) continue; pluck(t, nz((t < 3 ? mA : mB)[i % 8]), t < 3 ? 0.06 : 0.075, i % 2 ? 0.25 : -0.25, 0.3, t < 3 ? 2400 : 3200, 0.3); }
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; bass(t, nz(t < 3 ? (i % 4 < 2 ? 'D2' : 'A1') : (i % 4 < 2 ? 'F2' : 'C2')) * 2, t < 3 ? 0.07 : 0.09); }
+  for (let i = 0; i < 6; i++) noiseHit(3.0 + i * BEAT + E8, 0.04, 'highpass', 6500, 0.7, 0.028, i % 2 ? 0.25 : -0.25);
+  ['F4', 'A4', 'C5'].forEach((n, i) => pluck(3.0, nz(n), 0.11, -0.2 + i * 0.2, 0.5, 3400, 0.4));                        // the payoff: the sun
+  sub(3.0, 0.09);
+  chime(3.0, [nz('F5'), nz('A5'), nz('C6')], 0.06, 0);
+  to = 's';
+  lay(0.0, 0.72, 0.022, -0.5, 0.5, E16 / 4);                                                                            // the sea is laid
+  lay(q.shell, q.shell + 0.5, 0.03, -0.1, 0.1);                                                                         // waves, the shell
+  lay(q.pearl, q.pearl + 0.36, 0.034, 0, 0); chime(q.pearl + 0.36, [nz('A5'), nz('D6')], 0.03, 0);                      // the pearl
+  [0, 0.25, 0.5].forEach((d, i) => drop(q.swim + d, 700 - i * 60, 0.03, -0.5 + i * 0.12));                              // the fish swims in
+  thud(q.nudge, 0.07, -0.1); click(q.nudge, 0.06, -0.1, 1800);                                                          // the nudge
+  blip(q.nudge + 0.08, 500, 1500, 0.3, 0.035, 0);                                                                       // the pearl rises
+  sweep(2.4, 3.0, 0.014, 500, 2600, 0);                                                                                 // into the morph
+  lay(2.75, 3.0, 0.03, -0.2, 0.2); lay(3.0, 3.25, 0.03, -0.2, 0.2);                                                     // the medallion is re-laid
+  lay(q.rays, q.rays + 0.5, 0.034, -0.4, 0.4, E16 / 2);                                                                 // the rays, one by one
+  [q.f1, q.f2, q.f3].forEach((t, i) => { lay(t, t + 0.12, 0.034, -0.4, -0.3, E16 / 4); pluck(t, nz(['C6', 'D6', 'F6'][i]), 0.04, -0.35, 0.2, 5200, 0.3); });   // fruit
+  blip(q.leap, 400, 1300, 0.2, 0.035, 0.2); noiseHit(q.leap, 0.12, 'highpass', 3000, 0.7, 0.03, 0.2, 0.2);              // the leap
+  thud(q.splash, 0.08, 0.15); noiseHit(q.splash, 0.22, 'bandpass', 2400, 0.8, 0.05, 0.15, 0.3, 900);                    // the splash
+  chime(q.splash + 0.17, [nz('C6'), nz('F6')], 0.03, 0);                                                                // the gold glint crossing the sun
+  blip(q.leap2, 450, 1100, 0.14, 0.03, 0.15); noiseHit(q.splash2, 0.16, 'bandpass', 2600, 0.8, 0.04, 0.15, 0.3, 1000);
+  for (let i = 0; i < 4; i++) drop(3.7 + i * 0.5 + (i % 2) * E16, 1500 + (i % 2) * 300, 0.014, 0.5);                    // the fountain
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

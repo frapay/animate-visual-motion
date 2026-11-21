@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Split-flap demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #060607; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  SPLIT-FLAP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A departure board at 06:59:57. DEPARTURES clatters in left to
+//  right, a sun of yellow flaps assembles from its middle outward, a flight is listed, a bluebird of colour flaps
+//  hops along the row. At 3.0s (07:00:00) the sun's flaps turn over into a red heart: ARRIVALS, the flight has
+//  LANDED, the heart beats in waves of flips and the bird hops under it.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/split-flap/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 510;                                               // caption centre: 13–14 cells centred on it sit in columns 1–13
+
+const ERA_LIST = [[0, 3, () => sceneDepart()], [3, 6, () => sceneArrive()]];
+const SHOTS = [
+  ['depart', 0, 0.0, 3.0, 'DEPARTURES flips in, a sun of yellow flaps assembles, a flight is listed, the bluebird hops along the row'],
+  ['arrive', 1, 3.0, 6.0, 'the sun turns over into a red heart; ARRIVALS, the flight has LANDED, the heart beats in waves, the bird hops under it'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { title: 0.0, clock: 0.125, sun: 0.5, list: 0.75, bird: 1.0, rays: 1.25, hop1: 1.5, gate: 1.75, hop2: 2.0, heart: 3.0, arrive: 3.4, landed: 3.75, beat: 4.0, hop3: 4.5, hop4: 5.0, hop5: 5.5 },
+  acts: [
+    { name: '1 Depart', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Arrive', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.25, title: 'every goodbye', sound: 'a station gong, a clock tick, flap clatter in waves, a small hop', next: 'the sun turns over into a heart' },
+    { t: 5.25, title: 'flips to hello', sound: 'the chord lifts to major; the heart beats in clatter, the bird hops', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

@@ -1,0 +1,1668 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Origami demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2730; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ORIGAMI DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a pale blue table a white square lands on its crease pattern and
+//  is folded, one fold per beat, into a little boat: the top half comes down (indigo), two corners fold up (white),
+//  the sail stands (white). It rocks and drifts over two pleated paper waves. At 3.0s the boat flattens back into
+//  the square it came from, now vermilion on warm kraft, and that square is folded into the crane: in half, into a
+//  kite, opened (wings, neck and tail swing out), head down. It rocks on its base and flexes its wings while two
+//  stars fold open and a butterfly flaps.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/origami/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneBoat()], [3, 6, () => sceneCrane()]];
+const SHOTS = [
+  ['boat',  0, 0.0, 3.0, 'a white square lands on its crease pattern and is folded in three moves into a boat; it rocks and drifts over pleated waves'],
+  ['crane', 1, 3.0, 6.0, 'the boat flattens into a vermilion square that is folded into the crane; it rocks and flexes its wings; stars fold open, a butterfly flaps'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { land: 0.25, f1: 0.5, f2: 1.0, f3: 1.5, float: 1.95, c1: 3.4, c2: 3.75, open: 4.1, head: 4.5, star1: 4.5, star2: 4.75, flap1: 5.0, flap2: 5.5 },
+  acts: [
+    { name: '1 Boat',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Crane', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.1, title: 'a square, three folds: a boat', sound: 'soft plucks; a paper swish and a crease tick on every fold', next: 'the boat flattens back into the square' },
+    { t: 5.25, title: 'the same square folds into a crane', sound: 'the plucks open into a chord; swishes, a chime as the head folds down', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/origami/kit.js — ORIGAMI: folded paper models photographed on a plain tabletop. Every subject is a small
+//  number of LARGE flat paper facets (6–20) meeting along straight creases. What makes it paper and not 3D render:
+//  each facet is one flat tone of its paper colour, lighter or darker only by how it faces one soft light (top-left);
+//  creases show as a thin dark valley line or a thin light mountain ridge; the paper has TWO sides (a coloured face
+//  and a white reverse) and the reverse shows wherever a flap is folded over; facets carry faint paper fibres and a
+//  very soft gradient near a fold; a model casts ONE soft contact shadow on a calm matte table with lots of empty
+//  space, which may carry a faint crease-pattern diagram (dashed valley / dash-dot mountain lines) and instruction arrows.
+//  Motion on 1s. The signature move is FOLDING: a flap is mirrored across its crease with its width scaled through
+//  zero (oriFold), switching from face to reverse colour as it passes edge-on, shading as it turns, settling with one
+//  small bounce. Nothing squashes or stretches: paper is rigid.
+//  Built on kit/core.js. Helpers are prefixed ori…; the palette is ORI. Needs from the piece head: W, H, FPS (CX optional).
+// =====================================================================
+const ORI = {
+  table: '#e5e2db',     // neutral pale-grey table: the ground a morph happens on (STYLE.paper)
+  blue: '#cbdde5',      // a pale blue table (water, morning, calm)
+  kraft: '#c8a57a',     // a warm kraft table (wood, afternoon, warmth)
+  white: '#f8f5ee',     // the REVERSE side of every sheet; also tags, caption strips, pleats
+  verm: '#e2472d',      // vermilion: RESERVED for the hero (the crane)
+  indigo: '#2f4b8c',    // the calm second paper: boats, weight
+  mustard: '#e3ab2f',   // small bright things: stars, a far boat
+  sage: '#8db08c',      // quiet living things: butterflies, leaves
+  ink: '#35323b',       // lettering, diagram lines, arrows
+};
+const ORI_LIT = [255, 250, 238], ORI_SHD = [40, 34, 62];      // what a facet turns toward in the light / away from it
+const ORI_FONT = '"Avenir Next", Avenir, "Segoe UI", "Helvetica Neue", "Noto Sans", "Liberation Sans", "DejaVu Sans", Arial, sans-serif';
+const ORI_L = (() => { const v = [-0.5, -0.6, 0.62], n = Math.hypot(v[0], v[1], v[2]); return v.map((x) => x / n); })();   // the one light: top-left, toward the viewer
+const ORI_SH = [0.6, 0.8];                                    // the way shadows fall on the table (away from the light)
+const ORI_W = Math.SQRT2 - 1;                                 // tan 22.5°: the kite-fold ratio
+
+// ---------------------------------------------------------------------
+//  colour (accepts '#rrggbb' or 'rgb(r,g,b)')
+// ---------------------------------------------------------------------
+const ORI_RGBS = {};
+function oriRGB(c) { if (c[0] === '#') return ORI_RGBS[c] || (ORI_RGBS[c] = [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16))); return c.match(/[\d.]+/g).slice(0, 3).map(Number); }
+// a facet's flat tone: paper colour c turned toward the light (s > 0) or away from it (s < 0), s in -1..1
+function oriTone(c, s = 0) {
+  const v = oriRGB(c), w = s >= 0 ? ORI_LIT : ORI_SHD, k = s >= 0 ? Math.min(1, s) * 0.55 : Math.min(1, -s) * 0.62;
+  return `rgb(${Math.round(v[0] + (w[0] - v[0]) * k)},${Math.round(v[1] + (w[1] - v[1]) * k)},${Math.round(v[2] + (w[2] - v[2]) * k)})`;
+}
+const oriShdCol = (al) => `rgba(${ORI_SHD[0]},${ORI_SHD[1]},${ORI_SHD[2]},${al})`;
+// Lambert for a normal [x, y, z] (z toward the viewer; screen y down): a facet flat on the table = 0, lit > 0, shaded < 0
+function oriLambert(n, L = ORI_L) {
+  let [x, y, z] = n; if (z < 0) { x = -x; y = -y; z = -z; }
+  const d = (x * L[0] + y * L[1] + z * L[2]) / (Math.hypot(x, y, z) || 1);
+  return clamp(d >= L[2] ? (d - L[2]) / (1 - L[2]) : (d - L[2]) / L[2], -1, 1);
+}
+
+// ---------------------------------------------------------------------
+//  geometry: straight edges only
+// ---------------------------------------------------------------------
+const oriZ = () => { const m = ctx.getTransform(); return Math.hypot(m.a, m.b) || 1; };
+function oriPath(P) { ctx.beginPath(); ctx.moveTo(P[0][0], P[0][1]); for (let i = 1; i < P.length; i++) ctx.lineTo(P[i][0], P[i][1]); ctx.closePath(); }
+const oriCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+function oriArea(P) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a[0] * b[1] - b[0] * a[1]; } return Math.abs(s) / 2; }
+const oriLerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+// signed distance of p from the line a -> b (positive on the side of the normal (-uy, ux))
+function oriDist(p, a, b) { const dx = b[0] - a[0], dy = b[1] - a[1]; return (dx * (p[1] - a[1]) - dy * (p[0] - a[0])) / (Math.hypot(dx, dy) || 1); }
+function oriMirror(p, a, b) { const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, d = oriDist(p, a, b); return [p[0] + 2 * d * dy / L, p[1] - 2 * d * dx / L]; }
+// the part of polygon P on side sg (+1 / -1) of the line a -> b
+function oriClip(P, a, b, sg) {
+  const out = [], n = P.length;
+  for (let i = 0; i < n; i++) {
+    const p = P[i], q = P[(i + 1) % n], sp = sg * oriDist(p, a, b), sq = sg * oriDist(q, a, b);
+    if (sp >= -1e-9) out.push(p);
+    if ((sp > 1e-9 && sq < -1e-9) || (sp < -1e-9 && sq > 1e-9)) out.push(oriLerp(p, q, sp / (sp - sq)));
+  }
+  return out;
+}
+// a model's placement: local point -> world. Scale sc, rotation rot (radians) about the local pivot (px, py)
+function oriT(x, y, sc = 1, rot = 0, px = 0, py = 0) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return (p) => [x + (px + (p[0] - px) * c - (p[1] - py) * s) * sc, y + (py + (p[0] - px) * s + (p[1] - py) * c) * sc];
+}
+
+// ---------------------------------------------------------------------
+//  timing: a fold is a spring that reaches flat, bounces back ONCE a few degrees and settles
+//   oriBounce(u)      folds progress past 1 back (paper cannot pass through paper)
+//   oriGo(t0, d)      0..1 progress of a fold that starts at t0 and has settled after d seconds
+//   oriSteps(ts, d)   a model's step counter: +1 per fold time in ts (integer part = folds done, fraction = the fold in hand)
+// ---------------------------------------------------------------------
+const oriBounce = (u) => (u <= 0 ? 0 : u > 1 ? 2 - u : u);
+function oriGo(t0, d = 0.4) { const k = (6.6 / d) ** 2; return oriBounce(springEase(TT - t0, k, 1.4 * Math.sqrt(k))); }
+const oriSteps = (ts, d = 0.4) => ts.reduce((a, t) => a + oriGo(t, d), 0);
+
+// ---------------------------------------------------------------------
+//  paper: fibres inside every facet (one seeded tile), grain and a soft vignette over the finished photograph
+// ---------------------------------------------------------------------
+let ORI_FIB = null, ORI_GRAIN = null;
+function oriFibre() {
+  if (ORI_FIB) return ORI_FIB;
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+  const g = cv.getContext('2d'), R = RNG('ori-fibre');
+  for (let i = 0; i < 620; i++) {
+    const x = R.r(0, 256), y = R.r(0, 256), a = R.r(0, TAU), l = R.r(3, 12);
+    g.strokeStyle = R.f() < 0.5 ? 'rgba(255,255,255,0.11)' : 'rgba(40,34,62,0.075)'; g.lineWidth = R.r(0.5, 1.2);
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+  for (let i = 0; i < 1500; i++) { g.fillStyle = R.f() < 0.5 ? 'rgba(255,255,255,0.10)' : 'rgba(40,34,62,0.07)'; g.fillRect(R.r(0, 256), R.r(0, 256), 1.3, 1.3); }
+  return (ORI_FIB = g.createPattern(cv, 'repeat'));
+}
+function oriGrain() {
+  if (ORI_GRAIN) return ORI_GRAIN;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d'), R = RNG('ori-grain'), n = Math.round(W * H / 150);
+  g.fillStyle = 'rgba(40,34,62,0.055)'; g.beginPath(); for (let i = 0; i < n; i++) g.rect(R.r(0, W), R.r(0, H), 1.5, 1.5); g.fill();
+  g.fillStyle = 'rgba(255,252,244,0.07)'; g.beginPath(); for (let i = 0; i < n; i++) g.rect(R.r(0, W), R.r(0, H), 1.5, 1.5); g.fill();
+  const v = g.createRadialGradient(W / 2, H * 0.46, Math.min(W, H) * 0.5, W / 2, H * 0.46, Math.hypot(W, H) * 0.62);
+  v.addColorStop(0, 'rgba(30,24,50,0)'); v.addColorStop(1, 'rgba(30,24,50,0.16)'); g.fillStyle = v; g.fillRect(0, 0, W, H);
+  return (ORI_GRAIN = cv);
+}
+// the table: one matte colour under the soft light (brighter toward the top-left, falling off to the far corner)
+function oriTable(c) {
+  ctx.save(); screen();
+  ctx.fillStyle = c; ctx.fillRect(0, 0, W, H);
+  const g = ctx.createRadialGradient(W * 0.26, H * 0.2, 40, W * 0.26, H * 0.2, Math.hypot(W, H) * 0.95);
+  g.addColorStop(0, 'rgba(255,252,244,0.30)'); g.addColorStop(0.5, 'rgba(255,252,244,0.05)'); g.addColorStop(1, 'rgba(30,24,50,0.12)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the three marks of the medium: a facet, a crease, a contact shadow
+// ---------------------------------------------------------------------
+// one flat facet: polygon P of paper c at tone s. o.fold = [[a, b, kind?], ...] adds the soft gradient beside those
+// creases (kind 'm' = a lit ridge, default = a darker valley); o.soft = its reach in px (44); o.plain = no fibres
+function oriFacet(P, c, s = 0, o = {}) {
+  if (P.length < 3) return;
+  const z = oriZ(), col = oriTone(c, s);
+  oriPath(P); ctx.fillStyle = ctx.strokeStyle = col; ctx.lineWidth = 1.2 / z; ctx.lineJoin = 'round'; ctx.fill(); ctx.stroke();
+  ctx.save(); oriPath(P); ctx.clip();
+  const bb = bbox(P, 2), ce = oriCentroid(P);
+  for (const f of o.fold || []) {
+    const [a, b, kind] = f, d = oriDist(ce, a, b); if (Math.abs(d) < 0.5) continue;
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, nx = -(b[1] - a[1]) / L * Math.sign(d), ny = (b[0] - a[0]) / L * Math.sign(d);
+    const reach = Math.min(o.soft ?? 44, Math.abs(d) * 1.6), g = ctx.createLinearGradient(a[0], a[1], a[0] + nx * reach, a[1] + ny * reach);
+    g.addColorStop(0, kind === 'm' ? 'rgba(255,252,244,0.22)' : oriShdCol(0.2)); g.addColorStop(1, kind === 'm' ? 'rgba(255,252,244,0)' : oriShdCol(0));
+    ctx.fillStyle = g; ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+  }
+  if (!o.plain) { ctx.fillStyle = oriFibre(); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); }
+  ctx.restore();
+}
+// a crease from a to b: 'v' valley = a thin dark line whose far wall catches a little light, 'm' mountain = a thin
+// light ridge with a little shade behind it, 'e' = a folded edge (a quiet light line). o: w (2), al (1), frac (draw-on)
+function oriCrease(a, b, kind = 'v', o = {}) {
+  const f = clamp(o.frac ?? 1); if (f <= 0) return;
+  const z = oriZ(), w = (o.w ?? 2) / z, q = oriLerp(a, b, f), L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+  let ox = -(b[1] - a[1]) / L, oy = (b[0] - a[0]) / L; if (ox * ORI_L[0] + oy * ORI_L[1] > 0) { ox = -ox; oy = -oy; }   // away from the light
+  const line = (dx, dy, col, lw) => { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(a[0] + dx, a[1] + dy); ctx.lineTo(q[0] + dx, q[1] + dy); ctx.stroke(); };
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1; ctx.lineCap = 'round';
+  if (kind === 'm') { line(ox * w * 0.9, oy * w * 0.9, oriShdCol(0.2), w); line(0, 0, 'rgba(255,253,246,0.8)', w); }
+  else if (kind === 'e') line(0, 0, 'rgba(255,253,246,0.5)', w * 0.8);
+  else { line(ox * w * 0.9, oy * w * 0.9, 'rgba(255,253,246,0.34)', w); line(0, 0, oriShdCol(0.46), w); }
+  ctx.restore();
+}
+// the ONE soft contact shadow of a model: polys = the polygons it is made of (drawn as one shape, so overlaps do not
+// add up). o.lift 0..1 = how far the model stands off the table (a flat sheet ~0.1, a standing model 1), o.al (0.3)
+function oriShadow(polys, o = {}) {
+  polys = polys.filter((P) => P && P.length > 2); if (!polys.length) return;
+  const lift = o.lift ?? 0.5, z = oriZ(), OFF = 20000;
+  ctx.save();
+  ctx.shadowColor = oriShdCol(o.al ?? 0.3); ctx.shadowBlur = ((o.blur ?? 30) * lift + 5) * z;
+  ctx.shadowOffsetX = OFF + ((o.d ?? 30) * lift + 3) * ORI_SH[0] * z; ctx.shadowOffsetY = ((o.d ?? 30) * lift + 3) * ORI_SH[1] * z;
+  const m = ctx.getTransform(); ctx.setTransform(m.a, m.b, m.c, m.d, m.e - OFF, m.f);   // the shape itself is drawn off-canvas: only its shadow lands
+  ctx.fillStyle = '#000'; ctx.beginPath();
+  for (const P of polys) { ctx.moveTo(P[0][0], P[0][1]); for (let i = 1; i < P.length; i++) ctx.lineTo(P[i][0], P[i][1]); ctx.closePath(); }
+  ctx.fill(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  shading a list of facets from the light
+//   oriShade(facets, o)   each facet { P, n: [x, y, z] } (a normal), or { P, P3: [[x, y, z], ...] } (3D corners), or
+//                         { P, tilt: [dirAngle, amount] } (leaning toward the screen direction dirAngle by amount 0..1).
+//                         Sets f.s = (f.ds || 0) + o.amp (0.85) x Lambert. o.light = another light direction.
+//   oriFacets(facets, o)  shades (if needed) and draws them back to front: f.c || o.c, f.fold; then o.creases
+//                         [[a, b, kind], ...] and, unless o.shadow === false, the one contact shadow first (o.lift)
+// ---------------------------------------------------------------------
+function oriShade(facets, o = {}) {
+  const L = o.light ? (() => { const n = Math.hypot(...o.light); return o.light.map((x) => x / n); })() : ORI_L;
+  for (const f of facets) {
+    let n = f.n;
+    if (!n && f.P3) { const [A, B, C] = f.P3, u = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], v = [C[0] - A[0], C[1] - A[1], C[2] - A[2]]; n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]; }
+    if (!n && f.tilt) n = [Math.cos(f.tilt[0]) * f.tilt[1], Math.sin(f.tilt[0]) * f.tilt[1], Math.sqrt(Math.max(0, 1 - f.tilt[1] ** 2))];
+    f.s = (f.ds || 0) + (o.amp ?? 0.85) * oriLambert(n || [0, 0, 1], L);
+  }
+  return facets;
+}
+function oriFacets(facets, o = {}) {
+  if (facets.some((f) => f.s == null)) oriShade(facets, o);
+  if (o.shadow !== false) oriShadow(facets.map((f) => f.P), { lift: o.lift ?? 0.6 });
+  for (const f of facets) oriFacet(f.P, f.c ?? o.c ?? ORI.verm, f.s, f);
+  for (const [a, b, kind] of o.creases || []) oriCrease(a, b, kind);
+}
+
+// ---------------------------------------------------------------------
+//  THE FOLD
+//   oriFoldPts(P, [a, b], u, side, whole)   geometry only. The flap is the part of P on `side` of the crease a -> b
+//        (side = +1 / -1, or a point on the flap's side, or omitted = the smaller part); whole = true: all of P is the
+//        flap (it is hinged on the crease). u = 0 flat as drawn, 0.5 edge-on, 1 mirrored across the crease.
+//        -> { stay, flap0, flap, k (width factor 1 .. -1), th (angle), a, b, n, side, d0, chord }
+//   oriFoldDraw(g, o)   draws it: stay in the face colour, the flap in o.c while its face shows and o.rev once it has
+//        passed edge-on, toned by the angle it has turned, its cast shadow on the paper below, the crease.
+//        o: c (face), rev (reverse, white), s (base tone), ds (the flap's extra tone), stay (false = flap only),
+//           behind (true = a mountain fold: the flap goes behind the paper), shadow (false = none), crease (false = none)
+//   oriFold(P, cr, u, o)   both. o.side / o.whole as above.
+//   oriFoldMap(g, T)       the same fold placed with a model transform (oriT)
+// ---------------------------------------------------------------------
+function oriFoldPts(P, cr, u, side, whole) {
+  const [a, b] = cr, L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, n = [-(b[1] - a[1]) / L, (b[0] - a[0]) / L];
+  if (Array.isArray(side)) side = oriDist(side, a, b) >= 0 ? 1 : -1;
+  let flap0, stay;
+  if (whole) { flap0 = P; stay = []; if (side == null) side = oriDist(oriCentroid(P), a, b) >= 0 ? 1 : -1; }
+  else {
+    const pos = oriClip(P, a, b, 1), neg = oriClip(P, a, b, -1);
+    if (side == null) side = oriArea(pos) <= oriArea(neg) ? 1 : -1;
+    flap0 = side > 0 ? pos : neg; stay = side > 0 ? neg : pos;
+  }
+  const th = Math.PI * oriBounce(u), k = Math.cos(th), d0 = flap0.map((p) => oriDist(p, a, b));
+  const flap = flap0.map((p, i) => [p[0] - n[0] * d0[i] * (1 - k), p[1] - n[1] * d0[i] * (1 - k)]);
+  let lo = 1e9, hi = -1e9;
+  flap0.forEach((p, i) => { if (Math.abs(d0[i]) < 1e-6 * L + 1e-9) { const t = ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / (L * L); lo = Math.min(lo, t); hi = Math.max(hi, t); } });
+  const chord = hi > lo ? [oriLerp(a, b, lo), oriLerp(a, b, hi)] : [a, b];
+  return { stay, flap0, flap, k, th, a, b, n, side, d0, chord };
+}
+function oriFoldMap(g, T) {
+  const a = T(g.a), b = T(g.b), L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, L0 = Math.hypot(g.b[0] - g.a[0], g.b[1] - g.a[1]) || 1;
+  return { ...g, stay: g.stay.map(T), flap0: g.flap0.map(T), flap: g.flap.map(T), a, b, chord: g.chord.map(T), n: [-(b[1] - a[1]) / L, (b[0] - a[0]) / L], d0: g.d0.map((d) => d * L / L0) };
+}
+function oriFoldDraw(g, o = {}) {
+  const c = o.c ?? ORI.verm, rev = o.rev ?? ORI.white, s0 = o.s ?? 0, th = g.th, sn = Math.sin(th), front = g.k >= 0, dir = o.behind ? -1 : 1;
+  if (o.stay !== false && g.stay.length > 2) oriFacet(g.stay, c, s0);
+  if (g.flap.length < 3 || (o.behind && !front)) return g;
+  const px = g.n[0] * g.side * dir, py = g.n[1] * g.side * dir;
+  const s = s0 + (o.ds ?? 0) + Math.max(-0.5, (o.amp ?? 0.8) * oriLambert(front ? [-sn * px, -sn * py, Math.cos(th)] : [sn * px, sn * py, -Math.cos(th)]));
+  if (o.shadow !== false && !o.behind && th > 0.03) {   // the flap's shadow on the paper under it: long while it stands, a sliver once it lies flat
+    const Q = g.flap.map((p, i) => { const h = Math.min(44, Math.abs(g.d0[i]) * sn * 0.34) + (front ? 0 : Math.min(4, Math.abs(g.d0[i]))); return [p[0] + ORI_SH[0] * h, p[1] + ORI_SH[1] * h]; });
+    oriPath(Q); ctx.fillStyle = oriShdCol(0.16); ctx.fill();
+  }
+  if (Math.abs(g.k) > 0.012) oriFacet(g.flap, front ? c : rev, s, { fold: [[g.a, g.b]] });
+  if (o.crease !== false && th > 0.03) oriCrease(g.chord[0], g.chord[1], th > Math.PI - 0.03 ? 'e' : 'v', { al: th > Math.PI - 0.03 ? 0.7 : 0.9 });
+  return g;
+}
+function oriFold(P, cr, u, o = {}) { return oriFoldDraw(oriFoldPts(P, cr, u, o.side, o.whole), o); }
+
+// ---------------------------------------------------------------------
+//  ANY OUTLINE INTO THE MEDIUM
+//   oriCut(P, o)   outline P (any polygon, world coords) as a piece of folded paper: it is split by straight creases
+//        into a few large facets, each one flat tone by which way it leans from the light, the crease lines drawn, one
+//        contact shadow under it. o.creases = [[a, b, kind], ...] ('m' mountain / 'v' valley; at most 4). Left out:
+//        one mountain crease along the outline's long axis and one valley across it (o.cross = false: the axis only).
+//        o: c (paper), s (base tone), amp (how hard the creases are folded, 0.5), shadow (false), lift, lines (false)
+//   oriPleatFill(P, o)  the same outline as a fan of parallel pleats: o.n pleats (6) at angle o.a (radians, 0)
+// ---------------------------------------------------------------------
+function oriAxis(P) {   // centroid, long-axis direction and half-extent of an outline
+  const ce = oriCentroid(P); let xx = 0, xy = 0, yy = 0;
+  for (const p of P) { const x = p[0] - ce[0], y = p[1] - ce[1]; xx += x * x; xy += x * y; yy += y * y; }
+  const a = 0.5 * Math.atan2(2 * xy, xx - yy), d = [Math.cos(a), Math.sin(a)];
+  const R = Math.max(...P.map((p) => Math.abs((p[0] - ce[0]) * d[0] + (p[1] - ce[1]) * d[1])));
+  return { ce, d, R };
+}
+function oriHalf(a, b, sg) {   // clip to one side of the line a -> b
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, ux = (b[0] - a[0]) / L, uy = (b[1] - a[1]) / L, G = 6000;
+  ctx.beginPath(); ctx.moveTo(a[0] - ux * G, a[1] - uy * G); ctx.lineTo(b[0] + ux * G, b[1] + uy * G);
+  ctx.lineTo(b[0] + ux * G - uy * sg * G, b[1] + uy * G + ux * sg * G); ctx.lineTo(a[0] - ux * G - uy * sg * G, a[1] - uy * G + ux * sg * G); ctx.closePath(); ctx.clip();
+}
+function oriCut(P, o = {}) {
+  const c = o.c ?? ORI.verm, bb = bbox(P, 6), amp = o.amp ?? 0.5, s0 = o.s ?? 0, LL = Math.hypot(ORI_L[0], ORI_L[1]);
+  let cr = o.creases;
+  if (!cr) {
+    const { ce, d, R } = oriAxis(P), e = [ce[0] + d[0] * R * 0.28, ce[1] + d[1] * R * 0.28];
+    cr = [[[ce[0] - d[0] * R * 2, ce[1] - d[1] * R * 2], [ce[0] + d[0] * R * 2, ce[1] + d[1] * R * 2], 'm']];
+    if (o.cross !== false) cr.push([[e[0] + d[1] * R * 2, e[1] - d[0] * R * 2], [e[0] - d[1] * R * 2, e[1] + d[0] * R * 2], 'v']);
+  }
+  cr = cr.slice(0, 4);
+  if (o.shadow !== false) oriShadow([P], { lift: o.lift ?? 0.6 });
+  oriPath(P); ctx.fillStyle = ctx.strokeStyle = oriTone(c, s0); ctx.lineWidth = 1.2 / oriZ(); ctx.lineJoin = 'round'; ctx.fill(); ctx.stroke();
+  ctx.save(); oriPath(P); ctx.clip();
+  for (let m = 0; m < 1 << cr.length; m++) {
+    ctx.save(); let s = s0;
+    cr.forEach(([a, b, kind], i) => {
+      const sg = (m >> i) & 1 ? 1 : -1, L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, nx = -(b[1] - a[1]) / L * sg, ny = (b[0] - a[0]) / L * sg;
+      oriHalf(a, b, sg);
+      s += amp * (nx * ORI_L[0] + ny * ORI_L[1]) / LL * (kind === 'v' ? -0.7 : 1);   // a mountain's side that leans to the light is lit; a valley's is shaded
+    });
+    ctx.fillStyle = oriTone(c, s); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+    ctx.restore();
+  }
+  ctx.fillStyle = oriFibre(); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+  if (o.lines !== false) for (const [a, b, kind] of cr) oriCrease(a, b, kind || 'm', { al: clamp(amp / 0.3) });
+  ctx.restore();
+}
+function oriPleatFill(P, o = {}) {
+  const n = o.n ?? 6, a = o.a ?? 0, d = [Math.cos(a), Math.sin(a)], ce = oriCentroid(P);
+  const ts = P.map((p) => (p[0] - ce[0]) * d[0] + (p[1] - ce[1]) * d[1]), t0 = Math.min(...ts), t1 = Math.max(...ts), bb = bbox(P, 6), amp = o.amp ?? 0.3;
+  const at = (i) => { const t = lerp(t0, t1, i / n), q = [ce[0] + d[0] * t, ce[1] + d[1] * t]; return [[q[0] - d[1] * 4000, q[1] + d[0] * 4000], [q[0] + d[1] * 4000, q[1] - d[0] * 4000]]; };
+  if (o.shadow !== false) oriShadow([P], { lift: o.lift ?? 0.6 });
+  ctx.save(); oriPath(P); ctx.clip();
+  const lean = (d[0] * ORI_L[0] + d[1] * ORI_L[1]) >= 0 ? 1 : -1;
+  for (let i = 0; i < n; i++) {
+    ctx.save(); if (i > 0) oriHalf(...at(i), 1); if (i < n - 1) oriHalf(...at(i + 1), -1);
+    ctx.fillStyle = oriTone(o.c ?? ORI.verm, (o.s ?? 0) + amp * (i % 2 ? -1 : 0.8) * lean); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); ctx.restore();
+  }
+  ctx.fillStyle = oriFibre(); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0);
+  for (let i = 1; i < n; i++) oriCrease(...at(i), i % 2 ? 'm' : 'v');
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the table's diagram: a crease pattern and instruction arrows, printed faintly on the ground
+//   oriPattern(x, y, half, o)   a square sheet's crease pattern, half = half its side. o.lines = 'bird' | 'boat' or
+//        [[x1, y1, x2, y2, kind], ...] in -1..1; valley = dashed, mountain = dash-dot. o: rot (radians), al (0.3),
+//        in (0..1: the lines are ruled one after another), march (px/s: the dashes creep), c
+//   oriArrow(a, b, o)   a fold arrow from a to b, bowed by o.bend (0.3 of its length), with an open head.
+//        o: frac (draw-on), al, c, w
+// ---------------------------------------------------------------------
+const ORI_CP = {
+  bird: (() => {
+    const t = 2 * ORI_W - 1, L = [[-1, -1, 1, 1, 'm'], [-1, 1, 1, -1, 'm'], [0, -1, 0, 1, 'v'], [-1, 0, 1, 0, 'v']];
+    for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { L.push([sx, sy, -sx, sy * -t, 'v']); L.push([sx, sy, sx * -t, -sy, 'v']); }
+    return L;
+  })(),
+  boat: [[-1, 0, 1, 0, 'v'], [-1, 0, -0.58, 1, 'v'], [1, 0, 0.58, 1, 'v'], [-0.52, 0, 0.08, 0.98, 'm'], [0.62, 0, 0.08, 0.98, 'm'], [0.08, 0, 0.08, 0.98, 'v'], [-1, 0.3, 1, 0.3, 'm'], [-1, -1, 0, 0, 'm'], [1, -1, 0, 0, 'm']],
+};
+function oriPattern(x, y, half, o = {}) {
+  const lines = typeof o.lines === 'string' ? ORI_CP[o.lines] : o.lines || ORI_CP.bird, T = oriT(x, y, half, o.rot ?? 0), z = oriZ(), u = o.in ?? 1;
+  if (u <= 0) return;
+  ctx.save(); ctx.globalAlpha *= o.al ?? 0.3; ctx.strokeStyle = o.c ?? ORI.ink; ctx.lineWidth = (o.w ?? 1.7) / z; ctx.lineCap = 'butt';
+  const sq = [[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]].map(T), per = subPath(sq, clamp(u * 2));
+  ctx.beginPath(); ctx.moveTo(per[0][0], per[0][1]); for (let i = 1; i < per.length; i++) ctx.lineTo(per[i][0], per[i][1]); ctx.stroke();
+  lines.forEach(([x1, y1, x2, y2, kind], i) => {
+    const f = clamp(u * 2 * lines.length - lines.length * 0.6 - i * 0.7); if (f <= 0) return;
+    const a = T([x1, y1]), b = oriLerp(a, T([x2, y2]), f);
+    ctx.setLineDash(kind === 'm' ? [16 / z, 6 / z, 3 / z, 6 / z] : [10 / z, 8 / z]); ctx.lineDashOffset = -(o.march ?? 0) * TT / z * (i % 2 ? -1 : 1);
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  });
+  ctx.restore();
+}
+function oriArrow(a, b, o = {}) {
+  const f = clamp(o.frac ?? 1); if (f <= 0 || (o.al ?? 1) <= 0) return;
+  const z = oriZ(), L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, bend = (o.bend ?? 0.3) * L, m = [(a[0] + b[0]) / 2 - (b[1] - a[1]) / L * bend, (a[1] + b[1]) / 2 + (b[0] - a[0]) / L * bend];
+  const pts = []; for (let i = 0; i <= 24; i++) { const t = i / 24; pts.push([(1 - t) ** 2 * a[0] + 2 * t * (1 - t) * m[0] + t * t * b[0], (1 - t) ** 2 * a[1] + 2 * t * (1 - t) * m[1] + t * t * b[1]]); }
+  const Q = subPath(pts, f), e = Q[Q.length - 1], p = Q[Math.max(0, Q.length - 2)], ang = Math.atan2(e[1] - p[1], e[0] - p[0]), hl = (o.head ?? 20) / z;
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1; ctx.strokeStyle = o.c ?? ORI.ink; ctx.lineWidth = (o.w ?? 2.4) / z; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(Q[0][0], Q[0][1]); for (let i = 1; i < Q.length; i++) ctx.lineTo(Q[i][0], Q[i][1]);
+  if (f > 0.25) { ctx.moveTo(e[0] - Math.cos(ang - 0.42) * hl, e[1] - Math.sin(ang - 0.42) * hl); ctx.lineTo(e[0], e[1]); ctx.lineTo(e[0] - Math.cos(ang + 0.42) * hl, e[1] - Math.sin(ang + 0.42) * hl); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  small folded things (each one: a few facets, two sides, one shadow)
+//   oriStar(x, y, r, o)       a five-point folded star, ten facets. o: c, rev, rot, in (0..1: its points fold out of the
+//                             middle one after another, white side first), lift
+//   oriButterfly(x, y, r, o)  four wing facets hinged on the body crease. o: c, rev (the lower wings), rot,
+//                             flap (0 flat .. 1 wings up), lift
+//   oriPleat(x, y, n, o)      an accordion strip of n rigid panels centred on (x, y). o: len (each panel, 44), h (28),
+//                             ang (the fold angle, radians: 0.2 nearly flat .. 1.3 squeezed shut), c, rot, lift
+// ---------------------------------------------------------------------
+function oriStar(x, y, r, o = {}) {
+  const c = o.c ?? ORI.mustard, rev = o.rev ?? ORI.white, T = oriT(x, y, r, o.rot ?? 0), u = o.in ?? 1; if (u <= 0) return;
+  const O = [], I = [], LL = Math.hypot(ORI_L[0], ORI_L[1]);
+  for (let i = 0; i < 5; i++) { const a = -Math.PI / 2 + i * TAU / 5; O.push([Math.cos(a), Math.sin(a)]); I.push([Math.cos(a + TAU / 10) * 0.42, Math.sin(a + TAU / 10) * 0.42]); }
+  const tone = (A, B) => { const m = oriCentroid([A, B]), l = Math.hypot(m[0], m[1]) || 1; return 0.34 * (m[0] * ORI_L[0] + m[1] * ORI_L[1]) / l / LL; };
+  const core = [], arms = [];
+  for (let i = 0; i < 5; i++) {
+    const i0 = I[(i + 4) % 5], i1 = I[i], m = oriLerp(i0, i1, 0.5), ui = clamp(u * 2.2 - i * 0.3);
+    for (const [p, q, ds] of [[i0, m, 0.1], [m, i1, -0.1]]) {
+      const s = tone(p === i0 ? i0 : O[i], p === i0 ? O[i] : i1) + ds;
+      core.push({ P: [[0, 0], p, q].map(T), s });
+      arms.push({ g: oriFoldMap(oriFoldPts([p, q, O[i]], [i0, i1], 1 - ui, O[i], true), T), s });
+    }
+  }
+  oriShadow([...core.map((f) => f.P), ...arms.map((f) => f.g.flap)], { lift: o.lift ?? 0.35 });
+  for (const f of core) oriFacet(f.P, c, f.s, { plain: r < 30 });
+  // a point folded in shows the reverse; folded out (u = 0 of the fold) it shows the face
+  for (const f of arms) oriFoldDraw(f.g, { c, rev, s: f.s, amp: 0.5, stay: false, crease: false, shadow: f.g.th > 0.03 });
+  if (u >= 1) for (let i = 0; i < 5; i++) { oriCrease(T([0, 0]), T(O[i]), 'm', { w: 1.6, al: 0.8 }); oriCrease(T([0, 0]), T(I[i]), 'v', { w: 1.4, al: 0.5 }); }
+}
+function oriButterfly(x, y, r, o = {}) {
+  const c = o.c ?? ORI.sage, rev = o.rev ?? ORI.white, T = oriT(x, y, r, o.rot ?? 0), u = clamp(o.flap ?? 0) * 0.4, ax = [[0, -1], [0, 1]];
+  const up = [[0, -0.12], [0.95, -0.78], [0.78, 0.06], [0, 0.22]], lo = [[0, 0.16], [0.66, 0.2], [0.5, 0.86], [0, 0.46]], mir = (P) => P.map(([px, py]) => [-px, py]);
+  const parts = [[lo, rev, -0.04, 1], [mir(lo), rev, 0.04, -1], [up, c, -0.04, 1], [mir(up), c, 0.06, -1]].map(([P, col, ds, sd]) => ({ g: oriFoldMap(oriFoldPts(P, ax, u, [sd, 0], true), T), col, ds }));
+  oriShadow(parts.map((p) => p.g.flap), { lift: (o.lift ?? 0.4) + u });
+  for (const p of parts) oriFoldDraw(p.g, { c: p.col, rev: p.col, ds: p.ds, stay: false, shadow: false, crease: false });
+  oriCrease(T([0, -0.2]), T([0, 0.5]), 'v', { w: 2.4 });
+  ctx.save(); ctx.strokeStyle = o.ink ?? ORI.ink; ctx.lineWidth = 1.6 / oriZ(); ctx.lineCap = 'round'; ctx.globalAlpha *= 0.7;
+  for (const sx of [-1, 1]) { const a = T([0, -0.18]), b = T([sx * 0.2, -0.56]); ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+  ctx.restore();
+}
+function oriPleat(x, y, n, o = {}) {
+  const len = o.len ?? 44, h = o.h ?? 28, ang = o.ang ?? 0.45, dx = len * Math.cos(ang), dy = len * Math.sin(ang), T = oriT(x, y, 1, o.rot ?? 0), c = o.c ?? ORI.white;
+  const F = [];
+  for (let i = 0; i < n; i++) {
+    const x0 = (i - n / 2) * dx, x1 = x0 + dx, y0 = i % 2 ? -dy / 2 : dy / 2, y1 = -y0;
+    F.push({ P: [[x0, y0 - h / 2], [x1, y1 - h / 2], [x1, y1 + h / 2], [x0, y0 + h / 2]].map(T), s: (i % 2 ? 0.3 : -0.34) * Math.sin(ang) + 0.04 });
+  }
+  oriShadow(F.map((f) => f.P), { lift: o.lift ?? 0.25 });
+  for (const f of F) oriFacet(f.P, c, f.s);
+}
+
+// ---------------------------------------------------------------------
+//  the boat: a sheet (white side up) folded in three moves into a hull with white bow and stern flaps and a white sail
+//   oriBoat(x, y, a, o)   (x, y) = the centre of the sheet, a = half its side. o: step (0 flat sheet .. 3 the boat:
+//        1 the top half comes down, 2 the two lower corners fold up, 3 the sail stands), c (hull), rev, rot (rocks on
+//        the keel), lift (how far it stands off the table). Default step 3.
+//   oriBoatPts(x, y, a, rot)   the finished boat's outline (for bridges)
+// ---------------------------------------------------------------------
+const ORI_BOAT = { q: 0.42, sail: [[-0.52, 0], [0.62, 0], [0.08, 0.98]], rim: 0.3 };
+function oriBoat(x, y, a, o = {}) {
+  const st = o.step ?? 3, c = o.c ?? ORI.indigo, rev = o.rev ?? ORI.white, q = ORI_BOAT.q, T = oriT(x, y, a, o.rot ?? 0, 0, 1), M = (P) => P.map(T);
+  const polys = [], draws = [], small = a < 80;
+  const flat = (P, col, s, f) => { const Q = M(P); polys.push(Q); draws.push(() => oriFacet(Q, col, s, f)); };
+  const fold = (P, cr, u, side, f) => { const g = oriFoldMap(oriFoldPts(P, cr, u, side, f.whole), T); if (f.stay !== false) polys.push(g.stay); polys.push(g.flap); draws.push(() => oriFoldDraw(g, small ? { ...f, shadow: false } : f)); return g; };
+  if (st < 1) fold([[-1, -1], [1, -1], [1, 1], [-1, 1]], [[-1, 0], [1, 0]], st, [0, -1], { c: rev, rev: c });
+  else {
+    const rm = ORI_BOAT.rim;   // the hull: a lit rim above a mountain crease, the shaded side below it
+    flat([[-1, 0], [1, 0], [1 - q * rm, rm], [-1 + q * rm, rm]], c, 0.1);
+    flat([[-1 + q * rm, rm], [1 - q * rm, rm], [1 - q, 1], [-1 + q, 1]], c, -0.1);
+    draws.push(() => oriCrease(T([-1 + q * rm, rm]), T([1 - q * rm, rm]), 'm', { al: 0.45, w: small ? 1.2 : 2 }));
+    const uc = clamp(st - 1);
+    fold([[-1, 0], [-1 + q, 1], [-1, 1]], [[-1, 0], [-1 + q, 1]], uc, null, { whole: true, stay: false, c, rev, ds: 0.04 });
+    fold([[1, 0], [1, 1], [1 - q, 1]], [[1 - q, 1], [1, 0]], uc, null, { whole: true, stay: false, c, rev, ds: -0.1 });
+    if (st > 1.999) {
+      const us = clamp(st - 2), [s0, s1, tip] = ORI_BOAT.sail, m = [tip[0], 0], cr = [[-1, 0], [1, 0]];
+      fold([s0, m, tip], cr, us, tip, { whole: true, stay: false, c, rev, ds: 0.1, crease: false });
+      const g = fold([m, s1, tip], cr, us, tip, { whole: true, stay: false, c, rev, ds: -0.2, crease: false });
+      draws.push(() => { if (us > 0.02) { oriCrease(T(m), g.flap[2], 'm', { al: Math.abs(g.k) }); oriCrease(T(s0), T(s1), us > 0.97 ? 'e' : 'v'); } });
+    }
+  }
+  if (o.shadow !== false) oriShadow(polys, { lift: o.lift ?? (st >= 2.9 ? 0.8 : 0.12), d: small ? 12 : 30, blur: small ? 10 : 30 });
+  draws.forEach((f) => f());
+}
+function oriBoatPts(x, y, a, rot = 0) {
+  const q = ORI_BOAT.q, [s0, s1, tip] = ORI_BOAT.sail;
+  return [[-1, 0], s0, [tip[0], -tip[1]], s1, [1, 0], [1 - q, 1], [-1 + q, 1]].map(oriT(x, y, a, rot, 0, 1));
+}
+
+// ---------------------------------------------------------------------
+//  THE HERO: the classic crane, ten facets. It is folded from a square standing on its corner:
+//   step 0 the flat sheet (a diamond, face up)   1 the top half folded down (a white triangle)
+//   2 both corners folded in to the centre line (the kite)   3 opened: the far wing (its white reverse showing), the
+//   tail and the neck swing out from behind the body, the near wing lifts off it, the belly tip tucks away
+//   4 the head is folded down (white beak)
+//   oriCrane(x, y, r, o)   (x, y) = the centre of the sheet (the middle of the crane's back), r = half its wingspan.
+//        o: step (default 4), c, rev, rot (it rocks on its flat base), flap (0..1 the near wing dips toward you),
+//           flap2 (the far wing), lift (how far it stands off the table), shadow (false = none)
+//   oriCranePts(x, y, r, rot)   the finished crane's outline; oriSheetPts(x, y, r) the diamond it starts from
+// ---------------------------------------------------------------------
+const ORI_CR = {
+  wingF: [[-0.36, 0.079], [0.34, -0.002]], wingN: [[-0.38, -0.04], [0.36, 0.055]], neck: [[-0.30, 0.093], [-0.05, -0.074]], tail: [[0.04, -0.076], [0.30, 0.08]],
+  belly: 0.42, head: 0.72,
+};
+function oriCrane(x, y, r, o = {}) {
+  const d = r / 0.95, st = o.step ?? 4, c = o.c ?? ORI.verm, rev = o.rev ?? ORI.white, w = ORI_W, K = ORI_CR;
+  const T = oriT(x, y, d, o.rot ?? 0, 0, K.belly), M = (P) => P.map(T), polys = [], draws = [];
+  const flat = (P, col, s, f) => { const Q = M(P); polys.push(Q); draws.push(() => oriFacet(Q, col, s, f)); };
+  const fold = (P, cr, u, side, f) => {
+    const g = oriFoldMap(oriFoldPts(P, cr, u, side, f.whole), T);
+    if (f.stay !== false) polys.push(g.stay); if (!(f.behind && g.k < 0)) polys.push(g.flap);
+    draws.push(() => oriFoldDraw(g, f)); return g;
+  };
+  if (st < 1) fold([[0, -1], [1, 0], [0, 1], [-1, 0]], [[-1, 0], [1, 0]], st, [0, -1], { c, rev });
+  else if (st < 2) {
+    const u = st - 1;
+    flat([[-w, 0], [w, 0], [0, 1]], rev, 0);
+    fold([[-1, 0], [-w, 0], [0, 1]], [[-w, 0], [0, 1]], u, null, { whole: true, stay: false, c: rev, rev: c, ds: 0.1 });
+    fold([[1, 0], [w, 0], [0, 1]], [[0, 1], [w, 0]], u, null, { whole: true, stay: false, c: rev, rev: c, ds: -0.13 });
+  } else {
+    const op = clamp(st - 2), hd = clamp(st - 3), B = [0, 1], bx = w * (1 - K.belly);
+    const uF = op * (1 - 0.13 * (o.flap2 ?? 0)), uN = op * (1 - 0.15 * (o.flap ?? 0));
+    // behind the body: the far wing (its reverse shows once it is up), the tail, the neck
+    const mF = oriLerp(K.wingF[0], K.wingF[1], 0.55);
+    fold([K.wingF[0], mF, B], K.wingF, uF, B, { whole: true, stay: false, c, rev, ds: 0.02, amp: 0.45, crease: false });
+    const gF = fold([mF, K.wingF[1], B], K.wingF, uF, B, { whole: true, stay: false, c, rev, ds: -0.14, amp: 0.45, crease: false });
+    draws.push(() => oriCrease(T(mF), gF.flap[2], 'v', { al: 0.6 * Math.abs(gF.k) }));
+    fold([K.tail[0], K.tail[1], [0, 0.92]], K.tail, op, [0, 0.92], { whole: true, stay: false, c, rev: c, ds: -0.12, crease: false });
+    if (hd <= 0.001) fold([K.neck[0], K.neck[1], [0, 0.92]], K.neck, op, [0, 0.92], { whole: true, stay: false, c, rev: c, ds: 0.06, crease: false });
+    else {
+      const tip = oriMirror([0, 0.92], K.neck[0], K.neck[1]), yh = lerp((K.neck[0][1] + K.neck[1][1]) / 2, tip[1], K.head);
+      fold([K.neck[0], K.neck[1], tip], [[-2, yh], [2, yh]], hd, tip, { c, rev, s: 0.06, ds: -0.1 });
+    }
+    // the body: two facets about the ridge of the back; its belly tip tucks up behind it
+    fold([[-bx, K.belly], [bx, K.belly], B], [[-1, K.belly], [1, K.belly]], op, B, { whole: true, stay: false, behind: true, c, rev: c, s: -0.05, crease: false });
+    flat([[0, -w], [0, K.belly], [-bx, K.belly], [-w, 0]], c, 0.1);
+    flat([[0, -w], [w, 0], [bx, K.belly], [0, K.belly]], c, -0.13);
+    draws.push(() => oriCrease(T([0, -w]), T([0, K.belly]), 'm', { al: 0.9 }));
+    // in front: the near wing, two facets about its own ridge
+    const mN = oriLerp(K.wingN[0], K.wingN[1], 0.45);
+    fold([K.wingN[0], mN, B], K.wingN, uN, B, { whole: true, stay: false, c, rev: c, ds: 0.1, amp: 0.45, crease: false });
+    const gN = fold([mN, K.wingN[1], B], K.wingN, uN, B, { whole: true, stay: false, c, rev: c, ds: -0.1, amp: 0.45, crease: false });
+    draws.push(() => { oriCrease(T(mN), gN.flap[2], 'm', { al: 0.85 * Math.max(0.25, Math.abs(gN.k)) }); oriCrease(T(K.wingN[0]), T(K.wingN[1]), 'v', { al: 0.75 }); });
+  }
+  if (o.shadow !== false) oriShadow(polys, { lift: o.lift ?? (st < 2 ? 0.12 : 0.12 + 0.78 * clamp(st - 2)), d: 34 * Math.min(1, d / 300), blur: 34 * Math.min(1, d / 300) });
+  draws.forEach((f) => f());
+}
+const ORI_CRANE_OUT = [[-0.95, -0.21], [-0.79, -0.36], [-0.65, -0.36], [-0.32, -0.2], [-0.22, -0.9], [-0.014, -0.57], [0.25, -0.95], [0.33, -0.25], [0.9, -0.58], [0.3, 0.08], [0.414, 0], [0.24, 0.42], [-0.24, 0.42], [-0.414, 0]];
+const oriCranePts = (x, y, r, rot = 0) => ORI_CRANE_OUT.map(oriT(x, y, r / 0.95, rot, 0, ORI_CR.belly));
+const oriSheetPts = (x, y, r) => [[0, -1], [1, 0], [0, 1], [-1, 0]].map(oriT(x, y, r / 0.95));
+
+// ---------------------------------------------------------------------
+//  lettering: a clean light sans, small and quiet
+// ---------------------------------------------------------------------
+function oriFont(size, weight = 400, track = 0.02) { ctx.font = `${weight} ${size}px ${ORI_FONT}`; if ('letterSpacing' in ctx) ctx.letterSpacing = `${(size * track).toFixed(2)}px`; }
+function oriTextW(str, size, weight = 400, track = 0.02) { ctx.save(); oriFont(size, weight, track); const w = ctx.measureText(str).width; ctx.restore(); return w; }
+// o: align ('left' | 'center' | 'right'), weight (400), track (0.02 em), al
+function oriText(str, x, y, size, c = ORI.ink, o = {}) {
+  ctx.save(); oriFont(size, o.weight, o.track); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.globalAlpha *= o.al ?? 1;
+  const w = ctx.measureText(str).width; ctx.fillStyle = c; ctx.fillText(str, x - (o.align === 'center' ? w / 2 : o.align === 'right' ? w : 0), y);
+  ctx.restore(); return w;
+}
+
+// ---------------------------------------------------------------------
+//  tag and caption (through DEFER: after the camera, at screen size). Both are lifted off the table as a bridge
+//  starts and laid down again once the next era is open.
+//  The TAG is a little white paper strip whose left end is folded over, showing the era's paper colour.
+//  The CAPTION is a white paper strip that unfolds from its middle (its coloured reverse shows as it opens), then
+//  its two top corners are dog-eared; *word* is set a little heavier in the paper colour.
+// ---------------------------------------------------------------------
+function oriBridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - seg(TT, r.tc - d, r.tc - d + 0.2);
+    if (TT >= r.tc && TT < r.tc + d) return 0;
+  }
+  return 1;
+}
+//   o: x (64), y (262: the strip's top), size (30), c (the folded end: indigo), at (seconds after the era starts, 0.3)
+function oriTagNow(str, o = {}) {
+  const at = E0 + (o.at ?? 0.3), k = oriBridgeK(); if (k <= 0 || TT < at - 0.3) return;
+  const x = o.x ?? 64, y = o.y ?? 262, size = o.size ?? 30, c = o.c ?? ORI.indigo, h = size * 2.1, fw = size * 1.1;
+  const w = fw + size * 0.75 + oriTextW(str, size, 500, 0.1) + size * 0.8, sl = (1 - EZ.o3(seg(TT, at - 0.3, at))) * -(x + w + fw + 40), u = oriGo(at, 0.35);
+  ctx.save(); ctx.globalAlpha *= k; ctx.translate(x + sl, y); ctx.rotate(-0.035);
+  const g = oriFoldPts([[-fw, 0], [w, 0], [w, h], [-fw, h]], [[0, 0], [0, h]], u, [-1, 0]);
+  oriShadow([g.stay, g.flap], { lift: 0.14 });
+  oriFoldDraw(g, { c: ORI.white, rev: c });
+  if (u > 0.5) oriText(str, fw + size * 0.75, h / 2 + size * 0.35, size, o.col ?? ORI.ink, { weight: 500, track: 0.1, al: seg(u, 0.5, 1) });
+  ctx.restore();
+}
+//   o: x (CX), y (1400: the strip's centre line), size (50), c (the reverse and the *word*: vermilion),
+//      at (0.5), w (820: the widest the strip may be)
+function oriCaptionNow(str, o = {}) {
+  const at = E0 + (o.at ?? 0.5), k = oriBridgeK(); if (k <= 0 || TT < at) return;
+  const cx = o.x ?? (typeof CX !== 'undefined' ? CX : W / 2), cy = o.y ?? 1400, c = o.c ?? ORI.verm, maxW = o.w ?? 820;
+  let size = o.size ?? 50;
+  const toks = str.split('*').map((s, i) => ({ s: s.trim(), hi: i % 2 === 1 })).filter((t) => t.s);
+  const lay = () => { let tw = 0; toks.forEach((t, i) => { t.w = oriTextW(t.s, size, t.hi ? 600 : 400); t.gap = i === 0 ? 0 : /^[!?.,:;]/.test(t.s) ? 0 : size * 0.3; tw += t.w + t.gap; }); return tw; };
+  let tw = lay(); if (tw + size * 2.2 > maxW) { size *= (maxW - size * 2.2) / tw; tw = lay(); }
+  const w = tw + size * 2.2, h = size * 2, x0 = cx - w / 2, y0 = cy - h / 2, e = size * 0.5;
+  const u = oriGo(at, 0.45), ue = oriGo(at + 0.5, 0.3);
+  ctx.save(); ctx.globalAlpha *= k;
+  if (ue <= 0) {   // the strip opens: its right half unfolds off the left half
+    const g = oriFoldPts([[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]], [[cx, y0], [cx, y0 + h]], 1 - u, [x0 + w, cy]);
+    oriShadow([g.stay, g.flap], { lift: 0.16 }); oriFoldDraw(g, { c: ORI.white, rev: c });
+  } else {         // then both top corners are dog-eared
+    const body = [[x0 + e, y0], [x0 + w - e, y0], [x0 + w, y0 + e], [x0 + w, y0 + h], [x0, y0 + h], [x0, y0 + e]];
+    const gl = oriFoldPts([[x0, y0], [x0 + e, y0], [x0, y0 + e]], [[x0 + e, y0], [x0, y0 + e]], ue, null, true);
+    const gr = oriFoldPts([[x0 + w, y0], [x0 + w, y0 + e], [x0 + w - e, y0]], [[x0 + w, y0 + e], [x0 + w - e, y0]], ue, null, true);
+    oriShadow([body, gl.flap, gr.flap], { lift: 0.16 }); oriFacet(body, ORI.white, 0);
+    oriFoldDraw(gl, { c: ORI.white, rev: c, stay: false }); oriFoldDraw(gr, { c: ORI.white, rev: c, stay: false, ds: -0.08 });
+    oriCrease([cx, y0 + 2], [cx, y0 + h - 2], 'v', { al: 0.35, w: 1.6 });
+  }
+  const ta = seg(TT, at + 0.3, at + 0.55);
+  if (ta > 0) {
+    let xx = cx - tw / 2;
+    for (const t of toks) { xx += t.gap; oriText(t.s, xx, cy + size * 0.35, size, t.hi ? oriTone(c, -0.25) : o.col ?? ORI.ink, { weight: t.hi ? 600 : 400, al: ta }); xx += t.w; }
+  }
+  ctx.restore();
+}
+const oriTag = (str, o = {}) => { const f = () => oriTagNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const oriCaption = (str, o = {}) => { const f = () => oriCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'origami',
+  paper: ORI.table,
+  // the bare table in colour c (hex, or rgb() mid-morph) under the same soft light
+  backdrop(c) { oriTable(c); },
+  // the era seen as a picture on a sheet of paper cut to the bridge shape, lying on the table: its one soft shadow
+  // and a light paper edge, both strongest when the sheet is small
+  window(P, key, src, o = {}) {
+    const u = o.u ?? 0, k = o.phase === 'grow' ? 1 - u : u;
+    ctx.save();
+    oriShadow([P], { lift: 0.15 + 0.5 * k });
+    oriPath(P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    ctx.save(); oriPath(P); ctx.strokeStyle = `rgba(255,253,246,${0.55 * k})`; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore();
+  },
+  // the morphing shape: one sheet of paper in the blended colour, lifted off the table and flexed about a centre
+  // mountain crease (and a cross valley) that is folded hardest halfway through, so the unfolding and refolding reads
+  blob(P, c, key, u = 0) {
+    const q = Math.sin(Math.PI * clamp(u)), ce = oriCentroid(P);
+    oriCut(P, {
+      c, amp: 0.1 + 0.3 * q, lift: 0.2 + 0.6 * q,
+      creases: [[[ce[0], ce[1] - 3000], [ce[0], ce[1] + 3000], 'm'], [[ce[0] - 3000, ce[1]], [ce[0] + 3000, ce[1]], 'v']],
+    });
+  },
+  hero(x, y, r, o = {}) { oriCrane(x, y + r * 0.22, r, { flap: 0.4 }); },
+  heroColor: ORI.verm,
+  heroPts(x, y, r) { return oriCranePts(x, y + r * 0.22, r); },
+  // the photograph's finish: fine grain and a soft vignette
+  post() { ctx.save(); screen(); ctx.drawImage(oriGrain(), 0, 0); ctx.restore(); },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — origami demo. World coordinates 1080x1920; time TT on 1s. Content inside x 60-940, y 250-1300 (the
+//  caption strip owns y 1350-1450). Each era is one model on an empty table, folded in front of you.
+// =====================================================================
+const cu = TIMELINE.cues;
+const BOAT = { x: 500, y: 760, a: 250 };                     // the sheet's centre and half side
+const CRANE = { x: 500, y: 820, r: 351 };                    // the sheet's centre and the crane's half wingspan
+// a fold arrow with its step number: drawn on just before the fold at t, gone once the fold is under way
+function step(n, t, a, b, bend, at) {
+  const al = seg(TT, t - 0.32, t - 0.22) * (1 - seg(TT, t + 0.08, t + 0.28)); if (al <= 0) return;
+  oriArrow(a, b, { bend, frac: seg(TT, t - 0.32, t - 0.06), al: al * 0.8 });
+  if (n) oriText(String(n), at[0], at[1], 34, ORI.ink, { align: 'center', al: al * 0.8 });
+}
+
+// ---- era 1: a square, three folds, a boat
+function boatState() {
+  const t = Math.max(0, TT - cu.float), on = springEase(TT - cu.float, 120, 17);
+  return {
+    st: oriSteps([cu.f1, cu.f2, cu.f3], 0.4),
+    x: BOAT.x + 16 * t, y: BOAT.y - 900 * (1 - EZ.o3(seg(TT, 0, cu.land))),          // it slides in flat, then drifts
+    rot: 0.045 * Math.sin(t * 3.4) * clamp(t / 0.3), lift: 0.12 + 0.68 * on + 0.5 * (1 - seg(TT, 0, cu.land)),
+  };
+}
+function sceneBoat() {
+  oriTable(ORI.blue);
+  // the crease pattern printed on the table, its dashes creeping (background life)
+  oriPattern(BOAT.x, BOAT.y, 310, { lines: 'boat', al: 0.26, march: 14, in: seg(TT, 0, 0.7) });
+  // a far little boat drifting across the top (background life)
+  oriBoat(630 + 50 * TT, 356, 54, { c: ORI.mustard, rot: 0.08 * Math.sin(TT * 2.6), lift: 0.5 });
+  // two pleated paper waves: squeezed shut until the boat is done, then they spring open and keep breathing (background life)
+  const wv = oriGo(cu.float, 0.5);
+  oriPleat(470, 1108, 12, { len: 46, h: 26, ang: lerp(1.32, 0.5, wv) + 0.07 * Math.sin(TT * 3.1) });
+  oriPleat(590, 1184, 9, { len: 46, h: 26, ang: lerp(1.32, 0.56, wv) + 0.07 * Math.sin(TT * 3.1 + 2) });
+  const s = boatState();
+  oriBoat(s.x, s.y, BOAT.a, { step: s.st, rot: s.rot, lift: s.lift });
+  // the instructions: one arrow and its number before each fold
+  step(1, cu.f1, [812, 580], [812, 930], -0.22, [782, 700]);
+  step(2, cu.f2, [212, 1040], [338, 902], -0.3, [172, 1004]);
+  step(0, cu.f2, [788, 1040], [662, 902], 0.3);
+  step(3, cu.f3, [800, 900], [690, 590], 0.25, [846, 768]);
+  oriTag('boat', { c: ORI.indigo });
+  oriCaption('One square, *three folds*', { c: ORI.indigo, at: 0.6 });
+}
+
+// ---- era 2: fold again, a crane
+function craneState() {
+  const t = Math.max(0, TT - cu.head), beat = (t0) => Math.sin(Math.PI * seg(TT, t0, t0 + 0.34));
+  return {
+    st: oriGo(cu.c1, 0.33) + oriGo(cu.c2, 0.33) + oriGo(cu.open, 0.4) + oriGo(cu.head, 0.3),
+    rot: 0.032 * Math.sin(t * 3.1) * clamp(t / 0.4),
+    flap: clamp(0.22 + 0.22 * Math.sin(TT * 5.2) + 0.75 * Math.max(beat(cu.flap1), beat(cu.flap2))),
+    flap2: clamp(0.3 + 0.3 * Math.sin(TT * 5.2 + 1.4) + 0.6 * Math.max(beat(cu.flap1 + 0.06), beat(cu.flap2 + 0.06))),
+  };
+}
+function sceneCrane() {
+  oriTable(ORI.kraft);
+  // the bird-base crease pattern under the sheet, its dashes creeping (background life)
+  oriPattern(CRANE.x, CRANE.y, 296, { lines: 'bird', rot: Math.PI / 4, al: 0.24, march: 14 });
+  // a butterfly on the table, flapping (background life)
+  oriButterfly(800 + 10 * Math.sin(TT * 1.3), 374 + 8 * Math.cos(TT * 1.7), 62, { rot: 0.32 + 0.06 * Math.sin(TT * 1.3), flap: 0.5 + 0.5 * Math.sin(TT * 9) });
+  // stars whose points fold out one after another, then they turn a little (background life)
+  oriStar(176, 1092, 54, { in: seg(TT, cu.star1, cu.star1 + 0.6), rot: -0.2 + 0.12 * Math.sin(TT * 1.9) });
+  oriStar(818, 1150, 40, { in: seg(TT, cu.star2, cu.star2 + 0.6), rot: 0.3 + 0.12 * Math.sin(TT * 1.9 + 2) });
+  oriStar(236, 470, 30, { in: seg(TT, cu.star2 + 0.25, cu.star2 + 0.85), rot: 0.1 + 0.12 * Math.sin(TT * 1.9 + 4) });
+  const s = craneState();
+  oriCrane(CRANE.x, CRANE.y, CRANE.r, { step: s.st, rot: s.rot, flap: s.flap, flap2: s.flap2 });
+  step(1, cu.c1, [600, 560], [600, 1040], -0.2, [556, 760]);
+  step(2, cu.c2, [196, 792], [452, 772], -0.3, [330, 716]);
+  step(0, cu.c2, [804, 792], [548, 772], 0.3);
+  oriTag('crane', { c: ORI.verm });
+  oriCaption('Fold again: *a crane*', { c: ORI.verm, at: 0.7 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — origami demo (read by kit/morph.js). No camera moves: the table is photographed from a
+//  fixed stand.
+// =====================================================================
+const ERA_BG = [ORI.blue, ORI.kraft];
+const BRIDGES = [
+  // the finished boat -> the flat square the crane is folded from: both about as wide as tall
+  { tc: 3.0, A: () => { const s = boatState(); return { P: oriBoatPts(s.x, s.y, BOAT.a, s.rot), c: ORI.indigo }; }, B: () => ({ P: oriSheetPts(CRANE.x, CRANE.y, CRANE.r), c: ORI.verm }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — origami demo (inside buildScore(); see kit/score-head.js). Quiet and dry, like a room with one
+  // table in it: soft koto-like plucks on a pentatonic figure, a low pad, and on every fold a paper swish that ends
+  // in a crisp crease tick.
+  const T = TIMELINE, q = T.cues;
+  const swish = (t, d, vel, pan = 0) => { noiseHit(t, d, 'bandpass', 2600, 0.8, vel, pan, 0.15, 5200); noiseHit(t + d * 0.15, d * 0.8, 'highpass', 6000, 0.7, vel * 0.5, pan, 0.1); };   // a flap turning through the air
+  const crease = (t, vel, pan = 0) => { noiseHit(t, 0.022, 'highpass', 4200, 1, vel, pan, 0.08); blip(t, 900, 520, 0.035, vel * 0.5, pan); };                                        // the fold pressed flat
+  const fold = (t, d, vel, pan = 0) => { swish(t, d * 0.55, vel, pan); crease(t + d * 0.55, vel * 1.2, pan); };
+  const tap = (t, vel, pan = 0) => { sub(t, vel * 0.5); noiseHit(t, 0.05, 'lowpass', 700, 0.7, vel, pan, 0.1); };
+  to = 'm';
+  pad(0.0, 3.1, ['D3', 'A3', 'E4'], 0.03, { type: 'triangle', cut: 900, att: 0.3, rel: 0.4, send: 0.4 });
+  pad(3.0, 6.05, ['G2', 'D3', 'B3', 'F#4'], 0.045, { type: 'triangle', cut: 1300, att: 0.15, rel: 0.4, send: 0.45 });
+  const mA = ['D4', 'A4', 'F#4', 'E4', 'D4', 'B4', 'A4', 'F#4'], mB = ['G4', 'D5', 'B4', 'A4', 'F#5', 'D5', 'B4', 'D5'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; if (t < 0.5 || (t < 3 && i % 2)) continue; pluck(t, nz((t < 3 ? mA : mB)[i % 8]), t < 3 ? 0.07 : 0.085, i % 2 ? 0.25 : -0.2, 0.5, t < 3 ? 2200 : 3000, 0.4); }
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; if (t >= 0.5) bass(t, nz(t < 3 ? (i % 4 < 2 ? 'D2' : 'A1') : (i % 4 < 2 ? 'G2' : 'D2')) * 2, t < 3 ? 0.06 : 0.085); }
+  ['G4', 'B4', 'D5', 'F#5'].forEach((n, i) => pluck(3.0 + i * 0.03, nz(n), 0.1, -0.3 + i * 0.2, 0.7, 3400, 0.45));       // the payoff: the new sheet
+  sub(3.0, 0.08);
+  chime(q.head + 0.18, [nz('D6'), nz('F#6'), nz('A6')], 0.05, 0);                                                           // the crane is done
+  to = 's';
+  sweep(0.0, q.land, 0.02, 500, 1500, 0); tap(q.land, 0.07);                                                                // the sheet slides in and settles
+  [q.f1, q.f2, q.f3].forEach((t, i) => fold(t, 0.36, 0.09, [0, 0.1, -0.1][i]));                                              // three folds
+  swish(q.float, 0.3, 0.05, -0.2); crease(q.float + 0.22, 0.05, 0.2);                                                       // the paper waves spring open
+  sweep(2.4, 3.0, 0.016, 500, 3000, 0);                                                                                     // flattening back into the square
+  fold(q.c1, 0.3, 0.09, 0); fold(q.c2, 0.3, 0.09, 0);                                                                        // in half, into a kite
+  swish(q.open, 0.34, 0.1, -0.15); swish(q.open + 0.05, 0.3, 0.07, 0.25); crease(q.open + 0.3, 0.09, 0);                    // it opens
+  fold(q.head, 0.26, 0.07, -0.4);                                                                                           // the head
+  for (let i = 0; i < 5; i++) { crease(q.star1 + 0.05 + i * 0.1, 0.03, -0.5); crease(q.star2 + 0.05 + i * 0.1, 0.028, 0.5); } // the stars' points
+  [q.flap1, q.flap2].forEach((t) => { swish(t, 0.3, 0.07, 0.1); tap(t + 0.3, 0.03, 0); });                                   // the wings flex
+  for (let i = 0; i < 6; i++) noiseHit(3.6 + i * 0.4, 0.03, 'highpass', 7000, 1, 0.012, 0.55);                              // the butterfly
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

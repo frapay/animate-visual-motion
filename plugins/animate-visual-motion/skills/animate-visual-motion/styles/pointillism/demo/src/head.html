@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pointillism demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #191715; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  POINTILLISM DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a bare primed canvas inside a dotted border a riverside
+//  afternoon is dabbed in: the sun first, the sky working outward from it, the water left to right, the far bank,
+//  a tree; Skiff, a small sailboat, is dabbed in and sails across while a warm wave passes over the water. At 3.0s
+//  the sun's dabs regroup into the moon over the same river at dusk, in violets and oranges: stars come out one by
+//  one, lamps light on the far bank, the moon glitters down the water and Skiff lights its lantern.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/pointillism/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneNoon()], [3, 6, () => sceneDusk()]];
+const SHOTS = [
+  ['noon', 0, 0.0, 3.0, 'a riverside afternoon is dabbed in from the sun outward; the sailboat is dabbed in and sails; a warm wave crosses the water'],
+  ['dusk', 1, 3.0, 6.0, 'the sun regroups into the moon over the river at dusk; stars, lamps and moon glitter come on; the boat lights its lantern'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { sun: 0.0, sky: 0.08, water: 0.25, far: 0.5, bank: 0.67, tree: 0.75, boat: 1.0, sail: 1.42, wave: 1.5, birds: 1.25, glit: 3.5, star: 3.75, lamp1: 4.0, lamp2: 4.25, lamp3: 4.5, lantern: 5.0, fly: 5.25 },
+  acts: [
+    { name: '1 Noon', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Dusk', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'colour, dab by dab', sound: 'a light harp figure, a soft tick for every clutch of dabs', next: 'the sun regroups into the moon' },
+    { t: 5.0, title: 'the eye does the mixing', sound: 'a lower, warmer pad; bells for the stars, lamps and the lantern', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #020503; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  TERMINAL DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A green CRT starts up: "> mulai" is typed, three checks tick to
+//  "oke", a progress bar fills cell by cell while a shaded core fills with it, and Bit the ASCII robot wakes up and hops.
+//  At 3.0s the core (a ball of shade characters) morphs into the chart panel of a cyan dashboard: bars grow by
+//  half cells, a table counts up, a log scrolls by whole rows and Bit says "halo!".
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/terminal/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const HAND = 'Menlo, Consolas, "DejaVu Sans Mono", "Courier New", monospace';   // only the storyboard sheet uses it
+const CX = 480;   // captions centre on column 16
+
+const ERA_LIST = [[0, 3, () => sceneBoot()], [3, 6, () => sceneDash()]];
+const SHOTS = [
+  ['nyala',  0, 0.0, 3.0, 'a green terminal starts up: typed command, checks, a progress bar; the robot wakes'],
+  ['dasbor', 1, 3.0, 6.0, 'the core becomes a chart panel on a cyan dashboard; the robot says halo'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s)
+  cues: { type: 0.0, l1: 0.5, l2: 0.75, l3: 1.0, bar: 0.75, wake: 1.5, done: 2.25, chart: 3.5, count: 3.75, halo: 4.25, hop: 4.5, siap: 4.75, hop2: 5.25 },
+  acts: [
+    { name: '1 Nyala',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Dasbor', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'the terminal starts up', sound: 'key clicks, check beeps, a rising tick', next: 'the core becomes the chart panel' },
+    { t: 5.5, title: 'the dashboard is up, the robot says halo', sound: 'square arp, bass, a two-note chirp', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

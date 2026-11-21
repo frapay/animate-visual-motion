@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stained glass demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #070609; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  STAINED GLASS DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A dark arched window in a stone room. Night: the border lights
+//  pane by pane along the lead, the crescent in its medallion glows, the sky fills in from the moon outward, four
+//  stars and a comet light up, and a band of light wakes the little glass dove asleep on the hill. At 3.0s the moon
+//  medallion flares and turns into the morning sun: rays of pale glass, green hills, tulips that light one by one,
+//  and the dove flies up toward the sun in three steps.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/stained-glass/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneMalam()], [3, 6, () => scenePagi()]];
+const SHOTS = [
+  ['malam', 0, 0.0, 3.0, 'a dark window: the border, the crescent, the sky and the stars light pane by pane; a band of light wakes the dove'],
+  ['pagi',  1, 3.0, 6.0, 'the moon medallion becomes the sun: rays, hills and tulips light up; the dove flies up in three steps'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { moon: 0.5, sky: 0.75, s1: 1.0, s2: 1.25, s3: 1.5, s4: 1.75, sweep: 2.0, wake: 2.25, rays: 3.5, hills: 3.75, b1: 4.0, b2: 4.25, b3: 4.5, f1: 4.5, f2: 4.75, f3: 5.0, sweep2: 5.0, pulse: 5.5 },
+  acts: [
+    { name: '1 Malam', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Pagi',  role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'night: the moon lights the window', sound: 'low pad, glass tings as panes light, a shimmer for the sweep', next: 'the moon medallion flares into the sun' },
+    { t: 5.2, title: 'morning: the sun blazes, the dove flies', sound: 'bright pad, plucked melody, flaps and blooms', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

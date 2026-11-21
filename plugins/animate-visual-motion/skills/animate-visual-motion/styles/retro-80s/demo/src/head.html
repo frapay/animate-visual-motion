@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retro 80s demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #24104f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  RETRO 80s DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Over a scrolling grid floor a slatted sun rises between palms and
+//  mountains, a chrome triangle pops up behind it, and Kaset, a little teal cassette tape, tumbles in and bops to
+//  the beat. At 3.0s the sun's slats close and it becomes a spinning pink record on a Memphis party wall: confetti
+//  springs in on the 8ths, chrome lettering drops in and shines, notes float up, Kaset dances and jumps.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/retro-80s/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneSenja()], [3, 6, () => scenePesta()]];
+const SHOTS = [
+  ['senja', 0, 0.0, 3.0, 'a slatted sun rises over the grid floor; a chrome triangle pops up; the cassette hero tumbles in and bops'],
+  ['pesta', 1, 3.0, 6.0, 'the sun becomes a spinning record; confetti springs in, chrome lettering shines, the hero dances and jumps'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.0, roll: 0.5, tri: 1.0, land: 1.25, shine1: 1.5, jump: 2.0, pop: 3.75, title: 4.0, shine2: 4.5, script: 5.0, hop: 5.5 },
+  acts: [
+    { name: '1 Senja', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Pesta', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'a cool 80s sunset', sound: 'saw pad, octave bass, arpeggio; a tumble, a thud, sparkles', next: 'the sun becomes a record' },
+    { t: 5.2, title: 'time for a music party', sound: 'drums in, bright arpeggio; pops, a slam, a shine sweep', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

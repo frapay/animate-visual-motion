@@ -1,0 +1,1520 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diorama demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d080d; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  DIORAMA DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A paper-cut light box of one valley. "Senja": under a low sun the
+//  sheets rise one behind the other — far hills, a village with a small mosque, the ridge where a deer grazes, the
+//  near ground, a frame of leaves — while clouds and birds drift. At 3.0s the sun disc becomes a hanging paper
+//  lantern and the same valley is seen at night ("Malam"): moon, punched stars, windows lighting one by one,
+//  fireflies, and the deer walking in and looking up at the lantern.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/diorama/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneSenja()], [3, 6, () => sceneMalam()]];
+const SHOTS = [
+  ['senja', 0, 0.0, 3.0, 'dusk: the valley builds sheet by sheet under a low sun; clouds, birds, falling leaves; a deer grazes and lifts its head'],
+  ['malam', 1, 3.0, 6.0, 'the sun disc becomes a paper lantern; the same valley at night: moon, stars, windows lighting up, fireflies, the deer'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { vil: 0.25, ridge: 0.6, near: 0.95, leaves: 1.3, birds: 0.7, look: 2.0,
+          stars: 3.3, near2: 3.2, leaves2: 3.35, deer: 3.6, stop: 4.6, win1: 4.0, win2: 4.25, win3: 4.5, win4: 4.75, win5: 5.0, flies: 4.2, look2: 4.8, ear: 5.3 },
+  acts: [
+    { name: '1 Senja', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Malam', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'dusk falls on the valley', sound: 'a music box, a warm pad, paper sliding', next: 'the sun becomes a lantern' },
+    { t: 5.3, title: 'night: the lanterns are lit', sound: 'a lower pad, chimes as windows light, crickets', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/diorama/kit.js — DIORAMA: a layered paper-cut light box (a shadow-box diorama).
+//  The picture is 5-8 sheets of plain paper stacked in depth, each cut into a silhouette and lit from behind:
+//  a pale glowing back sheet with the light (a sun or moon disc cut through it), then sheets that step in value
+//  from light (far) to nearly dark (near) inside ONE hue family per era. No outlines, no patterns, no ink:
+//  only cut edges. Every sheet casts a soft shadow down-right onto the sheet behind and has a thin lit lip on its
+//  top-left cut; a dark box mat frames the whole picture; depth is shown by parallax (far sheets move least).
+//  Built on kit/core.js. Helpers are prefixed dio…; the palette is DIO. Needs from the piece head: CX.
+//
+//  Cheap by construction: a static sheet (dioSheet) is rendered ONCE — silhouette, holes, lit lip, grain, blurred
+//  cast shadow — into its own cropped offscreen canvas and afterwards costs one drawImage a frame, wherever it
+//  slides. Only small moving pieces (dioPiece: the deer, birds, leaves, the lantern) use a live shadowBlur.
+// =====================================================================
+const DIO = {
+  // tones[0..8]: 0-2 the sky sheet (near the light -> far corners), 3-7 the scenery sheets far -> near, 8 the nearest pieces and the ink
+  dusk: { name: 'dusk', light: '#fff6dc', tones: ['#fde6b0', '#f8cf85', '#f2b866', '#de8a42', '#cb6e36', '#aa522d', '#823a26', '#58251d', '#351513'], glow: '#ffdc96', text: '#fff3d2', strip: '#fff1cf', hi: '#ffd27a' },
+  night: { name: 'night', light: '#f3f7ff', tones: ['#bcd5f5', '#93b4ea', '#7396dc', '#4f70c0', '#3d57a4', '#2e4287', '#212f68', '#161f49', '#0b112b'], glow: '#c4d8ff', text: '#eef4ff', strip: '#e6efff', hi: '#ffb650' },
+  warm: '#ffb650', warmHi: '#fff0c2', warmD: '#d9741c',     // the one warm accent of the night: lantern, lit windows, fireflies
+  mat: '#170f16', mat2: '#2b1c27',                          // the box: outer mat and the thin inner mat
+  paper: '#4a2735',                                         // the blank sheet a morph happens on (between dusk and night)
+  shade: 'rgba(14,6,14,0.6)',                               // cast shadow where no era ramp applies (morph, mat)
+};
+const DIO_SERIF = 'Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", "Times New Roman", "DejaVu Serif", "Noto Serif", serif';
+const DIO_SANS = '"Gill Sans", "Gill Sans MT", "Trebuchet MS", Optima, Candara, "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif';
+const DIO_M = 140;            // how far a sheet reaches past the frame (room for parallax and slides)
+const DIO_SHEETS = {};        // cached sheets, by key and colour
+let DIO_R = DIO.dusk;         // the ramp of the era being drawn (set by dioEra at the top of every scene)
+let DIO_L = [540, 700];       // where that era's light is (set by dioSky)
+
+const dioRGB = (c) => (c[0] === '#' ? [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)) : c.match(/[\d.]+/g).slice(0, 3).map(Number));
+const dioA = (c, a) => { const [r, g, b] = dioRGB(c); return `rgba(${r},${g},${b},${clamp(a)})`; };
+const dioMix = (a, b, u) => { const x = dioRGB(a), y = dioRGB(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], clamp(u)))).join(',')})`; };
+const dioTone = (i) => DIO_R.tones[i];
+const dioShade = (a = 0.5) => dioA(DIO_R.tones[8], a);
+const dioPolys = (G) => (typeof G[0][0] === 'number' ? [G] : G);
+function dioMk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+function dioAdd(P, g = ctx) { P.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); }
+function dioTrace(Ps, g = ctx) { g.beginPath(); for (const P of Ps) dioAdd(P, g); }
+function dioArc(cx, cy, rx, ry, a0, a1, n = 24) { const P = []; for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); P.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]); } return P; }
+const dioCirclePts = (x, y, r, n = 72) => dioArc(x, y, r, r, 0, TAU * (1 - 1 / n), n - 1);
+const dioRectPts = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+const dioMove = (Ps, dx, dy) => dioPolys(Ps).map((P) => P.map(([x, y]) => [x + dx, y + dy]));
+
+// ---- era, depth and parallax. Depth 0 = the back sheet (never moves), 1 = the nearest sheet (moves most).
+function dioEra(name) { DIO_R = DIO[name] || DIO.dusk; return DIO_R; }
+const dioEye = () => [Math.sin(TT * 0.5 + 0.2) * 34, -Math.sin(TT * 0.5 + 0.2) * 9];      // the slow drift of the viewer's eye: a pure function of time
+const dioOff = (depth) => { const e = dioEye(); return [e[0] * depth, e[1] * depth]; };
+function dioLayer(depth, fn, o = {}) { const [ox, oy] = dioOff(depth); ctx.save(); ctx.translate(ox + (o.dx ?? 0), oy + (o.dy ?? 0)); fn(); ctx.restore(); }
+const dioRise = (t0, d = 760, dur = 1.0) => (1 - EZ.o3(ev(t0, dur))) * d;                 // a sheet coming up from below (or in from a side): soft, no bounce
+function dioLeaving() {   // captions fade out as a bridge starts (they would sit at screen size over the closing window)
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.25)); }
+  return 1;
+}
+function dioArrive() {    // when this era is fully open (the end of the bridge that leads into it)
+  if (typeof BRIDGES !== 'undefined') for (const r of BRIDGES) if (Math.abs(r.tc - E0) < 1e-6) return r.tc + (r.d ?? 0.6);
+  return E0;
+}
+
+// ---------------------------------------------------------------------
+//  paper: the grain tile, a cached sheet, a live piece, a lit hole, a glow
+// ---------------------------------------------------------------------
+let DIO_GRAIN = null;
+function dioGrainTile() {   // very faint: light and dark specks plus a few fibres, fixed seed
+  if (DIO_GRAIN) return DIO_GRAIN;
+  const n = 256, c = dioMk(n, n), g = c.getContext('2d'), im = g.createImageData(n, n), R = RNG('dio-grain');
+  for (let i = 0; i < n * n; i++) { const v = R.f(); im.data[i * 4] = im.data[i * 4 + 1] = im.data[i * 4 + 2] = v > 0.5 ? 255 : 0; im.data[i * 4 + 3] = Math.round(Math.abs(v - 0.5) ** 1.5 * 2 * 44); }
+  g.putImageData(im, 0, 0);
+  g.lineWidth = 1; for (let i = 0; i < 46; i++) { const x = R.r(8, n - 8), y = R.r(8, n - 8), a = R.r(0, TAU), l = R.r(5, 16); g.strokeStyle = i % 2 ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)'; g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke(); }
+  return (DIO_GRAIN = c);
+}
+function dioGrainOver(g, w, h) { g.fillStyle = g.createPattern(dioGrainTile(), 'repeat'); g.fillRect(0, 0, w, h); }
+
+// build one sheet: geo = polygons (or { P: polygons, holes: polygons }) in world coords, col its paper colour
+function dioBuildSheet(geo, col, o) {
+  const P = dioPolys(geo.P ?? geo), holes = geo.holes && geo.holes.length ? dioPolys(geo.holes) : [], k = o.gap ?? 1, pad = 56 + 40 * k;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const Q of P) for (const [x, y] of Q) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  x0 = Math.max(-DIO_M, Math.floor(x0)) - pad; y0 = Math.max(-DIO_M, Math.floor(y0)) - pad; x1 = Math.min(W + DIO_M, Math.ceil(x1)) + pad;
+  y1 = o.floor != null ? Math.round(o.floor) : Math.min(H + DIO_M, Math.ceil(y1)) + pad;
+  const w = x1 - x0, h = y1 - y0;
+  const sil = dioMk(w, h), s = sil.getContext('2d');                               // the silhouette, holes punched
+  s.translate(-x0, -y0); dioTrace(P, s); s.fillStyle = col; s.fill();
+  if (holes.length) { s.globalCompositeOperation = 'destination-out'; dioTrace(holes, s); s.fill(); }
+  const body = dioMk(w, h), t = body.getContext('2d');                             // the paper: lit lip, value falloff, haze, grain
+  t.drawImage(sil, 0, 0); t.globalCompositeOperation = 'source-in'; t.fillStyle = dioMix(col, '#ffffff', o.lip ?? 0.4); t.fillRect(0, 0, w, h);
+  t.globalCompositeOperation = 'source-atop'; t.drawImage(sil, 1.6, 2.6);          // the body, shifted: the lip stays on the top-left cuts
+  const fall = t.createLinearGradient(0, pad, 0, o.floor != null ? h : h - pad); fall.addColorStop(0, 'rgba(255,255,255,0.06)'); fall.addColorStop(1, 'rgba(0,0,0,0.12)'); t.fillStyle = fall; t.fillRect(0, 0, w, h);
+  if (o.haze > 0) { const hx = o.light[0] - x0, hy = o.light[1] - y0, hz = t.createRadialGradient(hx, hy, 0, hx, hy, 760); hz.addColorStop(0, dioA(o.glow, o.haze)); hz.addColorStop(0.45, dioA(o.glow, o.haze * 0.5)); hz.addColorStop(1, dioA(o.glow, 0)); t.fillStyle = hz; t.fillRect(0, 0, w, h); }
+  dioGrainOver(t, w, h);
+  const out = dioMk(w, h), c = out.getContext('2d');                               // the sheet over its own cast shadow
+  c.shadowColor = o.shadow; c.shadowBlur = 48 * k; c.shadowOffsetX = 12 * k; c.shadowOffsetY = 12 * k; c.drawImage(body, 0, 0);
+  return { cv: out, x0, y0, w, h, flat: dioMix(dioMix(col, '#000000', 0.12), '#808080', 0.049) };   // flat = the paper's average colour at the floor (falloff + grain)
+}
+// a static sheet. key names its geometry (never reuse a key for another shape); geo may be a function, called once.
+// tone = a ramp index or a colour; o: { depth, dx, dy, gap (shadow distance, 1), lip, a, haze (light caught from the
+// lamp, baked in; default falls with depth), floor (a world y below which the sheet is plain paper right across:
+// only the part above it is cached, the rest is one flat fill — for hills whose lower part hides behind nearer sheets) }
+function dioSheet(key, geo, tone, o = {}) {
+  const col = typeof tone === 'number' ? DIO_R.tones[tone] : tone, id = key + '|' + col + '|' + DIO_L, depth = o.depth ?? 0;
+  const s = DIO_SHEETS[id] || (DIO_SHEETS[id] = dioBuildSheet(typeof geo === 'function' ? geo() : geo, col, { shadow: dioShade(0.6), light: DIO_L, glow: DIO_R.glow, ...o, haze: o.haze ?? 0.34 * (1 - depth) ** 2 }));
+  const [ox, oy] = dioOff(depth), x = s.x0 + ox + (o.dx ?? 0), y = s.y0 + oy + (o.dy ?? 0);
+  if (y > H + DIO_M || x > W + DIO_M || x + s.w < -DIO_M || (o.floor == null && y + s.h < -DIO_M)) return;
+  ctx.save(); if (o.a != null) ctx.globalAlpha *= o.a;
+  ctx.drawImage(s.cv, x, y);
+  if (o.floor != null && y + s.h < H + DIO_M) { ctx.fillStyle = s.flat; ctx.fillRect(-DIO_M, y + s.h - 0.5, W + 2 * DIO_M, H + DIO_M - (y + s.h) + 0.5); if (o.dy > 1 || o.bare) { ctx.fillStyle = ctx.createPattern(dioGrainTile(), 'repeat'); ctx.fillRect(-DIO_M, y + s.h, W + 2 * DIO_M, H + DIO_M - (y + s.h)); } }
+  ctx.restore();
+}
+// a moving piece of paper: fn() traces and fills / strokes it WITHOUT setting colours; drawn once as the lit lip
+// with the cast shadow, then again 1.4 / 2.2 px down-right as the body. o: { gap, shadow, lip }
+function dioPiece(fn, col, o = {}) {
+  const k = o.gap ?? 1;
+  ctx.save(); ctx.lineJoin = ctx.lineCap = 'round';
+  ctx.fillStyle = ctx.strokeStyle = dioMix(col, '#ffffff', o.lip ?? 0.4);
+  ctx.shadowColor = o.shadow ?? dioShade(); ctx.shadowBlur = 20 * k; ctx.shadowOffsetX = 8 * k; ctx.shadowOffsetY = 11 * k; fn();
+  ctx.shadowColor = 'transparent'; ctx.translate(1.4, 2.2); ctx.fillStyle = ctx.strokeStyle = col; fn();
+  ctx.restore();
+}
+const dioCut = (Ps, col, o) => dioPiece(() => { dioTrace(dioPolys(Ps)); ctx.fill(); }, col, o);
+const DIO_GLOWS = {};
+function dioGlow(x, y, r, a, c) {   // light leaking: a soft radial bloom (a small cached sprite per colour, enlarged)
+  if (a <= 0.004 || r <= 1) return;
+  let sp = DIO_GLOWS[c];
+  if (!sp) { sp = DIO_GLOWS[c] = dioMk(128, 128); const g = sp.getContext('2d'), gr = g.createRadialGradient(64, 64, 0, 64, 64, 64); gr.addColorStop(0, dioA(c, 1)); gr.addColorStop(0.35, dioA(c, 0.46)); gr.addColorStop(0.7, dioA(c, 0.12)); gr.addColorStop(1, dioA(c, 0)); g.fillStyle = gr; g.fillRect(0, 0, 128, 128); }
+  ctx.save(); ctx.globalAlpha *= clamp(a); ctx.drawImage(sp, x - r, y - r, r * 2, r * 2); ctx.restore();
+}
+// the lit lip on the far (bottom-right) wall of a cut hole
+function dioLip(P, col = 'rgba(255,255,255,0.5)', w = 3) { ctx.save(); dioTrace([P]); ctx.clip(); ctx.translate(-w * 0.6, -w * 0.9); dioTrace([P]); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore(); }
+// a hole cut through the sheet in front, showing light of colour c: hot centre, the cut edge's shadow falling inside
+function dioHole(P, c, o = {}) {
+  const b = bbox(P), cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, r = Math.max(b.x1 - b.x0, b.y1 - b.y0) / 2, pd = 90;
+  ctx.save(); dioTrace([P]); ctx.clip();
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 1.2); g.addColorStop(0, dioMix(c, '#ffffff', o.hot ?? 0.75)); g.addColorStop(0.55, dioMix(c, '#ffffff', (o.hot ?? 0.75) * 0.4)); g.addColorStop(1, dioMix(c, '#ffffff', 0));
+  ctx.fillStyle = g; ctx.fillRect(b.x0 - 2, b.y0 - 2, b.x1 - b.x0 + 4, b.y1 - b.y0 + 4);
+  ctx.shadowColor = o.shadow ?? dioShade(0.55); ctx.shadowBlur = o.blur ?? 24; ctx.shadowOffsetX = 9; ctx.shadowOffsetY = 13;
+  ctx.beginPath(); ctx.rect(b.x0 - pd, b.y0 - pd, b.x1 - b.x0 + pd * 2, b.y1 - b.y0 + pd * 2); dioAdd(P); ctx.fillStyle = '#000'; ctx.fill('evenodd');
+  ctx.restore();
+  dioLip(P, o.lipC);
+}
+// the light itself: a disc (or any outline P) cut through the sky sheet, with its bloom. p = 0..1 pulse
+function dioLamp(P, c, glow, p = 0.5, o = {}) {
+  const b = bbox(P), x = (b.x0 + b.x1) / 2, y = (b.y0 + b.y1) / 2, r = Math.max(b.x1 - b.x0, b.y1 - b.y0) / 2;
+  dioGlow(x, y, r * (3.3 + 0.3 * p), 0.5 + 0.14 * p, glow);
+  dioHole(P, c, { hot: 0.85, ...o });
+  dioGlow(x, y, r * 1.55, 0.2 + 0.1 * p, '#ffffff');
+}
+
+// ---------------------------------------------------------------------
+//  the back of the box: the sky sheet (cached), the light disc, haze between sheets, stars as punched holes
+// ---------------------------------------------------------------------
+function dioSky(x, y, o = {}) {   // light at (x, y): brightest there, a tone darker toward the far corners
+  DIO_L = [x, y];
+  const R = DIO_R, id = 'sky|' + R.name + '|' + x + '|' + y; let s = DIO_SHEETS[id];
+  if (!s) {
+    const w = W + 2 * DIO_M, h = H + 2 * DIO_M, cv = dioMk(w, h), g = cv.getContext('2d');
+    const gr = g.createRadialGradient(x + DIO_M, y + DIO_M, 0, x + DIO_M, y + DIO_M, o.rad ?? 1500); gr.addColorStop(0, R.tones[0]); gr.addColorStop(0.5, R.tones[1]); gr.addColorStop(1, dioMix(R.tones[1], R.tones[2], 0.75));
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    const vg = g.createRadialGradient(w / 2, h * 0.46, h * 0.3, w / 2, h * 0.46, h * 0.62); vg.addColorStop(0, dioA(R.tones[8], 0)); vg.addColorStop(1, dioA(R.tones[8], 0.22)); g.fillStyle = vg; g.fillRect(0, 0, w, h);   // the box's dark corners
+    dioGrainOver(g, w, h);
+    s = DIO_SHEETS[id] = { cv };
+  }
+  ctx.drawImage(s.cv, -DIO_M, -DIO_M);
+}
+const dioPulse = () => 0.5 + 0.5 * Math.sin(TT * 2.1);
+function dioDisc(x, y, r, o = {}) { dioLamp(dioCirclePts(x, y, r), o.c ?? DIO_R.light, DIO_R.glow, o.pulse ?? dioPulse()); }
+function dioStarPts(x, y, r) { const P = []; for (let i = 0; i < 8; i++) { const a = i * TAU / 8 - Math.PI / 2, k = i % 2 ? 0.34 : 1; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); } return P; }
+// stars: holes punched in the sky sheet (fixed places), each twinkling at its own rate. o: { y0, y1, avoid: [[x, y, r]], t0, stagger }
+function dioStars(key, n, o = {}) {
+  const R = RNG('dio-stars', key), c = o.c ?? DIO_R.light;
+  for (let i = 0; i < n; i++) {
+    const x = R.r(70, W - 70), y = R.r(o.y0 ?? 130, o.y1 ?? 1000), r = R.r(3, 6.2), f = R.r(1.6, 3.6), ph = R.r(0, TAU), big = i % 5 === 0;
+    if ((o.avoid || []).some(([ax, ay, ar]) => Math.hypot(x - ax, y - ay) < ar)) continue;
+    const on = o.t0 != null ? EZ.o2(ev(o.t0 + i * (o.stagger ?? 0.03), 0.25)) : 1; if (on <= 0) continue;
+    const tw = (0.62 + 0.38 * Math.sin(TT * f + ph)) * on;
+    ctx.fillStyle = dioA(c, 0.25 + 0.75 * tw);
+    if (big) { dioTrace([dioStarPts(x, y, r * 2.5)]); ctx.fill(); dioGlow(x, y, r * 7, 0.3 * tw, c); } else { ctx.beginPath(); ctx.arc(x, y, r * (0.8 + 0.2 * tw), 0, TAU); ctx.fill(); }
+  }
+}
+
+// ---------------------------------------------------------------------
+//  silhouettes (all return polygons in world coords, ready for dioSheet / dioCut)
+// ---------------------------------------------------------------------
+// a ridge line: y at any x. o: { amp, freq, tilt, bumps: [[x, height, width]] }. Keep it in a const: scenes ask it where things stand.
+function dioRidge(key, y, o = {}) {
+  const R = RNG('dio-ridge', key), amp = o.amp ?? 44, ks = [];
+  for (let i = 0; i < 4; i++) ks.push([R.r(0.7, 1.3) * (o.freq ?? 1) * (i + 1) * TAU / 1500, R.r(0, TAU), 1 / (i + 1.3)]);
+  return (x) => y + (o.tilt ?? 0) * (x - W / 2) - ks.reduce((s, [f, p, a]) => s + Math.sin(x * f + p) * a, 0) * amp - (o.bumps || []).reduce((s, [bx, bh, bw]) => s + bh * Math.exp(-(((x - bx) / bw) ** 2)), 0);
+}
+// the whole ground under a ridge line, down past the frame
+function dioHillPts(ridge, step = 14) { const P = []; for (let x = -DIO_M; x <= W + DIO_M; x += step) P.push([x, ridge(x)]); P.push([W + DIO_M, H + DIO_M + 80], [-DIO_M, H + DIO_M + 80]); return P; }
+function dioVolcanoPts(x, y, w, h) {   // peak at x, base line y (hide it behind a nearer sheet), half-width w, height h: concave flanks, a notched crater
+  const P = [], cw = w * 0.085, n = 22;
+  for (let i = 0; i <= n; i++) { const u = i / n; P.push([x - w + (w - cw) * u, y - h * u ** 1.75]); }
+  P.push([x - cw * 0.35, y - h + h * 0.035], [x + cw * 0.3, y - h + h * 0.018]);
+  for (let i = n; i >= 0; i--) { const u = i / n; P.push([x + w - (w - cw) * u, y - h * (u ** 1.75) * 0.985]); }
+  P.push([x + w, y + 60], [x - w, y + 60]); return P;
+}
+function dioCloudPts(x, y, w, key) {   // a flat-bottomed cloud: a bar with round lumps on top (y = its base line)
+  const R = RNG('dio-cloud', key), P = [rrectPts(x - w / 2, y - w * 0.12, w, w * 0.12, w * 0.058, 6)], n = 4;
+  for (let i = 0; i < n; i++) { const r = w * (0.11 + 0.1 * Math.sin(Math.PI * (i + 0.6) / n)) * R.r(0.88, 1.12); P.push(dioArc(x - w / 2 + w * (0.2 + 0.6 * i / (n - 1)), y - w * 0.07, r * 1.12, r, Math.PI, TAU, 20)); }
+  return P;
+}
+// a leaf / frond / blade: from (x, y) along angle ang, len long, wid at its widest, drooping (gravity) by droop
+function dioFrondPts(x, y, len, ang, droop, wid, n = 9) {
+  const L = [], Rt = [], ca = Math.cos(ang), sa = Math.sin(ang);
+  for (let i = 0; i <= n; i++) {
+    const t = i / n, px = x + ca * len * t, py = y + sa * len * t + droop * len * t * t, tx = ca, ty = sa + 2 * droop * t, tl = Math.hypot(tx, ty) || 1, hw = wid * 0.5 * Math.sin(Math.PI * t ** 0.75) ** 0.8;
+    L.push([px - ty / tl * hw, py + tx / tl * hw]); Rt.unshift([px + ty / tl * hw, py - tx / tl * hw]);
+  }
+  return L.concat(Rt);
+}
+function dioBlobPts(x, y, r, key, rough = 0.1, n = 44) { const R = RNG('dio-blob', key), p = [R.r(0, TAU), R.r(0, TAU), R.r(0, TAU)], P = []; for (let i = 0; i < n; i++) { const a = i / n * TAU, k = 1 + rough * (Math.sin(3 * a + p[0]) * 0.5 + Math.sin(5 * a + p[1]) * 0.32 + Math.sin(8 * a + p[2]) * 0.18); P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k * 0.92]); } return P; }
+function dioTree(x, y, h, key) {   // a round-crowned tree standing on ground line y, h tall
+  const R = RNG('dio-tree', key), r = h * 0.3, P = [[[x - h * 0.035, y + 50], [x - h * 0.022, y - h * 0.6], [x + h * 0.022, y - h * 0.6], [x + h * 0.035, y + 50]]];
+  P.push(dioBlobPts(x, y - h * 0.7, r, key + 'a'), dioBlobPts(x - r * 0.62, y - h * 0.58, r * 0.66, key + 'b'), dioBlobPts(x + r * 0.6, y - h * 0.6, r * 0.7, key + 'c'), dioBlobPts(x + R.n(r * 0.2), y - h * 0.86, r * 0.6, key + 'd'));
+  return P;
+}
+function dioPalm(x, y, h, key, lean = 0.14) {   // a coconut palm: a bent tapering trunk, a fan of drooping fronds
+  const R = RNG('dio-palm', key), L = [], Rt = [], P = [];
+  for (let i = 0; i <= 10; i++) { const u = i / 10, cx = x + lean * h * u * u, cy = y + 50 - (h + 50) * u, hw = lerp(h * 0.034, h * 0.016, u); L.push([cx - hw, cy]); Rt.unshift([cx + hw, cy]); }
+  P.push(L.concat(Rt));
+  const tx = x + lean * h, ty = y - h, n = 7;
+  for (let i = 0; i < n; i++) { const a = -Math.PI * (0.03 + 0.94 * i / (n - 1)) + R.n(0.09); P.push(dioFrondPts(tx, ty, h * R.r(0.36, 0.46), a, 0.5 + 0.3 * Math.abs(Math.cos(a)), h * 0.085)); }
+  P.push(dioCirclePts(tx, ty + h * 0.012, h * 0.04, 14)); return P;
+}
+function dioGrass(x, y, h, key) { const R = RNG('dio-grass', key), P = []; for (let i = 0; i < 5; i++) P.push(dioFrondPts(x + R.n(h * 0.1), y + 8, h * R.r(0.55, 1), -Math.PI / 2 + R.n(0.55), 0.14, h * 0.13, 6)); return P; }
+// a gabled village house on ground line y: { P, holes } (holes = its cut windows)
+function dioHouse(x, y, w, h, o = {}) {
+  const ov = w * 0.15, rh = o.roof ?? w * 0.44, ww = w * 0.2;
+  return { P: [dioRectPts(x - w / 2, y - h, w, h + 70), [[x - w / 2 - ov, y - h + 5], [x, y - h - rh], [x + w / 2 + ov, y - h + 5]]], holes: (o.wins ?? [-0.22, 0.22]).map((f) => dioRectPts(x + f * w - ww / 2, y - h * 0.74, ww, ww * 1.3)) };
+}
+const dioArchPts = (x, y, w, h) => [[x - w / 2, y], ...dioArc(x, y - h + w / 2, w / 2, w / 2, Math.PI, TAU, 10), [x + w / 2, y]];   // an arched opening standing on y
+// a small village mosque (a hall, a dome with a spike, a minaret): { P, holes }
+function dioMosque(x, y, w) {
+  const h = w * 0.52, top = y - h, dr = w * 0.3, mx = x + w * 0.74, mw = w * 0.13, mt = y - w * 1.32;
+  const P = [dioRectPts(x - w / 2, top, w, h + 70), dioRectPts(x - dr * 0.82, top - w * 0.07, dr * 1.64, w * 0.08), dioArc(x, top - w * 0.06, dr * 1.04, dr * 1.02, Math.PI * 0.94, Math.PI * 2.06, 26),
+    [[x - dr * 0.13, top - dr * 0.95], [x, top - dr * 1.62], [x + dr * 0.13, top - dr * 0.95]],
+    dioRectPts(mx - mw / 2, mt, mw, y - mt + 70), dioRectPts(mx - mw * 0.95, y - w * 1.02, mw * 1.9, w * 0.05), [[mx - mw * 0.8, mt + 2], [mx, mt - w * 0.3], [mx + mw * 0.8, mt + 2]]];
+  return { P, holes: [-0.3, 0, 0.3].map((f) => dioArchPts(x + f * w, y - h * 0.2, w * 0.13, h * 0.56)).concat([dioArchPts(mx, y - w * 0.72, mw * 0.5, w * 0.16)]) };
+}
+const dioJoin = (...gs) => ({ P: gs.flatMap((g) => dioPolys(g.P ?? g)), holes: gs.flatMap((g) => g.holes || []) });
+// one side of the leaf frame (side -1 = left, 1 = right), as three sheets so each stays small: part 'top' = a leafy
+// branch across the top corner, 'side' = leaves poking in along the edge, 'fern' = ferns rising from the bottom corner
+function dioLeafFrame(side, part, key) {
+  const R = RNG('dio-frame', key, part), P = [], X = (f) => (side < 0 ? f : W - f), A = (a) => (side < 0 ? a : Math.PI - a);
+  if (part === 'top') {
+    const L = [], Rt = [], n = 12;
+    for (let i = 0; i <= n; i++) { const u = i / n, f = -150 + 380 * u, y = 46 + 170 * u - 40 * Math.sin(Math.PI * u), hw = lerp(13, 3, u); L.push([X(f), y - hw]); Rt.unshift([X(f), y + hw]);
+      if (i > 2) { const up = i % 2 === 0; P.push(dioFrondPts(X(f), y, R.r(105, 150), A((up ? -0.62 : 0.95) + R.n(0.22)), up ? 0.1 : 0.22, R.r(44, 58))); } }
+    P.push(L.concat(Rt));
+  } else if (part === 'side') for (let i = 0; i < 4; i++) P.push(dioFrondPts(X(-50), 470 + i * 250 + R.n(50), R.r(120, 165), A(R.n(0.4) + 0.15), 0.25, R.r(46, 60)));
+  else for (let i = 0; i < 6; i++) P.push(dioFrondPts(X(-40 + i * 36), H + 60, R.r(380, 540), A(-Math.PI / 2 + 0.1 + i * 0.17 + R.n(0.06)), 0.16, R.r(64, 88)));
+  return P;
+}
+function dioLeafSheets(key, tone, o = {}) {   // both sides of the frame; o.slide = how far each side is still out of the picture
+  for (const side of [-1, 1]) for (const part of ['top', 'side', 'fern']) dioSheet(key + side + part, () => dioLeafFrame(side, part, key + side), tone, { depth: 1, gap: 1.3, haze: 0, ...o, dx: side * (o.slide ?? 0) });
+}
+
+// ---------------------------------------------------------------------
+//  background life: birds, falling leaves, fireflies, lit windows, the lantern
+// ---------------------------------------------------------------------
+function dioBirdPts(x, y, s, ph) {   // a gliding bird seen from afar; ph = flap phase
+  const up = s * 0.55 * Math.sin(ph);
+  return [[x - s, y - up], [x - s * 0.46, y - up * 0.72 - s * 0.17], [x, y - s * 0.1], [x + s * 0.46, y - up * 0.72 - s * 0.17], [x + s, y - up], [x + s * 0.42, y - up * 0.42 + s * 0.03], [x, y + s * 0.15], [x - s * 0.42, y - up * 0.42 + s * 0.03]];
+}
+function dioBird(x, y, s, ph, col) { dioCut(dioBirdPts(x, y, s, ph), col ?? dioTone(7), { gap: 0.45 }); }
+function dioLeavesFall(key, n, col, o = {}) {   // small leaves drifting down, turning. o: { x0, x1, y0, y1 } (they sway up to 60px past x0 / x1)
+  const R = RNG('dio-fall', key), y0 = o.y0 ?? 200, span = (o.y1 ?? 1500) - y0;
+  for (let i = 0; i < n; i++) {
+    const bx = R.r(o.x0 ?? 120, o.x1 ?? W - 160), sp = R.r(70, 120), ph = R.r(0, 10), len = R.r(26, 40), sw = R.r(30, 60), f = R.r(0.9, 1.5);
+    const t = TT + ph, y = y0 + mod(t * sp, span), x = bx + Math.sin(t * f) * sw, a = Math.sin(t * f) * 0.9 + t * 0.6;
+    const edge = Math.min(1, (y - y0) / 80, (y0 + span - y) / 80);
+    ctx.save(); ctx.globalAlpha *= clamp(edge); dioCut(dioFrondPts(x - Math.cos(a) * len / 2, y - Math.sin(a) * len / 2, len, a, 0, len * 0.46, 6), col, { gap: 0.4 }); ctx.restore();
+  }
+}
+function dioFireflies(key, n, o = {}) {   // glowing dots wandering near (o.x, o.y, o.w, o.h), blinking; they come on one by one from o.t0
+  const R = RNG('dio-fly', key), c = o.c ?? DIO.warm;
+  for (let i = 0; i < n; i++) {
+    const bx = R.r(o.x ?? 80, (o.x ?? 80) + (o.w ?? 800)), by = R.r(o.y ?? 1000, (o.y ?? 1000) + (o.h ?? 400)), f1 = R.r(0.5, 1.1), f2 = R.r(0.4, 0.9), p1 = R.r(0, TAU), p2 = R.r(0, TAU), fb = R.r(1.6, 3);
+    const on = o.t0 != null ? EZ.o2(ev(o.t0 + i * 0.13, 0.4)) : 1; if (on <= 0) continue;
+    const x = bx + Math.sin(TT * f1 + p1) * 46, y = by + Math.cos(TT * f2 + p2) * 30, a = on * (0.45 + 0.55 * Math.sin(TT * fb + p1) ** 2);
+    dioGlow(x, y, 34, 0.75 * a, c); ctx.fillStyle = dioA(DIO.warmHi, a); ctx.beginPath(); ctx.arc(x, y, 3.6, 0, TAU); ctx.fill();
+  }
+}
+// windows cut in a sheet, lit from inside. Call with pass 'back' BEFORE the sheet (the warm paper behind the holes)
+// and 'glow' AFTER it. lit(i) = 0..1 for hole i; o = the sheet's { depth, dx, dy }
+function dioWindows(holes, pass, lit, o = {}) {
+  dioLayer(o.depth ?? 0, () => holes.forEach((P, i) => {
+    const a = clamp(lit(i)); if (a <= 0) return; const b = bbox(P), x = (b.x0 + b.x1) / 2, y = (b.y0 + b.y1) / 2;
+    if (pass === 'back') { ctx.fillStyle = dioMix(dioTone(4), DIO.warm, a); ctx.fillRect(b.x0 - 5, b.y0 - 5, b.x1 - b.x0 + 10, b.y1 - b.y0 + 10); ctx.fillStyle = dioA(DIO.warmHi, 0.55 * a); ctx.fillRect(b.x0 - 5, b.y0 - 5, b.x1 - b.x0 + 10, (b.y1 - b.y0) * 0.6); } else dioGlow(x, y, 58, 0.5 * a * (0.9 + 0.1 * Math.sin(TT * 5 + i * 2)), DIO.warm);
+  }), o);
+}
+// the hanging paper lantern: body centre (x, y) at rest, s = body height; it hangs from (x, o.top) and sways
+function dioLanternGeo(x, y, s, o = {}) {
+  const top = o.top ?? y - s * 2, a = o.sway ?? Math.sin(TT * 1.5 + 0.6) * 0.028, ca = Math.cos(a), sa = Math.sin(a);
+  const rot = ([px, py]) => [x + (px - x) * ca - (py - top) * sa, top + (px - x) * sa + (py - top) * ca];
+  const sup = (ax, by, n = 48) => { const P = []; for (let i = 0; i < n; i++) { const t = i / n * TAU, c = Math.cos(t), sn = Math.sin(t); P.push([x + Math.sign(c) * Math.abs(c) ** 0.6 * ax, y + Math.sign(sn) * Math.abs(sn) ** 0.72 * by]); } return P; };
+  return { top, rot, body: sup(s * 0.38, s * 0.5).map(rot), shell: sup(s * 0.43, s * 0.535).map(rot) };
+}
+const dioLanternPts = (x, y, s, o) => dioLanternGeo(x, y, s, o).body;   // the bridge outline
+function dioLantern(x, y, s, o = {}) {
+  const g = dioLanternGeo(x, y, s, o), q = (px, py) => g.rot([x + px * s, y + py * s]), lit = (o.lit ?? 1) * (0.93 + 0.07 * Math.sin(TT * 5.3)), c = o.c ?? DIO.warm, col = o.col ?? dioTone(8);
+  const [gx, gy] = g.rot([x, y]);
+  dioGlow(gx, gy, s * 2.5, 0.5 * lit, c);
+  dioPiece(() => {
+    dioTrace([g.shell, [q(-0.3, -0.5), q(-0.2, -0.64), q(0.2, -0.64), q(0.3, -0.5)], [q(-0.3, 0.5), q(-0.21, 0.62), q(0.21, 0.62), q(0.3, 0.5)], [q(-0.02, 0.6), q(0.02, 0.6), q(0.02, 0.84), q(0.05, 0.92), q(0, 1.0), q(-0.05, 0.92), q(-0.02, 0.84)]]); ctx.fill();
+    ctx.lineWidth = Math.max(3, s * 0.018); ctx.beginPath(); ctx.moveTo(...q(0, -0.62)); ctx.lineTo(x, g.top); ctx.stroke();
+  }, col);
+  dioHole(g.body, dioMix(dioTone(6), c, lit), { hot: 0.7 * lit });
+  if ((o.ribs ?? 1) > 0) { ctx.save(); dioTrace([g.body]); ctx.clip(); ctx.globalAlpha *= o.ribs ?? 1; ctx.strokeStyle = col; ctx.lineWidth = Math.max(3, s * 0.022); ctx.beginPath(); for (const f of [-0.14, 0.14]) { ctx.moveTo(...q(f, -0.6)); ctx.lineTo(...q(f, 0.6)); } ctx.stroke(); ctx.restore(); }
+  dioGlow(gx, gy, s * 0.9, 0.28 * lit, DIO.warmHi);
+}
+
+// ---------------------------------------------------------------------
+//  the hero: a paper deer in profile (x, y = between its hooves on the ground line; s = height to the top of its head).
+//  o: { face 1 | -1, graze 0..1 (head down), look -1..1 (lifts / drops the muzzle), ear, tail (0..1, else idle flicks),
+//       antlers, col, ramp, key }. A pale cut-out eye that blinks. Sets SPARK_AT.
+// ---------------------------------------------------------------------
+function dioDeer(x, y, s, o = {}) {
+  const R = o.ramp ?? DIO_R, f = o.face ?? 1, col = o.col ?? R.tones[8], gz = clamp(o.graze ?? 0);
+  const flick = (off, every, len) => { const p = mod(TT + off, every); return p < len ? Math.sin(p / len * Math.PI) : 0; };
+  const ear = o.ear ?? flick(0.5, 2.3, 0.3), tail = o.tail ?? flick(1.2, 1.7, 0.36), br = Math.sin(TT * 1.9) * 0.005;
+  const pt = (lx, ly) => [x + f * lx * s, y + ly * s];
+  const nb = [0.2, -0.58 + br], th = lerp(-64, 46, gz) * DEG, nl = lerp(0.3, 0.34, gz), hp = [nb[0] + Math.cos(th) * nl, nb[1] + Math.sin(th) * nl], nx = -Math.sin(th), ny = Math.cos(th);
+  const ha = (lerp(10, 66, gz) - (o.look ?? 0) * 15) * DEG + Math.sin(TT * 1.3) * 0.015, ch = Math.cos(ha), sh = Math.sin(ha);
+  const hl = (lx, ly) => [hp[0] + lx * ch - ly * sh, hp[1] + lx * sh + ly * ch], hpt = (lx, ly) => pt(...hl(lx, ly));
+  const U = [   // body space: unit = s, y up is negative
+    dioArc(0, -0.5 + br, 0.27, 0.125, 0, TAU, 26), dioArc(0.17, -0.53 + br, 0.13, 0.135, 0, TAU, 20), dioArc(-0.17, -0.52 + br, 0.14, 0.135, 0, TAU, 20),
+    [[0.14, -0.48], [0.215, -0.48], [0.196, -0.24], [0.192, -0.03], [0.204, 0], [0.16, 0], [0.164, -0.03], [0.158, -0.24]], [[0.07, -0.46], [0.135, -0.46], [0.118, -0.24], [0.114, 0], [0.08, 0], [0.084, -0.24]],
+    [[-0.3, -0.5], [-0.13, -0.46], [-0.185, -0.27], [-0.182, -0.02], [-0.172, 0], [-0.226, 0], [-0.23, -0.24], [-0.292, -0.34]], [[-0.2, -0.46], [-0.07, -0.45], [-0.118, -0.27], [-0.122, 0], [-0.164, 0], [-0.164, -0.25], [-0.212, -0.34]],
+    [[0.12, -0.635 + br], [hp[0] - nx * 0.052, hp[1] - ny * 0.052], [hp[0] + nx * 0.052, hp[1] + ny * 0.052], [0.275, -0.47 + br]],
+    [[-0.075, -0.05], [-0.01, -0.078], [0.07, -0.058], [0.165, -0.012], [0.19, 0.018], [0.175, 0.046], [0.08, 0.052], [-0.03, 0.07], [-0.08, 0.03]].map(([a, b]) => hl(a, b)),
+    dioFrondPts(...hl(-0.035, -0.05), 0.14, ha + (-122 + ear * 36) * DEG, 0, 0.062, 6),
+    dioFrondPts(-0.285, -0.57 + br, 0.115, (118 + tail * 95) * DEG, 0, 0.058, 6),
+  ].map((P) => P.map(([a, b]) => pt(a, b)));
+  const ant = o.antlers === false ? [] : [[[-0.01, -0.07], [-0.05, -0.19], [-0.02, -0.31], [0.03, -0.38]], [[-0.045, -0.17], [0.04, -0.22]], [[-0.03, -0.27], [-0.1, -0.34]], [[0.03, -0.07], [0.025, -0.18], [0.065, -0.28], [0.115, -0.33]], [[0.03, -0.2], [0.1, -0.22]]].map((L) => L.map(([a, b]) => hpt(a, b)));
+  SPARK_AT = toScreen(x, y - s * 0.5);
+  dioPiece(() => {
+    dioTrace(U); ctx.fill();
+    ctx.lineWidth = Math.max(3, s * 0.021); ctx.beginPath(); for (const L of ant) L.forEach(([a, b], i) => (i ? ctx.lineTo(a, b) : ctx.moveTo(a, b))); ctx.stroke();
+  }, col, { shadow: dioA(R.tones[8], 0.5), gap: 0.8 });
+  if (mod(TT + 0.8, 2.9) > 0.12) { const [ex, ey] = hpt(0.058, -0.02); ctx.fillStyle = R.light; ctx.beginPath(); ctx.arc(ex, ey, Math.max(2.6, s * 0.017), 0, TAU); ctx.fill(); }
+}
+const dioDeerPts = (x, y, s) => dioArc(x, y - s * 0.52, s * 0.42, s * 0.5, 0, TAU * 47 / 48, 47);   // a bridge outline for the hero (its bounding egg)
+
+// ---------------------------------------------------------------------
+//  type: letters cut out of pale paper (each glued on by hand, with its cast shadow), and a caption on a paper strip.
+//  Both go through DEFER (drawn after the camera, at screen size) and fade as a bridge starts.
+// ---------------------------------------------------------------------
+function dioTitleNow(str, R, o = {}) {
+  const al = dioLeaving(); if (al <= 0.001) return;
+  const size = o.size ?? 112, sp = o.spacing ?? 14, at = o.at ?? Math.max(E0 + 0.1, dioArrive() - 0.1), y = o.y ?? 376, rng = RNG('dio-title', str), chars = [...str];
+  ctx.save(); ctx.font = `700 ${size}px ${DIO_SERIF}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const ws = chars.map((ch) => ctx.measureText(ch).width); let px = (o.x ?? CX) - (ws.reduce((a, b) => a + b, 0) + sp * (chars.length - 1)) / 2;
+  chars.forEach((ch, i) => {
+    const u = EZ.o3(ev(at + i * 0.07, 0.5)), rot = rng.n(0.035), dy = rng.n(4), cx = px + ws[i] / 2; px += ws[i] + sp;
+    if (u <= 0 || ch === ' ') return;
+    ctx.save(); ctx.globalAlpha = al * Math.min(1, u * 1.7); ctx.translate(cx, y + dy + (1 - u) * 46); ctx.rotate(rot * (2 - u));
+    ctx.shadowColor = dioA(R.tones[8], 0.55); ctx.shadowBlur = 14; ctx.shadowOffsetX = 7; ctx.shadowOffsetY = 10; ctx.fillStyle = dioMix(R.text, R.tones[3], 0.5); ctx.fillText(ch, 1.6, 2.6);
+    ctx.shadowColor = 'transparent'; ctx.fillStyle = R.text; ctx.fillText(ch, 0, 0); ctx.restore();
+  });
+  ctx.restore();
+}
+// 'Senja turun di *lembah*': the starred word sits on a dark chip of paper in the accent colour. o: { y, size, at, hi, rot }
+function dioCaptionNow(str, R, o = {}) {
+  const al = dioLeaving(), size = o.size ?? 52, y = o.y ?? 1404, u = EZ.o3(ev(o.at ?? dioArrive() + 0.25, 0.55)); if (al <= 0.001 || u <= 0) return;
+  const parts = str.split('*').map((s, i) => ({ s: i % 2 ? s.trim() : s, hi: i % 2 === 1 })).filter((p) => p.s.length), chip = 16, rng = RNG('dio-strip', str);
+  ctx.save(); ctx.font = `600 ${size}px ${DIO_SANS}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  for (const p of parts) p.w = ctx.measureText(p.s).width + (p.hi ? chip * 2 : 0);
+  const tot = parts.reduce((a, p) => a + p.w, 0), w = tot + 96, h = size * 1.9, j = () => rng.n(4);
+  ctx.globalAlpha = al * Math.min(1, u * 1.6); ctx.translate(o.x ?? CX, y + (1 - u) * 70); ctx.rotate(o.rot ?? -0.012);
+  const S = [[-w / 2 + j(), -h / 2 + j()], [w / 2 + j(), -h / 2 + j()], [w / 2 + j(), h / 2 + j()], [-w / 2 + j(), h / 2 + j()]];
+  dioPiece(() => { dioTrace([S]); ctx.fill(); }, R.strip, { shadow: dioA(R.tones[8], 0.6), lip: 0.6 });
+  ctx.save(); dioTrace([S]); ctx.clip(); dioGrainOver(ctx, 0, 0); ctx.fillRect(-w / 2 - 8, -h / 2 - 8, w + 16, h + 16); ctx.restore();
+  let px = -tot / 2;
+  for (const p of parts) {
+    if (p.hi) {
+      ctx.save(); ctx.translate(px + p.w / 2, 0); ctx.rotate(0.022);
+      dioPiece(() => { ctx.beginPath(); ctx.rect(-p.w / 2, -size * 0.7, p.w, size * 1.4); ctx.fill(); }, R.tones[7], { shadow: dioA(R.tones[8], 0.5), gap: 0.4, lip: 0.25 });
+      ctx.textAlign = 'center'; ctx.fillStyle = o.hi ?? R.hi; ctx.fillText(p.s, 0, 2); ctx.restore();
+    } else { ctx.fillStyle = R.tones[8]; ctx.fillText(p.s, px, 2); }
+    px += p.w;
+  }
+  ctx.restore();
+}
+const dioTitle = (str, o = {}) => { const R = DIO_R, f = () => dioTitleNow(str, R, o); if (DEFER) DEFER.push(f); else f(); };
+const dioCaption = (str, o = {}) => { const R = DIO_R, f = () => dioCaptionNow(str, R, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---- the box: a dark outer mat over a thin inner mat, each throwing its shadow into the picture; darker corners. Cached.
+let DIO_MAT = null;
+function dioMat() {
+  const t = 104;   // how far the mats and their shadows reach in from the frame edge: only these four strips are drawn
+  if (!DIO_MAT) {
+    const g = (DIO_MAT = dioMk(W, H)).getContext('2d');
+    for (const [inset, rad, col, k] of [[42, 12, DIO.mat2, 0.75], [18, 22, DIO.mat, 1]]) {
+      const O = rrectPts(inset, inset, W - inset * 2, H - inset * 2, rad, 8);
+      g.save(); g.shadowColor = 'rgba(8,4,10,0.62)'; g.shadowBlur = 36 * k; g.shadowOffsetX = 13 * k; g.shadowOffsetY = 18 * k;
+      g.beginPath(); g.rect(-300, -300, W + 600, H + 600); dioAdd(O, g); g.fillStyle = col; g.fill('evenodd'); g.restore();
+      g.save(); g.beginPath(); dioAdd(O, g); g.clip(); g.translate(-1.6, -2.4); g.beginPath(); dioAdd(O, g); g.strokeStyle = 'rgba(255,255,255,0.22)'; g.lineWidth = 3; g.stroke(); g.restore();
+    }
+    g.globalCompositeOperation = 'source-atop'; dioGrainOver(g, W, H);
+  }
+  ctx.save(); screen(); ctx.globalAlpha = 1;
+  for (const [x, y, w, h] of [[0, 0, W, t], [0, H - t, W, t], [0, t, t, H - 2 * t], [W - t, t, t, H - 2 * t]]) ctx.drawImage(DIO_MAT, x, y, w, h, x, y, w, h);
+  ctx.restore();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks. The morph happens on one blank sheet of paper: the old era is seen through a hole
+//  cut in it (the cut edge's shadow falls into the scene), the hole closes onto the light disc, the disc's outline
+//  changes shape as a lit hole, and the new era opens out of it.
+// =====================================================================
+let DIO_BACK = DIO.paper;   // the morph sheet's colour this frame (backdrop always runs before window / blob)
+const dioGrowPts = (P, d) => { const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), r = P.reduce((a, p) => a + Math.hypot(p[0] - c[0], p[1] - c[1]), 0) / P.length || 1, k = (r + d) / r; return P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]); };
+// one step down into the box (screen coords): through outline P the next sheet shows (colour col, or whatever fn draws),
+// with the shadow of the cut edge above falling onto it and a lit lip on the cut
+function dioStep(P, col, fn) {
+  const b = bbox(P), x0 = Math.max(b.x0, 0) - 90, y0 = Math.max(b.y0, 0) - 90, x1 = Math.min(b.x1, W) + 90, y1 = Math.min(b.y1, H) + 90; if (x1 <= x0 || y1 <= y0) return;
+  ctx.save(); dioTrace([P]); ctx.strokeStyle = 'rgba(255,255,255,0.16)'; ctx.lineWidth = 6; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore();   // the cut's thickness catching light
+  ctx.save(); dioTrace([P]); ctx.clip();
+  if (col) { ctx.fillStyle = col; ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.fillStyle = ctx.createPattern(dioGrainTile(), 'repeat'); ctx.fillRect(x0, y0, x1 - x0, y1 - y0); } else fn();
+  ctx.shadowColor = DIO.shade; ctx.shadowBlur = 34; ctx.shadowOffsetX = 13; ctx.shadowOffsetY = 18;
+  ctx.beginPath(); ctx.rect(x0, y0, x1 - x0, y1 - y0); dioAdd(P); ctx.fillStyle = '#000'; ctx.fill('evenodd'); ctx.restore();
+  dioLip(P, 'rgba(255,255,255,0.4)', 3.2);
+}
+// the stack of sheets around a morph opening: two wider cuts, each a step lighter (nearer the light of colour c)
+function dioSteps(P, c) { dioStep(dioGrowPts(P, 104), dioMix(DIO_BACK, c, 0.14)); dioStep(dioGrowPts(P, 50), dioMix(DIO_BACK, c, 0.32)); }
+const STYLE = {
+  name: 'diorama',
+  paper: DIO.paper,
+  backdrop(c) { DIO_BACK = c; fillAll(c); ctx.save(); screen(); dioGrainOver(ctx, W, H); ctx.restore(); },
+  window(P, key, src, o = {}) { dioSteps(P, o.c ?? '#ffffff'); dioStep(P, null, () => ctx.drawImage(src, 0, 0)); },
+  blob(P, c, key, u = 0) { dioSteps(P, c); dioLamp(P, c, c, 0.5 + 0.5 * Math.sin(u * Math.PI), { shadow: DIO.shade }); },
+  hero(x, y, r, o = {}) { dioDeer(x, y + r, r * 2, { ramp: DIO.night, key: o.key }); },
+  heroColor: DIO.night.tones[8],
+  heroPts(x, y, r) { return dioDeerPts(x, y + r, r * 2); },
+  post() { dioMat(); },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — diorama demo. World units = px at zoom 1; time TT on 1s. One valley, cut once and used twice: the same
+//  sheets (same keys, same shapes) in the dusk ramp and in the night ramp. Sheets are listed back to front; DEP is
+//  each sheet's depth (0 = the back of the box, 1 = the leaf frame against the glass).
+// =====================================================================
+const cu = TIMELINE.cues;
+const SUN = { x: 350, y: 640, r: 118 }, MOON = { x: 338, y: 548, r: 92 };
+const LAN = { x: 822, y: 716, s: 215, top: 120, depth: 0.85 };
+const DEER = { x: 330, s: 250 };
+const DEP = { cloud: 0.06, volc: 0.14, far: 0.26, vil: 0.4, ridge: 0.55, near: 0.74, leaf: 1 };
+const RID = {
+  far: dioRidge('far', 1105, { amp: 44 }),
+  vil: dioRidge('vil', 1205, { amp: 28 }),
+  ridge: dioRidge('ridge', 1322, { amp: 28, bumps: [[330, 40, 200]] }),
+  near: dioRidge('near', 1470, { amp: 24 }),
+};
+const VIL = (() => {   // the village sheet: its windows are real holes (VIL.holes), lit from behind at night
+  const g = (x) => RID.vil(x) + 14;
+  return dioJoin({ P: [dioHillPts(RID.vil)] }, dioHouse(610, g(610), 150, 104), dioMosque(790, g(790), 180), dioHouse(1012, g(1012), 124, 88, { wins: [0] }), { P: dioPalm(700, g(700), 250, 'p1', 0.1) });
+})();
+const WIN_AT = [cu.win2, cu.win3, cu.win1, cu.win1 + 0.08, cu.win1 + 0.16, cu.win4, cu.win5];   // when each hole lights (house, mosque arches, minaret, house)
+const GEO = {
+  volc: () => dioVolcanoPts(650, 1270, 620, 505),
+  far: () => [dioHillPts(RID.far), ...dioTree(150, RID.far(150) + 8, 96, 'f1'), ...dioTree(212, RID.far(212) + 8, 70, 'f2')],
+  ridge: () => [dioHillPts(RID.ridge), ...dioPalm(985, RID.ridge(985) + 10, 300, 'r2', -0.1), ...dioPalm(1065, RID.ridge(1065) + 10, 230, 'r3', 0.12)],
+  near: () => [dioHillPts(RID.near), ...dioTree(30, RID.near(30) + 12, 470, 'n1'), ...[250, 330, 470, 560, 650, 735, 830, 900, 990].flatMap((x, i) => dioGrass(x, RID.near(x), 84 + (i * 37) % 60, 'g' + i))],
+};
+// the sheets every era shares, back to front; o = each sheet's slide offsets, hooks draw between sheets.
+// The three hill sheets behind the near ground are cached only down to `floor` (plain paper below it).
+function valley(o) {
+  dioSheet('volc', GEO.volc, 3, { depth: DEP.volc });
+  dioSheet('far', GEO.far, 4, { depth: DEP.far, floor: 1420, bare: o.vil > 1 });
+  if (o.lit) dioWindows(VIL.holes, 'back', o.lit, { depth: DEP.vil, dy: o.vil });
+  dioSheet('vil', VIL, 5, { depth: DEP.vil, dy: o.vil, floor: 1500, bare: o.ridge > 1 });
+  if (o.lit) dioWindows(VIL.holes, 'glow', o.lit, { depth: DEP.vil, dy: o.vil });
+  dioLayer(DEP.ridge, o.deer, { dy: o.ridge });                     // the deer stands just behind the ridge's cut edge
+  dioSheet('ridge', GEO.ridge, 6, { depth: DEP.ridge, dy: o.ridge, floor: 1620, bare: o.near > 1 });
+  if (o.mid) o.mid();
+  dioSheet('near', GEO.near, 7, { depth: DEP.near, dy: o.near });
+  if (o.front) o.front();
+  dioLeafSheets('leaf', 8, { slide: o.leaf });
+}
+
+// ---- era 1: senja — the valley builds up sheet by sheet under a low sun
+function sceneSenja() {
+  dioEra('dusk');
+  dioSky(SUN.x, SUN.y);
+  dioDisc(SUN.x, SUN.y, SUN.r);
+  dioSheet('cloudA', () => dioCloudPts(800, 520, 330, 'a'), 2, { depth: DEP.cloud, dx: 46 - TT * 13, gap: 0.5 });
+  dioSheet('cloudB', () => dioCloudPts(150, 965, 270, 'b'), 2, { depth: DEP.cloud + 0.03, dx: -34 + TT * 10, gap: 0.5 });
+  for (let i = 0; i < 3; i++) {   // three birds cross the sky (they stay right of the sun)
+    const t0 = cu.birds + i * 0.22, x = 1150 - (TT - t0) * 250 - i * 26, y = 610 + i * 46 + Math.sin(TT * 2 + i) * 10;
+    if (TT > t0) dioLayer(0.1, () => dioBird(x, y, 30 - i * 4, TT * 9 + i * 1.7));
+  }
+  const graze = 1 - EZ.io(seg(TT, cu.look, cu.look + 0.45));
+  valley({
+    vil: dioRise(cu.vil), ridge: dioRise(cu.ridge), near: dioRise(cu.near), leaf: dioRise(cu.leaves, 460),
+    deer: () => dioDeer(DEER.x, RID.ridge(DEER.x) + 8, DEER.s, { graze, look: 0.5 * (1 - graze) }),
+    mid: () => dioLayer(0.65,   // falling leaves, kept right of the sun and the peak so nothing crosses the morph shape
+      () => dioLeavesFall('senja', 5, dioTone(7), { x0: 790, x1: 900, y0: 600, y1: 1420 })),
+  });
+  dioTitle('SENJA');
+  dioCaption('Senja turun di *lembah*', { at: 1.45 });   // after the ridge has risen, so the deer never passes behind the strip
+}
+
+// ---- era 2: malam — the same valley at night: moon, stars, a lantern, windows lighting up, the deer
+function sceneMalam() {
+  dioEra('night');
+  dioSky(MOON.x, MOON.y);
+  dioStars('malam', 52, { y0: 150, y1: 1060, avoid: [[MOON.x, MOON.y, MOON.r + 80], [LAN.x, LAN.y, 200]], t0: cu.stars, stagger: 0.022 });
+  dioDisc(MOON.x, MOON.y, MOON.r);
+  dioSheet('cloudB', () => dioCloudPts(150, 965, 270, 'b'), 2, { depth: DEP.cloud + 0.03, dx: 10 + (TT - 3) * 10, gap: 0.5 });
+  const go = EZ.io(seg(TT, cu.deer, cu.stop)), dx = lerp(-190, DEER.x, go), hop = TT > cu.deer && TT < cu.stop ? Math.abs(Math.sin((TT - cu.deer) * Math.PI * 3)) * 9 : 0;
+  const ear = Math.sin(seg(TT, cu.ear, cu.ear + 0.28) * Math.PI) + Math.sin(seg(TT, cu.ear + 0.36, cu.ear + 0.6) * Math.PI) * 0.7;
+  valley({
+    vil: 0, ridge: 0, near: dioRise(cu.near2, 420, 0.9), leaf: dioRise(cu.leaves2, 460, 0.9),
+    lit: (i) => EZ.o2(ev(WIN_AT[i], 0.22)),
+    deer: () => dioDeer(dx, RID.ridge(dx) + 8 - hop, DEER.s, { look: EZ.io(seg(TT, cu.look2, cu.look2 + 0.4)), ear: TT > cu.ear ? ear : undefined }),
+    front: () => {
+      dioLayer(0.7, () => dioFireflies('malam', 7, { x: 110, y: 1170, w: 640, h: 230, t0: cu.flies }));
+      dioLayer(LAN.depth, () => dioLantern(LAN.x, LAN.y, LAN.s, { top: LAN.top, ribs: ev(3.62, 0.3) }));
+    },
+  });
+  dioTitle('MALAM');
+  dioCaption('Malam tiba, *lentera* menyala');
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — diorama demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [DIO.dusk.tones[3], DIO.night.tones[4]];
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.2, 2.5, { z: 1.04, p: [500, 900], to: [500, 900] });
+  const z = springMove(3.0, 1.07, 1.0, { k: 16, d: 8 });
+  return camOf({ z, p: [540, 940], to: [540, 940] });
+}
+const BRIDGES = [
+  // the sun disc (a circle of light) -> the lantern's paper body (a rounded barrel of light): similar proportions,
+  // cream -> amber. The lantern hangs on the lantern's own sheet, so its outline carries that sheet's parallax.
+  { tc: 3.0,
+    A: () => ({ P: dioCirclePts(SUN.x, SUN.y, SUN.r), c: DIO.dusk.light }),
+    B: () => { const [ox, oy] = dioOff(LAN.depth); return { P: dioLanternPts(LAN.x + ox, LAN.y + oy, LAN.s, { top: LAN.top + oy }), c: DIO.warm }; } },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — diorama demo (inside buildScore(); see kit/score-head.js). Slow and calm, like a music box beside
+  // a light box: a soft triangle pad (D major at dusk, B minor at night), a music-box line on the beat with a few
+  // 8ths, a low note every two beats, paper sliding as each sheet rises, a chime on the morph and one for every
+  // window that lights, crickets at night.
+  const T = TIMELINE, q = T.cues;
+  to = 'm';
+  pad(0.0, 3.1, ['D3', 'A3', 'Fs4', 'B4'], 0.062, { cut: 1300, att: 0.6, rel: 0.4, send: 0.6, type: 'triangle' });
+  pad(3.0, 6.05, ['B2', 'Fs3', 'D4', 'A4'], 0.07, { cut: 1150, att: 0.3, rel: 0.5, send: 0.6, type: 'triangle' });
+  const box = [[0, 'Fs5'], [1, 'A5'], [1.5, 'B5'], [2, 'D6'], [3, 'A5'], [3.5, 'Fs5'], [4, 'E5'], [5, 'A5'], [5.5, 'D6'],
+               [6, 'Fs6'], [7, 'D6'], [7.5, 'B5'], [8, 'A5'], [9, 'B5'], [9.5, 'D6'], [10, 'Fs5'], [11, 'B5'], [11.5, 'A5']];
+  box.forEach(([b, n], i) => { const t = b * BEAT; pluck(t, nz(n), 0.09, i % 2 ? 0.25 : -0.25, 0.75, 5200, 0.5); pluck(t + 0.012, nz(n) / 2, 0.035, 0, 0.5, 2400, 0.4); });
+  for (let i = 0; i < 6; i++) bass(i * BEAT * 2, nz(i < 3 ? 'D3' : 'B2'), 0.08);
+  for (let i = 0; i < 3; i++) bass(i * BEAT * 2 + BEAT * 1.5, nz('A2'), 0.045);
+  for (let i = 0; i < 3; i++) bass(3 + i * BEAT * 2 + BEAT * 1.5, nz('Fs2') * 2, 0.05);
+  chime(3.0, [nz('D5'), nz('A5'), nz('Fs6')], 0.1, 0.2);                                  // the sun becomes the lantern
+  [[q.win1, 'D6'], [q.win2, 'Fs6'], [q.win3, 'A6'], [q.win4, 'B6'], [q.win5, 'D7']].forEach(([t, n], i) => chime(t, [nz(n), nz(n) * 1.5], 0.045, -0.3 + i * 0.15));   // windows light up
+  to = 's';
+  for (const [t, p] of [[q.vil, -0.3], [q.ridge, 0.2], [q.near, -0.1], [q.leaves, 0], [q.near2, 0.1], [q.leaves2, 0]]) noiseHit(t, 0.55, 'bandpass', 620, 0.8, 0.034, p, 0.3, 1900);   // a sheet of paper slides into place
+  for (let i = 0; i < 3; i++) { const t = q.birds + 0.2 + i * 0.22; blip(t, 2500 + i * 180, 3300 + i * 180, 0.05, 0.014, 0.5 - i * 0.2); blip(t + 0.09, 2900, 2500, 0.04, 0.01, 0.5 - i * 0.2); }   // birds
+  blip(q.look, 420, 640, 0.14, 0.03, -0.2);                                               // the deer lifts its head
+  sweep(2.4, 3.0, 0.02, 380, 2800, 0);
+  noiseHit(3.0, 0.4, 'bandpass', 1100, 0.9, 0.045, 0, 0.4, 380);
+  for (let t = q.deer + 1 / 3; t < q.stop; t += 1 / 3) noiseHit(t, 0.05, 'lowpass', 380, 1, 0.045, -0.4 + (t - q.deer) * 0.3);   // the deer's steps
+  for (let i = 0; i < 11; i++) { const t = 3.4 + i * E8 * 1.0 + (i % 2) * 0.03; for (let k = 0; k < 3; k++) blip(t + k * 0.035, 4300, 4250, 0.018, 0.0055, i % 2 ? 0.6 : -0.6); }   // crickets
+  blip(q.ear, 900, 1300, 0.05, 0.016, -0.2); blip(q.ear + 0.36, 950, 1350, 0.05, 0.012, -0.2);                                   // an ear flicks
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

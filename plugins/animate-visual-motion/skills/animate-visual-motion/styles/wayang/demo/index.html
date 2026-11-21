@@ -1,0 +1,1565 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wayang demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #120603; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  WAYANG DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On the lamp-lit screen the gunungan stands centre, spins about its
+//  rod and steps aside while a young villager puppet walks in and presents it; at 3.0s the gunungan becomes a
+//  mountain: a village at its foot (trees, a joglo house, birds), the puppet walks in again and waves.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/wayang/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 540;
+
+const ERA_LIST = [[0, 3, () => sceneOpen()], [3, 6, () => sceneVillage()]];
+const SHOTS = [
+  ['open',    0, 0.0, 3.0, 'the gunungan spins on its rod and steps aside; a puppet walks in and presents it'],
+  ['village', 1, 3.0, 6.0, 'the gunungan becomes a mountain; trees, a house and birds; the puppet walks in and waves'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { spin: 0.2, aside: 1.4, walk: 1.0, stop: 2.0, present: 2.0, trees: 3.3, house: 3.55, birds: 3.4, walk2: 3.7, stop2: 5.0, wave: 5.1 },
+  acts: [
+    { name: '1 Pembuka', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Desa',    role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.6, title: 'the puppet presents the gunungan', sound: 'saron, kenong, a kendang roll', next: 'the gunungan becomes a mountain' },
+    { t: 5.4, title: 'the village at the foot of the mountain', sound: 'a gong, bonang', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/wayang/kit.js — wayang kulit (Indonesian shadow-puppet theatre) seen on the kelir, the lit screen.
+//  A warm screen lit by an oil lamp (blencong) that flickers; flat dark silhouettes with a soft shadow copy,
+//  perforated with tatahan (dot rows along the edge, crescent "scale" rows inside): real holes, punched out of
+//  each figure on a scratch layer (wyFigure), so the lit screen shows through;
+//  jointed arms on thin rods (tuding); the gunungan / kayon as the transition object; the banana-trunk stage
+//  (gedebog) as a dark band at the bottom. Motion on 2s, stiff pivots, sway.
+//  Built on kit/core.js. Helpers are prefixed wy…; never redeclare a core name (styles/README.md).
+//  Needs from the piece head: CX (caption centre x). The stage line is WY_STAGE (1530); a piece moves it with
+//  wySetStage(y) at the top of its scenes file.
+// =====================================================================
+const WY = {
+  paper: '#d08a3c',      // the bare lit screen (morph sheet)
+  amber: '#d08a3c',      // era ground, warm
+  dusk: '#c0703a',       // era ground, a touch redder
+  glow: '#ffd27e', mid: '#e8963c', ember: '#a2441a', edge: '#2e0c05',   // the lamp's falloff, centre -> edge
+  ink: '#1e0c06',        // the silhouette (a puppet pressed to the screen)
+  inkS: '#2c140a',       // soft shadow copy
+  far: '#6b3015',        // scenery further from the screen: lighter, blurrier
+  cream: '#fbe9c0', gold: '#e2b24f', goldD: '#a8742a',
+  red: '#5c170c', stage: '#120603', stageL: '#3a1a0c',
+};
+const WY_SERIF = '"Palatino Linotype", Palatino, "Book Antiqua", "URW Palladio L", "P052", Georgia, "DejaVu Serif", serif';
+let WY_STAGE = 1530;   // the top of the stage (gedebog): the kit's default
+function wySetStage(y) { WY_STAGE = y; }   // a piece's override; call it before the first frame
+const WY_LAMP = [540, 930];
+const WY_STOPS = [[0, WY.glow], [0.3, WY.mid], [0.62, WY.ember], [1, WY.edge]];
+
+// ---- colour
+function wyRGB(c) {
+  if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+  return c.match(/[\d.]+/g).slice(0, 3).map(Number);
+}
+const wyMix = (a, b, u) => { const x = wyRGB(a), y = wyRGB(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+// the lamp's flicker, on 2s: -1..1
+function wyFlick() { const R = RNG('wyflick', B); return 0.6 * R.n(1) + 0.4 * Math.sin(B * 1.7); }
+// the screen's colour at a screen point (what shows through a cut-out there); tint c mixes in like the backdrop
+function wyLightAt(x, y, c) {
+  const d = clamp(Math.hypot(x - WY_LAMP[0], (y - WY_LAMP[1]) * 0.85) / (1150 * (1 + 0.025 * wyFlick())));
+  let i = 0; while (i < WY_STOPS.length - 2 && d > WY_STOPS[i + 1][0]) i++;
+  const [a, ca] = WY_STOPS[i], [b, cb] = WY_STOPS[i + 1];
+  const col = wyMix(ca, cb, (d - a) / (b - a));
+  const lit = wyMix(col, '#fff3d6', 0.18);   // a cut-out is brighter than the screen around it (no leather in front)
+  return c ? wyMix(lit, c, 0.22) : lit;
+}
+
+// ---- scratch canvases (made once, by name)
+const WY_SCR = {};
+function wyScratch(name, w, h) {
+  let c = WY_SCR[name];
+  if (!c) { c = document.createElement('canvas'); c.width = w; c.height = h; c.g = c.getContext('2d'); WY_SCR[name] = c; }
+  return c;
+}
+
+// ---- the kelir (screen): lamp glow + cloth weave
+let WY_WEAVE = null;
+function wyWeave() {
+  if (WY_WEAVE) return WY_WEAVE;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d'), R = RNG('wyweave');
+  g.lineWidth = 1;
+  for (let y = 0; y < H; y += 3) { g.strokeStyle = `rgba(60,20,5,${R.r(0.05, 0.16)})`; g.beginPath(); g.moveTo(0, y + R.n(0.4)); g.lineTo(W, y + R.n(0.6)); g.stroke(); }
+  for (let x = 0; x < W; x += 3) { g.strokeStyle = `rgba(255,235,190,${R.r(0.03, 0.09)})`; g.beginPath(); g.moveTo(x, 0); g.lineTo(x + R.n(0.6), H); g.stroke(); }
+  for (let i = 0; i < 260; i++) { g.fillStyle = `rgba(70,25,8,${R.r(0.04, 0.12)})`; g.fillRect(R.r(0, W), R.r(0, H), R.r(20, 120), 1.2); }   // slubs
+  WY_WEAVE = cv; return cv;
+}
+function wyScreenFill(c) {
+  // the glow is smooth, so it is painted at quarter size and enlarged (a full-size radial fill was the dearest thing in the frame)
+  const fk = wyFlick(), rad = 1150 * (1 + 0.025 * fk), q = 4, sm = wyScratch('glow', Math.ceil(W / q), Math.ceil(H / q)), sg = sm.g;
+  const g = sg.createRadialGradient(WY_LAMP[0], WY_LAMP[1], 0, WY_LAMP[0], WY_LAMP[1], rad);
+  WY_STOPS.forEach(([s, col]) => g.addColorStop(s, wyMix(col, c, 0.22)));
+  sg.save(); sg.scale(1 / q, 1 / q); sg.translate(0, WY_LAMP[1]); sg.scale(1, 1 / 0.85); sg.translate(0, -WY_LAMP[1]);
+  sg.fillStyle = g; sg.fillRect(0, -400, W + q, H + 800); sg.restore();
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(sm, 0, 0, sm.width, sm.height, 0, 0, sm.width * q, sm.height * q);
+  ctx.globalAlpha = 0.55; ctx.drawImage(wyWeave(), 0, 0);
+  ctx.restore();
+}
+const wyScreen = (c = WY.amber) => wyScreenFill(c);
+
+// ---- geometry
+function wyInside(P, x, y) {
+  let c = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const [xi, yi] = P[i], [xj, yj] = P[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; }
+  return c;
+}
+function wyEdgeD(P, x, y) {
+  let m = 1e9;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+    const [ax, ay] = P[j], [bx, by] = P[i], dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy || 1;
+    const t = clamp(((x - ax) * dx + (y - ay) * dy) / l), px = ax + t * dx - x, py = ay + t * dy - y, d = px * px + py * py;
+    if (d < m) m = d;
+  }
+  return Math.sqrt(m);
+}
+function wyChaikin(P, n = 2) { let Q = P; for (let k = 0; k < n; k++) { const R = []; for (let i = 0; i < Q.length; i++) { const a = Q[i], b = Q[(i + 1) % Q.length]; R.push([lerp(a[0], b[0], 0.25), lerp(a[1], b[1], 0.25)], [lerp(a[0], b[0], 0.75), lerp(a[1], b[1], 0.75)]); } Q = R; } return Q; }
+function wyTrace(P, closed, sharp) { if (!sharp) return trace(P, closed); ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); if (closed) ctx.closePath(); }
+const wyCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+const wyZoom = () => Math.hypot(ctx.getTransform().a, ctx.getTransform().b) || 1;
+
+// ---- tatahan: the cut-out pattern inside a silhouette (local coords; cached by key when the outline is fixed)
+const WY_HOLES = {};
+function wyHoles(P, o = {}) {
+  if (o.key && WY_HOLES[o.key]) return WY_HOLES[o.key];
+  const s = o.scale ?? 1, out = [], clr = o.clear || (() => false);   // clear(x, y): no cut-outs at all there (a face)
+  const Q = resample(P, true, 19 * s), n = Q.length;
+  for (let i = 0; i < n; i++) {
+    const a = Q[(i - 1 + n) % n], b = Q[(i + 1) % n], q = Q[i];
+    let nx = a[1] - b[1], ny = b[0] - a[0]; const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    if (!wyInside(P, q[0] + nx * 3, q[1] + ny * 3)) { nx = -nx; ny = -ny; }
+    const p1 = [q[0] + nx * 13 * s, q[1] + ny * 13 * s];
+    if (wyEdgeD(P, ...p1) > 9 * s && wyInside(P, ...p1) && !clr(...p1)) out.push({ k: 'dot', x: p1[0], y: p1[1], r: 3.1 * s });
+    if (o.rows !== 1 && i % 2 === 0) {
+      const p2 = [q[0] + nx * 30 * s, q[1] + ny * 30 * s];
+      if (wyEdgeD(P, ...p2) > 22 * s && wyInside(P, ...p2) && !clr(...p2)) out.push({ k: 'cres', x: p2[0], y: p2[1], r: 6.5 * s, a: Math.atan2(ny, nx) });
+    }
+  }
+  if (o.interior !== false) {   // crescent "scales" in staggered rows, opening down (tatah inten-like)
+    const bb = bbox(P), g = (o.step ?? 30) * s;
+    for (let row = 0, y = bb.y0 + g; y < bb.y1; y += g * 0.8, row++) {
+      for (let x = bb.x0 + (row % 2 ? g / 2 : 0); x < bb.x1; x += g) {
+        if (!wyInside(P, x, y) || wyEdgeD(P, x, y) < 50 * s) continue;
+        if ((o.skip && o.skip(x, y)) || clr(x, y)) continue;
+        out.push({ k: 'cres', x, y, r: 8 * s, a: Math.PI / 2 });
+        if (row % 3 === 1) out.push({ k: 'dot', x, y: y - 9 * s, r: 2.4 * s });
+      }
+    }
+  }
+  if (o.key) WY_HOLES[o.key] = out;
+  return out;
+}
+function wyDrawHoles(H0, col = null, a = 1) {   // col null = punch real holes (inside a figure); a colour = paint them
+  ctx.save(); ctx.lineCap = 'round'; ctx.globalAlpha *= a;
+  if (col) { ctx.fillStyle = col; ctx.strokeStyle = col; } else { ctx.globalCompositeOperation = 'destination-out'; ctx.fillStyle = ctx.strokeStyle = '#000'; }
+  ctx.beginPath();
+  for (const h of H0) if (h.k === 'dot') { ctx.moveTo(h.x + h.r, h.y); ctx.arc(h.x, h.y, h.r, 0, TAU); }
+  ctx.fill();
+  const byR = new Map();   // crescents of one size share a path (one stroke each)
+  for (const h of H0) if (h.k === 'cres') { if (!byR.has(h.r)) byR.set(h.r, []); byR.get(h.r).push(h); }
+  for (const [r, L] of byR) {
+    ctx.lineWidth = r * 0.38; ctx.beginPath();
+    for (const h of L) { const cy = h.y - Math.sin(h.a) * r * 0.5; ctx.moveTo(h.x + Math.cos(h.a - 1.25) * r, cy + Math.sin(h.a - 1.25) * r); ctx.arc(h.x, cy, r, h.a - 1.25, h.a + 1.25); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ---- a figure: one piece of leather. Everything drawn inside wyFigure(fn) goes to a scratch layer, where cut-outs
+// (wySil's tatahan, wyCut) are punched with destination-out, so the lit screen and whatever stands behind really
+// show through. The layer is then laid on the frame over a soft shadow copy made from the layer itself by halving
+// it down and enlarging it again (bilinear smoothing does the blur; no ctx.filter, which cost 20-60 ms a shape).
+// o: soft (shadow blur px, default 7; 0 = none), depth (0 near .. 1 far: a wider, softer shadow)
+let WY_FIG = null;   // the open figure's screen bounding box (null = drawing straight on the frame)
+function wyGrow(P) {
+  const f = WY_FIG; if (!f) return;
+  const m = ctx.getTransform();
+  for (const [x, y] of P) {
+    const sx = m.a * x + m.c * y + m.e, sy = m.b * x + m.d * y + m.f;
+    if (sx < f.x0) f.x0 = sx; if (sx > f.x1) f.x1 = sx; if (sy < f.y0) f.y0 = sy; if (sy > f.y1) f.y1 = sy;
+  }
+}
+function wyFigure(fn, o = {}) {
+  if (WY_FIG) { fn(); return; }   // already inside a figure: part of the same leather
+  const main = ctx, T = main.getTransform(), z = Math.hypot(T.a, T.b) || 1, depth = o.depth ?? 0;
+  const cv = wyScratch('fig', W, H), g = cv.g;
+  const f = WY_FIG = { x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
+  g.save(); g.setTransform(T); ctx = g;
+  try { fn(); } finally { ctx = main; g.restore(); WY_FIG = null; }
+  const R = Math.max(0, (o.soft ?? 7) * (1 + depth * 1.6) * z), q = 16, pad = Math.ceil(R * 2.6 + 10 * z + 12);
+  if (f.x1 < f.x0) { f.x0 = 0; f.y0 = 0; f.x1 = W; f.y1 = H; }   // nothing reported its size: take the whole frame
+  const rx = Math.max(0, Math.floor((f.x0 - pad) / q) * q), ry = Math.max(0, Math.floor((f.y0 - pad) / q) * q);
+  const rw = Math.min(Math.ceil(W / q) * q, Math.ceil((f.x1 + pad) / q) * q) - rx, rh = Math.min(Math.ceil(H / q) * q, Math.ceil((f.y1 + pad) / q) * q) - ry;
+  if (rw <= 0 || rh <= 0) { g.clearRect(0, 0, W, H); return; }
+  main.save(); main.setTransform(1, 0, 0, 1, 0, 0);
+  const al = main.globalAlpha;
+  if (R > 0) {   // the soft copy: halve the layer down to 1/4, 1/8 or 1/16 and lay it back enlarged (no ctx.filter)
+    const n = R < 5 ? 4 : R < 13 ? 8 : 16;
+    let src = cv, sx = rx, sy = ry, sw = rw, sh = rh;
+    for (let d = 4; d <= n; d *= 2) {
+      const sm = wyScratch('soft' + d, Math.ceil(W / 4) + 8, Math.ceil(H / 4) + 8), sg = sm.g, dw = rw / d, dh = rh / d;   // all one size: tiny canvases leave the GPU path and every copy becomes a read-back
+      sg.clearRect(0, 0, dw + 4, dh + 4); sg.drawImage(src, sx, sy, sw, sh, 0, 0, dw, dh);
+      src = sm; sx = 0; sy = 0; sw = dw; sh = dh;
+    }
+    main.globalAlpha = al * 0.55; main.imageSmoothingEnabled = true;
+    main.drawImage(src, 0, 0, sw, sh, rx + 7 * z, ry + 5 * z, rw, rh);
+  }
+  main.globalAlpha = al; main.drawImage(cv, rx, ry, rw, rh, rx, ry, rw, rh);
+  main.restore();
+  g.clearRect(rx, ry, rw, rh);
+}
+
+// ---- a silhouette: a crisp fill with its cut-outs. P in current (local) coords. Called on its own it is a whole
+// figure (soft shadow + real holes); inside wyFigure(...) it adds a part to that figure.
+// o: key (cache the holes), col, soft (shadow blur px, 0 = none), depth (0 near .. 1 far: lighter, softer, holes only
+//    partly open), holes: false, rows, interior, step, scale, skip (no inner scales there), clear (no cut-outs at all
+//    there), sharp, light (paint the holes this colour instead)
+function wySil(P, o = {}) {
+  if (!WY_FIG) { wyFigure(() => wySil(P, o), { soft: o.soft, depth: o.depth }); return; }
+  const depth = o.depth ?? 0, col = o.col ?? (depth ? wyMix(WY.ink, WY.far, depth) : WY.ink);
+  wyGrow(P);
+  ctx.save(); wyTrace(P, true, o.sharp); ctx.fillStyle = col; ctx.fill(); ctx.restore();
+  if (o.holes !== false) wyDrawHoles(wyHoles(P, o), o.light ?? null, o.light ? 1 : 1 - depth * 0.3);
+}
+// a line (or, with fill, a shape) cut out of the figure being drawn: belts, folds, the tree of life, a doorway.
+// o: fill, closed, sharp, a (0..1 how open the cut is), light (paint in this colour instead of cutting).
+// Outside a figure there is nothing to cut, so it paints the screen's colour at that point (the old behaviour).
+function wyCut(P, w, o = {}) {
+  ctx.save(); ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (o.light) ctx.strokeStyle = o.light;
+  else if (WY_FIG) { ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; ctx.globalAlpha *= o.a ?? 1; }
+  else { const c = P[Math.floor(P.length / 2)], [sx, sy] = toScreen(c[0], c[1]); ctx.strokeStyle = wyLightAt(sx, sy); }
+  wyTrace(P, !!o.closed || !!o.fill, o.sharp);
+  if (o.fill) { ctx.fillStyle = ctx.strokeStyle; ctx.fill(); } else if (w > 0) ctx.stroke();
+  ctx.restore();
+}
+function wyCutDot(x, y, r, ry = r, rot = 0) {   // a round or almond cut (eyes, pins, studs); inside a figure only
+  ctx.save(); if (WY_FIG) ctx.globalCompositeOperation = 'destination-out'; else { const [sx, sy] = toScreen(x, y); ctx.fillStyle = wyLightAt(sx, sy); }
+  ctx.beginPath(); ctx.ellipse(x, y, r, ry, rot, 0, TAU); ctx.fill(); ctx.restore();
+}
+// a rod (tuding / gapit): a thin dark line running down into the stage. Inside a figure it shares the figure's shadow.
+function wyRod(x0, y0, x1, y1, w = 4) {
+  ctx.save(); ctx.lineCap = 'round';
+  if (WY_FIG) wyGrow([[x0, y0], [x1, y1]]);
+  else { ctx.strokeStyle = 'rgba(30,12,6,0.35)'; ctx.lineWidth = w * 2.2; ctx.beginPath(); ctx.moveTo(x0 + 5, y0 + 4); ctx.lineTo(x1 + 5, y1 + 4); ctx.stroke(); }
+  ctx.strokeStyle = WY.ink; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+  ctx.restore();
+}
+
+
+// ---- the gunungan / kayon: a tall pointed leaf on a gate, a tree of life cut through it
+const WY_GUN_PROFILE = [[0, 0], [0.06, 0.08], [0.15, 0.2], [0.26, 0.36], [0.37, 0.53], [0.45, 0.68], [0.5, 0.8], [0.5, 0.89], [0.45, 0.95], [0.38, 1.0]];
+function wyGunLocal(h) {   // base centre at (0,0), top at (0,-h)
+  const w = 0.62 * h, R = WY_GUN_PROFILE.map(([u, v]) => [u * w, -h + v * h]);
+  const L = R.slice().reverse().map(([x, y]) => [-x, y]);
+  return wyChaikin(R.concat(L.slice(0, -1)), 2);
+}
+function wyGununganPts(x, y, h, o = {}) {
+  const sx = o.turn ?? 1, a = o.tilt ?? 0, ca = Math.cos(a), sa = Math.sin(a);
+  return resample(wyGunLocal(h), true, h / 70).map(([px, py]) => { px *= sx; return [x + px * ca - py * sa, y + px * sa + py * ca]; });
+}
+function wyTreeOfLife(h) {   // cut lines in local coords
+  const lines = [], s = h / 1000;
+  lines.push([[0, -170 * s], [0, -860 * s]]);
+  for (let i = 0; i < 6; i++) {
+    const y0 = -(250 + i * 105) * s, reach = (230 - i * 32) * s;
+    for (const d of [-1, 1]) {
+      const P = [[0, y0]];
+      for (let k = 1; k <= 14; k++) { const u = k / 14; P.push([d * reach * Math.sin(u * 1.6), y0 - reach * 0.55 * u]); }
+      const [ex, ey] = P[P.length - 1], rr = reach * 0.16;   // curl at the tip
+      for (let k = 0; k <= 16; k++) { const a = -Math.PI / 2 + d * k / 16 * 1.8 * Math.PI, r = rr * (1 - k / 22); P.push([ex + d * rr * 0 + Math.cos(a) * r * d - d * 0, ey + rr + Math.sin(a) * r]); }
+      lines.push(P);
+    }
+  }
+  return lines;
+}
+// x, y: the base centre; h: height; o: turn (-1..1, its spin about the rod), tilt (radians), rod (true)
+function wyGunungan(x, y, h, o = {}) {
+  const turn = o.turn ?? 1, s = h / 1000, sx = Math.sign(turn || 1) * Math.max(0.035, Math.abs(turn));
+  const u = (L) => L.map(([a, b]) => [a * s, b * s]);
+  wyFigure(() => {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(o.tilt ?? 0);
+    if (o.rod !== false) wyRod(0, -60 * s, 0, 900, 7 * s);
+    ctx.scale(sx, 1);
+    wySil(wyGunLocal(h), { key: 'gun' + Math.round(h), scale: s * 1.6, step: 34, skip: (px, py) => Math.abs(px) < 60 * s || py > -250 * s });
+    wyCut(u([[-95, -10], [95, -10], [95, -120], [60, -150], [60, -175], [-60, -175], [-60, -150], [-95, -120]]), 0, { fill: true, sharp: true });   // the gateway
+    for (const d of [-1, 1]) wySil(u([[d * 6, -12], [d * 50, -12], [d * 50, -96], [d * 6, -110]]), { holes: false, sharp: true });   // the doors, a slit of light between
+    wySil(u([[-80, -130], [80, -130], [80, -144], [-80, -144]]), { holes: false, sharp: true });   // the lintel
+    for (const d of [-1, 1]) { wyCutDot(d * 28 * s, -60 * s, 4 * s); wyCut(u([[d * 150, -40], [d * 150, -120], [d * 128, -150]]), 5 * s); }   // door studs, the gate's wings
+    wyCut(u([[0, -196], [16, -216], [0, -236], [-16, -216]]), 0, { fill: true, sharp: true });   // a lozenge over the gate
+    for (const L of wyTreeOfLife(h)) wyCut(L, 9 * s);
+    wyCutDot(0, -900 * s, 6 * s);   // the bud at the tip
+    ctx.restore();
+  });
+}
+
+// ---- the hero: an original puppet in profile (a young villager, facing right), jointed arms on rods.
+// Drawn to the wayang kulit canon: a small head with a long nose and a narrow eye, a long neck, broad shoulders
+// turned to the viewer over a narrow waist, a wide stance with both feet pointing forward, a tail of cloth behind,
+// and thin arms long enough to reach the knees. He wears a plain headcloth knotted at the back (no crown, no
+// court hair-curl), so he is nobody from the epics or the punakawan.
+// local units: 1000 = its height, origin between its feet
+const WY_BODY = [[-10, -1000], [28, -990], [50, -964], [52, -934], [62, -906], [98, -872], [102, -866], [68, -856], [70, -843], [58, -833],
+  [66, -821], [50, -800], [28, -790], [26, -766], [60, -754], [94, -738], [88, -700], [72, -660], [48, -600], [30, -560],
+  [40, -535], [58, -500], [80, -420], [96, -340], [112, -230], [108, -120], [112, -50], [150, -34], [204, -14], [206, 0],
+  [78, 0], [80, -50], [72, -130], [62, -235], [10, -330], [-40, -235], [-62, -125], [-72, -50], [-40, -34], [8, -14],
+  [10, 0], [-112, 0], [-108, -50], [-112, -130], [-100, -235], [-96, -330], [-150, -300], [-190, -258], [-146, -362], [-112, -440],
+  [-70, -500], [-58, -535], [-30, -560], [-56, -620], [-88, -690], [-114, -736], [-84, -756], [-18, -770], [-22, -800], [-52, -830],
+  [-80, -852], [-106, -838], [-114, -872], [-88, -890], [-62, -896], [-56, -940], [-40, -982]];
+const WY_SHF = [70, -730], WY_SHB = [-92, -730];   // the shoulder pins, front and back
+function wyPuppetPts(x, y, s, face = 1) { const k = s / 1000; return WY_BODY.map(([a, b]) => [x + a * k * face, y + b * k]); }
+// one arm (inside the puppet's figure): shoulder point, upper-arm and forearm angles from straight down (+ = forward).
+// Returns where its rod is tied (the hand).
+function wyArm(sh, a1, a2, k) {
+  const L1 = 290 * k, L2 = 272 * k, d1 = [Math.sin(a1), Math.cos(a1)], d2 = [Math.sin(a2), Math.cos(a2)], n2 = [d2[1], -d2[0]];
+  const el = [sh[0] + d1[0] * L1, sh[1] + d1[1] * L1], ha = [el[0] + d2[0] * L2, el[1] + d2[1] * L2];
+  const limb = (p, q, w0, w1) => { const dx = q[0] - p[0], dy = q[1] - p[1], l = Math.hypot(dx, dy) || 1, nx = -dy / l, ny = dx / l; return [[p[0] + nx * w0, p[1] + ny * w0], [q[0] + nx * w1, q[1] + ny * w1], [q[0] - nx * w1, q[1] - ny * w1], [p[0] - nx * w0, p[1] - ny * w0]]; };
+  const at = (p, d, n, a, b) => [p[0] + d[0] * a * k + n[0] * b * k, p[1] + d[1] * a * k + n[1] * b * k];
+  const n1 = [d1[1], -d1[0]], am = at(sh, d1, n1, 86, 0);
+  const parts = [limb(sh, el, 14 * k, 10 * k), limb(el, ha, 10 * k, 7 * k),
+    [at(am, d1, n1, -20, 0), at(am, d1, n1, 0, 25), at(am, d1, n1, 20, 0), at(am, d1, n1, 0, -25)],                                  // the armlet
+    [at(ha, d2, n2, -6, -9), at(ha, d2, n2, 26, -11), at(ha, d2, n2, 58, -2), at(ha, d2, n2, 50, 15), at(ha, d2, n2, 34, 6), at(ha, d2, n2, 20, 22), at(ha, d2, n2, 2, 10)]];   // the hand: curled fingers, a thumb
+  for (const P of parts) wySil(P, { holes: false, sharp: true });
+  ctx.save(); ctx.fillStyle = WY.ink; ctx.beginPath();
+  for (const [p, r] of [[sh, 16], [el, 13], [at(ha, d2, n2, -14, 0), 12]]) { ctx.moveTo(p[0] + r * k, p[1]); ctx.arc(p[0], p[1], r * k, 0, TAU); }   // shoulder, elbow, bracelet
+  ctx.fill(); ctx.restore();
+  wyCutDot(el[0], el[1], 4 * k); wyCutDot(sh[0], sh[1], 4 * k); wyCutDot(am[0], am[1], 5 * k);   // the joint pins, the armlet's stone
+  return at(ha, d2, n2, 24, 2);
+}
+// x, y: between its feet; s: height. o: key, face (1 right / -1 left), walk (phase, radians; null = standing),
+// stop (the time it stopped walking: a small rock that dies away), reach (0..1: the front arm lifts to present),
+// wave (bool), pop (time it rises into view from the stage)
+function wyPuppet(x, y, s, o = {}) {
+  const key = o.key ?? 'hero', face = o.face ?? 1, k = s / 1000;
+  let bob = 0, rot = 0, swing = 0;
+  if (o.walk != null) { bob = -Math.abs(Math.sin(o.walk)) * 24 * k; rot = Math.sin(o.walk) * 0.035; swing = Math.sin(o.walk); }
+  else {
+    bob = Math.sin(TT * TAU * 0.5 + key.length) * 6 * k; rot = Math.sin(TT * TAU * 0.35) * 0.012;
+    if (o.stop != null && TT >= o.stop) { const dt = TT - o.stop; rot += 0.05 * Math.sin(dt * 10) * Math.exp(-dt * 4.5); }   // follow-through
+  }
+  if (o.pop != null) bob += (1 - EZ.o3(ev(o.pop, 0.5))) * s * 0.9;
+  const reach = clamp(o.reach ?? 0), wv = o.wave ? Math.sin(TT * TAU * 1.1) * 0.22 : 0;
+  const u = (L) => L.map(([a, b]) => [a * k, b * k]);
+  ctx.save(); ctx.translate(x, y + bob); ctx.rotate(rot); ctx.scale(face, 1);
+  wyFigure(() => {
+    // the back arm (behind the body), the body on its centre rod, its ornament, then the front arm
+    const hb = wyArm(u([WY_SHB])[0], -0.2 - swing * 0.22, -0.02 - swing * 0.3, k);
+    wyRod(hb[0], hb[1], hb[0] - 40 * k, 1200 * k + 400, 3);
+    wyRod(-4 * k, -420 * k, -4 * k, 1200 * k + 400, 6 * k);
+    wySil(u(WY_BODY), { key: 'wybody' + Math.round(s), scale: k * 1.25, interior: false, clear: (px, py) => py < -765 * k });   // the head stays solid
+    wyCut(u([[52, -950], [0, -941], [-56, -930]]), 5 * k);                        // the headcloth's band
+    wyCut(u([[-72, -884], [-100, -866]]), 4 * k);                                 // its knot
+    wyCut(u([[-14, -884], [-2, -872], [-14, -860], [-22, -872]]), 4 * k, { closed: true });   // an ear stud
+    const blink = (B + hash(key) % 29) % 37 < 1;
+    wyCutDot(60 * k, -894 * k, 19 * k, (blink ? 1.5 : 5) * k, 0.28);              // the narrow eye
+    wyCut(u([[-12, -742], [6, -712], [34, -706], [58, -728]]), 5 * k);            // a necklace
+    wyCutDot(22 * k, -690 * k, 5 * k);
+    wyCut(u([[-30, -556], [30, -556]]), 6 * k); wyCut(u([[-50, -526], [46, -526]]), 4 * k);   // the sash
+    wyCut(u([[8, -500], [34, -410], [58, -330]]), 4 * k);                         // the kain's folds
+    wyCut(u([[-22, -500], [-42, -420], [-70, -350]]), 4 * k);
+    wyCut(u([[-104, -340], [-150, -292]]), 4 * k);                                // the tail of cloth
+    const a1 = lerp(0.22 + swing * 0.3, 2.12, reach) + wv, a2 = lerp(0.6 + swing * 0.3, 1.92, reach) + wv * 1.6;
+    const hf = wyArm(u([WY_SHF])[0], a1, a2, k);
+    wyRod(hf[0], hf[1], hf[0] + 60 * k + reach * 90 * k, 1200 * k + 400, 3);
+  });
+  ctx.restore();
+  if (typeof SPARK_AT !== 'undefined') SPARK_AT = toScreen(x, y + bob - s * 0.8);
+}
+
+
+// ---- scenery
+function wyMountainPts(x, y, w, h, key = 'mt') {   // base centre x, base y
+  const R = RNG('wymt', key), P = [[x - w * 0.56, y + h * 0.2]];   // the foot runs on below the stage line, so the corner rounding happens out of sight
+  const n = 9;
+  for (let i = 1; i < n; i++) { const u = i / n, peak = 1 - Math.abs(u - 0.5) * 2; P.push([x - w / 2 + u * w + R.n(w * 0.02), y - h * (peak ** 0.9) * (0.92 + 0.08 * Math.cos(u * 25)) + (i === n / 2 ? 0 : R.n(h * 0.03))]); }
+  P.push([x + w * 0.56, y + h * 0.2]);
+  return resample(wyChaikin(P, 1), true, 24);
+}
+function wyMountain(x, y, w, h, o = {}) {
+  const P = wyMountainPts(x, y, w, h, o.key);
+  wySil(P, { depth: o.depth ?? 0.6, key: 'mtn' + (o.key ?? 'mt') + w, scale: 1.6, step: 50 });
+}
+// a tree: trunk + lobed canopy, swaying about its base
+function wyTree(x, y, h, o = {}) {
+  const key = o.key ?? 'tree', s = h / 600, R = RNG('wytree', key), depth = o.depth ?? 0;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(Math.sin(TT * TAU * 0.4 + R.r(0, 6)) * 0.03 + (o.tilt ?? 0));
+  const cy = -h * 0.62, rx = h * 0.34, ry = h * 0.36, n = 9, C = [];
+  for (let i = 0; i < 72; i++) { const a = i / 72 * TAU, b = 1 + 0.12 * Math.abs(Math.sin(a * n / 2)); C.push([Math.cos(a) * rx * b, cy + Math.sin(a) * ry * b]); }
+  const trunk = [[-14 * s, 0], [14 * s, 0], [10 * s, cy + ry * 0.5], [40 * s, cy], [-36 * s, cy], [-10 * s, cy + ry * 0.5]];
+  wyFigure(() => {
+    wyRod(0, -10, 0, 900, 4);
+    wySil(trunk, { holes: false, depth });
+    wySil(C, { key: 'tree' + key + h, scale: s * 1.4, step: 30, depth });
+  }, { depth });
+  ctx.restore();
+}
+// a joglo house: stepped roof, posts, a door. Its door, windows and ornament are lit from inside (o.lit, default true):
+// they are painted in the screen's bright colour instead of being cut, so they glow even in front of dark scenery.
+function wyHouse(x, y, w, o = {}) {
+  const s = w / 300, depth = o.depth ?? 0;
+  const lit = o.lit === false ? undefined : wyLightAt(...toScreen(x, y - 110 * s));
+  ctx.save(); ctx.translate(x, y);
+  wyFigure(() => {
+    ctx.save(); ctx.scale(s, s);
+    wySil([[-120, -150], [120, -150], [120, 0], [-120, 0]], { key: 'wyhouseb', scale: 1.2, rows: 1, interior: false, depth, sharp: true, light: lit });
+    wySil([[-150, -150], [-95, -210], [-45, -215], [-25, -290], [25, -290], [45, -215], [95, -210], [150, -150]], { key: 'wyhouser', scale: 1.2, rows: 1, interior: false, depth, sharp: true, light: lit });
+    wyCut([[-30, 0], [30, 0], [30, -100], [-30, -100]], 0, { fill: true, sharp: true, light: lit });
+    const col = depth ? wyMix(WY.ink, WY.far, depth) : WY.ink;
+    for (const sx of [-1, 1]) { wyCut([[sx * 95, -110], [sx * 60, -110], [sx * 60, -70], [sx * 95, -70]], 0, { fill: true, sharp: true, light: lit }); wyCut([[sx * 77.5, -110], [sx * 77.5, -70]], 3, { sharp: true, light: col }); }
+    wyCut([[-140, -165], [140, -165]], 5, { light: lit }); wyCut([[-30, -240], [30, -240]], 4, { light: lit });
+    ctx.restore();
+  }, { depth });
+  ctx.restore();
+}
+// a bird flapping on 2s
+function wyBird(x, y, s, ph = 0) {
+  const f = Math.sin(TT * TAU * 2.2 + ph), k = s / 100;
+  const P = [[-56, -10], [-40, -4], [-18, -8], [-12, -9], [-26, -10 - 56 * f], [-4, -10 - 30 * f], [18, -11], [34, -13], [56, -8], [38, -3], [14, 6], [-20, 4], [-40, 2], [-58, 6]].map(([a, b]) => [x + a * k, y + b * k]);
+  wySil(P, { holes: false, soft: 4, sharp: true });
+}
+// dust in the lamp's beam, drifting up
+function wyMotes(n = 26, key = 'motes') {
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (let i = 0; i < n; i++) {
+    const R = RNG('wymote', key, i), x0 = R.r(140, 940), sp = R.r(30, 70), y = 1500 - mod(R.r(0, 1100) + TT * sp, 1100);
+    const x = x0 + Math.sin(TT * R.r(0.5, 1.2) + i) * 18, d = Math.hypot(x - WY_LAMP[0], y - WY_LAMP[1]) / 700;
+    ctx.fillStyle = `rgba(255,236,190,${(clamp(1 - d) * R.r(0.35, 0.8)).toFixed(3)})`;
+    ctx.beginPath(); ctx.arc(x, y, R.r(1.6, 3.6), 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---- type: an ornamental line, a tag, captions (through DEFER, at screen size)
+function wyLeaving() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.3)); }
+  return 1;
+}
+function wyOrnament(x, y, half, frac, col = WY.gold) {   // a gold rule with a lozenge in the middle and curls at the ends
+  if (frac <= 0) return;
+  const L = half * EZ.o3(frac);
+  ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.shadowColor = 'rgba(30,8,2,0.55)'; ctx.shadowBlur = 8;
+  for (const d of [-1, 1]) {
+    ctx.beginPath(); ctx.moveTo(x + d * 26, y); ctx.lineTo(x + d * L, y); ctx.stroke();
+    if (frac > 0.7) { ctx.beginPath(); ctx.arc(x + d * (L + 0), y - 9, 9, d > 0 ? Math.PI / 2 : Math.PI / 2, d > 0 ? Math.PI / 2 + 4.5 : Math.PI / 2 - 4.5, d < 0); ctx.stroke(); }
+    ctx.beginPath(); ctx.arc(x + d * L * 0.55, y, 3.5, 0, TAU); ctx.fill();
+  }
+  ctx.beginPath(); ctx.moveTo(x, y - 14); ctx.lineTo(x + 14, y); ctx.lineTo(x, y + 14); ctx.lineTo(x - 14, y); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function wyTextLine(str, x, y, size, col, o = {}) {
+  ctx.save(); ctx.font = `${o.italic === false ? '' : 'italic '}${o.weight ?? 600} ${size}px ${WY_SERIF}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const w = ctx.measureText(str).width, fr = clamp(o.frac ?? 1);
+  if (fr < 1) { ctx.beginPath(); ctx.rect(x - w / 2 - 20, y - size * 1.3, (w + 40) * fr, size * 1.9); ctx.clip(); }
+  ctx.shadowColor = 'rgba(28,8,2,0.75)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 4;
+  if (o.spacing && 'letterSpacing' in ctx) ctx.letterSpacing = o.spacing + 'px';
+  ctx.fillStyle = col; ctx.fillText(str, x, y);
+  ctx.restore(); return w;
+}
+function wyCaptionNow(str, o = {}) {
+  const al = wyLeaving(); if (al <= 0.001) return;
+  const lines = str.split('\n'), size = o.size ?? 78, y0 = o.y ?? 400, at = o.at ?? E0 + 0.15;
+  ctx.save(); ctx.globalAlpha = al;
+  lines.forEach((ln, i) => wyTextLine(ln, CX, y0 + i * size * 1.12, size, WY.cream, { frac: ev(at + i * 0.3, 0.5) }));
+  wyOrnament(CX, y0 + (lines.length - 1) * size * 1.12 + 46, 230, ev(at + 0.2, 0.7));
+  ctx.restore();
+}
+function wyTagNow(label, o = {}) {
+  const al = wyLeaving(); if (al <= 0.001) return;
+  const y = o.y ?? 300, fr = ev(E0 + 0.1, 0.5);
+  ctx.save(); ctx.globalAlpha = al * EZ.o2(fr);
+  wyTextLine(label, CX, y, 34, WY.gold, { italic: false, weight: 700, spacing: 8 });
+  ctx.restore();
+}
+const wyCaption = (str, o = {}) => { const f = () => wyCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const wyTag = (label, o = {}) => { const f = () => wyTagNow(label, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---- the frame's fixed furniture, drawn after everything: the stage (gedebog), the screen's top border, the flicker
+let WY_FURN = null, WY_FURN_Y = -1;
+function wyFurniture() {   // the stage band and the top border never change: drawn once (again if the stage line moves)
+  if (WY_FURN && WY_FURN_Y === WY_STAGE) return WY_FURN;
+  const cv = WY_FURN || document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g0 = cv.getContext('2d'), y = WY_STAGE;
+  const g = g0.createLinearGradient(0, y, 0, H); g.addColorStop(0, '#2a1209'); g.addColorStop(0.08, WY.stage); g.addColorStop(1, '#070301');
+  g0.fillStyle = g; g0.fillRect(0, y, W, H - y);
+  g0.fillStyle = WY.stageL; g0.fillRect(0, y, W, 5);
+  const R = RNG('wygedebog');   // the banana trunk's fibres
+  g0.lineWidth = 1.5;
+  for (let i = 0; i < 26; i++) { const yy = y + 14 + R.r(0, 130); g0.strokeStyle = `rgba(90,45,20,${R.r(0.15, 0.4)})`; g0.beginPath(); g0.moveTo(R.r(-50, W * 0.6), yy); g0.lineTo(R.r(W * 0.4, W + 50), yy + R.n(3)); g0.stroke(); }
+  // the top border (plisir): a dark red band with a scalloped edge
+  const top = 120;
+  g0.fillStyle = WY.red; g0.beginPath(); g0.moveTo(0, 0); g0.lineTo(W, 0); g0.lineTo(W, top);
+  for (let x = W; x >= 0; x -= 60) g0.quadraticCurveTo(x - 30, top + 26, x - 60, top);
+  g0.closePath(); g0.fill();
+  g0.fillStyle = 'rgba(10,3,1,0.6)'; g0.fillRect(0, 0, W, top - 30);
+  g0.strokeStyle = WY.goldD; g0.lineWidth = 2; g0.beginPath(); g0.moveTo(0, top - 22); g0.lineTo(W, top - 22); g0.stroke();
+  WY_FURN = cv; WY_FURN_Y = y; return cv;
+}
+function wyStage() {
+  const y = WY_STAGE, cv = wyFurniture();
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(cv, 0, 0, W, 150, 0, 0, W, 150); ctx.drawImage(cv, 0, y, W, H - y, 0, y, W, H - y);
+  // the lamp's flicker: a faint darkening pass over the whole frame
+  const fk = wyFlick();
+  ctx.fillStyle = `rgba(20,5,2,${(0.035 + 0.03 * fk).toFixed(3)})`; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks
+// =====================================================================
+const STYLE = {
+  name: 'wayang',
+  paper: WY.paper,
+  backdrop(c) { wyScreenFill(c); },
+  // the world seen through a hole cut in leather: the scene clipped to P, a dark perforated rim around it
+  window(P, key, src, o = {}) {
+    const c = wyCentroid(P);
+    const rAvg = P.reduce((a, p) => a + Math.hypot(p[0] - c[0], p[1] - c[1]), 0) / P.length || 1;
+    const out = P.map(([x, y]) => [c[0] + (x - c[0]) * (1 + 40 / rAvg), c[1] + (y - c[1]) * (1 + 40 / rAvg)]);
+    ctx.save(); trace(P, true); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    wyFigure(() => {   // the rim: out minus P (even-odd), a row of real holes around it
+      wyGrow(out);
+      ctx.save(); ctx.beginPath();
+      const addPath = (Q) => { const n = Q.length; ctx.moveTo((Q[n - 1][0] + Q[0][0]) / 2, (Q[n - 1][1] + Q[0][1]) / 2); for (let i = 0; i < n; i++) { const p = Q[i], q = Q[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); } ctx.closePath(); };
+      addPath(out); addPath(P); ctx.fillStyle = WY.ink; ctx.fill('evenodd');
+      ctx.globalCompositeOperation = 'destination-out'; ctx.beginPath();
+      for (const q of resample(P, true, 22)) { const dx = q[0] - c[0], dy = q[1] - c[1], l = Math.hypot(dx, dy) || 1, hx = q[0] + dx / l * 20, hy = q[1] + dy / l * 20; ctx.moveTo(hx + 3.6, hy); ctx.arc(hx, hy, 3.6, 0, TAU); }
+      ctx.fill(); ctx.restore();
+    }, { soft: 8 });
+  },
+  // the morphing shape: a dark perforated silhouette
+  blob(P, c) { wySil(P, { col: c, scale: 1.5, step: 34 }); },
+  hero(x, y, r, o = {}) { wyPuppet(x, y + r, r * 2, { key: o.key }); },
+  heroColor: WY.ink,
+  heroPts(x, y, r) { return wyPuppetPts(x, y + r, r * 2); },
+  post() { wyStage(); },
+  ones: false,
+};
+// =====================================================================
+//  SCENES — wayang demo. World units = px at zoom 1; motion on 2s. Everything stands on the stage line
+//  (WY_STAGE, 1530); the stage band, the top border and the flicker are drawn by STYLE.post.
+// =====================================================================
+const cu = TIMELINE.cues;
+const GUN = { x: 540, x2: 715, h: 900 };
+const MTN = { x: 540, w: 1000, h: 880 };
+const HERO_S = 740;
+
+// ---- era 1: the opening — the gunungan spins on its rod and steps aside; the puppet walks in and presents it
+function sceneOpen() {
+  wyScreen(WY.amber);
+  wyMotes(28, 'open');
+  const x = springMove(cu.aside, GUN.x, GUN.x2, SPRING.heavy);
+  const spin = EZ.io(seg(TT, cu.spin, cu.spin + 1.1)) * TAU;
+  const dt = TT - cu.aside, tilt = dt > 0 ? 0.11 * Math.sin(dt * 7) * Math.exp(-dt * 1.8) * (1 - ev(2.6, 0.35)) : 0;
+  wyGunungan(x, WY_STAGE, GUN.h, { turn: Math.cos(spin), tilt });
+  const walking = TT >= cu.walk && TT < cu.stop;
+  const hx = lerp(-320, 200, EZ.o2(seg(TT, cu.walk, cu.stop)));
+  wyPuppet(hx, WY_STAGE, HERO_S, { key: 'hero', walk: walking ? (TT - cu.walk) * TAU * 1.5 : null, stop: cu.stop, reach: EZ.o2(ev(cu.present, 0.4)) });
+  wyTag('BABAK I');
+  wyCaption('Pada zaman\ndahulu kala…');
+}
+
+// ---- era 2: the village at the foot of the mountain
+const rise = (t0) => (1 - EZ.o3(ev(t0, 0.5))) * 760;
+function sceneVillage() {
+  wyScreen(WY.dusk);
+  wyMotes(28, 'village');
+  wyMountain(880, WY_STAGE, 620, 560, { key: 'back', depth: 1 });
+  wyMountain(MTN.x, WY_STAGE, MTN.w, MTN.h, { key: 'main', depth: 0.85 });
+  for (let i = 0; i < 3; i++) {
+    const t0 = cu.birds + i * 0.18, bx = 1160 - (TT - t0) * 300 - i * 30, by = 720 + i * 60 + Math.sin(TT * 3 + i) * 12;
+    if (TT > t0) wyBird(bx, by, 70 - i * 10, i * 1.3);
+  }
+  wyHouse(690, WY_STAGE + rise(cu.house), 330, { depth: 0.25 });
+  wyTree(70, WY_STAGE + rise(cu.trees), 430, { key: 'left', depth: 0.4 });
+  wyTree(1020, WY_STAGE + rise(cu.trees + 0.12), 600, { key: 'right', depth: 0.3 });
+  const walking = TT >= cu.walk2 && TT < cu.stop2;
+  const hx = lerp(-320, 290, EZ.o2(seg(TT, cu.walk2, cu.stop2)));
+  wyPuppet(hx, WY_STAGE, HERO_S, { key: 'hero', walk: walking ? (TT - cu.walk2) * TAU * 1.5 : null, stop: cu.stop2, wave: TT > cu.wave, reach: 0.55 * EZ.o2(ev(cu.wave, 0.3)) });
+  wyTag('BABAK II');
+  wyCaption('di sebuah desa\ndi kaki gunung');
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — wayang demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [WY.amber, WY.dusk];
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.3, 2.7, { z: 1.035, p: [540, WY_STAGE], to: [540, WY_STAGE] });
+  const z = springMove(3.0, 1.06, 1.0, { k: 22, d: 9.5 });
+  return camOf({ z, p: [540, WY_STAGE], to: [540, WY_STAGE] });
+}
+const BRIDGES = [
+  // the gunungan (a tall pointed leaf) -> the mountain (a broad peak): both pointed tops on a flat base
+  { tc: 3.0,
+    A: () => ({ P: wyGununganPts(GUN.x2, WY_STAGE, GUN.h), c: WY.ink }),
+    B: () => ({ P: wyMountainPts(MTN.x, WY_STAGE, MTN.w, MTN.h, 'main'), c: WY.far }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — wayang demo (inside buildScore(); see kit/score-head.js). A gamelan-like texture in a slendro-like
+  // five-note scale (five equal ~240-cent steps, so nothing here is tuned to the piano): saron on the beat (the
+  // balungan), bonang twice as fast an octave up, kenong every 4 beats, a kendang pattern with a roll into the morph,
+  // kecrek clicks, and a gong (a low beating pair, no pitch drop) on the first beat and on the morph.
+  const T = TIMELINE, q = T.cues;
+  const SL = (deg, oct = 0) => 293.66 * 2 ** (oct + deg * 240 / 1200);   // slendro-like: five ~240-cent steps
+  const gong = (t, vel) => {
+    to = 'm';
+    const f = SL(0, -2);   // ~73 Hz
+    drone(t, t + 3.0, f, vel * 0.55, { att: 0.012, rel: 2.6 }); drone(t, t + 2.9, f * 1.021, vel * 0.4, { att: 0.012, rel: 2.5 });   // the beating pair (ombak, ~1.5 Hz)
+    drone(t, t + 2.2, f * 2, vel * 0.22, { att: 0.01, rel: 2.0 });                                                                 // the octave, so a phone speaker still has a gong
+    noiseHit(t, 0.09, 'lowpass', 320, 0.7, vel * 0.5);                                                                             // the padded mallet
+    chime(t, [SL(0, -1), SL(2, -1) * 1.003], vel * 0.4, 0);
+  };
+  to = 'm';
+  drone(0.0, 6.05, SL(0, -1), 0.01, { att: 0.6, rel: 0.5 }); drone(0.0, 6.05, SL(3, -1), 0.007, { att: 0.6, rel: 0.5 });   // a quiet bed on the scale's own 1 and 4
+  const balungan = [2, 1, 2, 3, 5, 3, 2, 1, 2, 3, 2, 0];                   // one note a beat
+  balungan.forEach((d, i) => pluck(i * BEAT, SL(d), 0.11, -0.2, 0.55, 2600, 0.35));
+  for (let i = 0; i < 24; i++) { const d = balungan[Math.floor(i / 2)]; pluck(i * E8 + 0.01, SL((d + (i % 2 ? 2 : 0)) % 5, 1), 0.045, 0.35, 0.3, 4200, 0.25); }   // bonang
+  for (let i = 1; i < 6; i += 2) chime(i * BEAT * 2 - BEAT, [SL(3, -1), SL(3, 0)], 0.05, -0.1);   // kenong
+  gong(0.0, 0.16); gong(3.0, 0.2);
+  // kendang: 'd' = dung (a low pitched skin), 't' = tak (a dry slap), one character an 8th; a roll of 16ths into the morph
+  to = 'm';
+  const dung = (t, v) => { blip(t, 175, 108, 0.13, v, -0.12); noiseHit(t, 0.03, 'lowpass', 520, 0.7, v * 0.4, -0.12); };
+  const tak = (t, v) => noiseHit(t, 0.035, 'bandpass', 1500, 3, v, 0.18);
+  'd.t.d.ttd.t.d.t.d.ttd.t.d.t.d.tt'.slice(0, 24).split('').forEach((ch, i) => { if (ch === 'd') dung(i * E8, i === 12 ? 0.05 : 0.075); else if (ch === 't') tak(i * E8, 0.035); });
+  for (let k = 0; k < 4; k++) tak(2.5 + k * E16, 0.02 + k * 0.008);
+  to = 's';
+  for (let i = 0; i < 24; i++) if (i % 4 === 3) noiseHit(i * E8, 0.05, 'highpass', 5200, 0.8, 0.03, 0.4, 0.1);   // kecrek
+  noiseHit(q.spin, 0.9, 'bandpass', 900, 0.8, 0.02, 0, 0.4, 2400);                       // the gunungan's whoosh
+  // puppet steps, on the landings of its hops (3 a second: see wyPuppet's walk phase in scenes.js)
+  for (let t = q.walk + 1 / 3; t < q.stop + 0.05; t += 1 / 3) noiseHit(t, 0.06, 'bandpass', 420, 2, 0.05, -0.3);
+  sweep(2.5, 3.0, 0.012, 400, 2200, 0);
+  for (let t = q.walk2 + 1 / 3; t < q.stop2 + 0.05; t += 1 / 3) noiseHit(t, 0.06, 'bandpass', 420, 2, 0.05, -0.3);
+  blip(q.house, 300, 500, 0.12, 0.03, 0.3);
+  for (let i = 0; i < 3; i++) blip(q.birds + 0.1 + i * 0.18, 2600, 3400, 0.05, 0.015, 0.4 - i * 0.2);
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

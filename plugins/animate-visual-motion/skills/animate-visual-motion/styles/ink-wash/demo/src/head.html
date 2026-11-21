@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ink wash demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1714; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  INK WASH DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On bare rice paper a pale moon soaks in and mountains are brushed
+//  on, range by range, out of drifting mist; Bangau, a red-crowned crane, flies in across them, looking for a
+//  place to rest. At 3.0s the moon becomes a round pond: bamboo is brushed in joint by joint, the crane glides
+//  down and lands in the water, a leaf falls, and the crane bows to look at it.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/ink-wash/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneGunung()], [3, 6, () => sceneKolam()]];
+const SHOTS = [
+  ['gunung', 0, 0.0, 3.0, 'a moon soaks in, mountains are brushed on out of mist, the crane flies in across them'],
+  ['kolam',  1, 3.0, 6.0, 'the moon becomes a pond; bamboo is brushed in, the crane lands, a leaf falls, the crane bows to it'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { moon: 0.0, ridge: 0.5, fly: 1.0, cliff: 1.0, pine: 1.5, flap2: 2.0, bambu: 3.5, glide: 3.75, land: 4.5, leaf: 4.75, plop: 5.5 },
+  acts: [
+    { name: '1 Gunung', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Kolam',  role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'the crane flies far', sound: 'a low drone, sparse koto plucks, brush on paper, slow wings', next: 'the moon becomes a pond' },
+    { t: 5.5, title: 'and rests at the pond', sound: 'a warmer chord, plucks, a splash, a water drop', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

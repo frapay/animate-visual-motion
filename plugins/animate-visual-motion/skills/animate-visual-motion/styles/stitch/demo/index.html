@@ -1,0 +1,1524 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitch demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a1d16; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  STITCH DEMO — 9:16, 6.0s @ 60 BPM (two bars of three, triplet feel), 24fps. Linen in a wooden hoop: a chain-stitch
+//  wreath sews itself, a felt heart drops on and a needle sews it down with 22 blanket stitches, one per step; daisies
+//  and sequins come out. At 3.0s the heart morphs into a felt house on denim: a cross-stitch border runs round the
+//  cloth, a button sun gets its rays, chimney smoke rises in French knots and Beru the felt bear waves.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/stitch/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 60, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4, T3 = BEAT / 3, T6 = BEAT / 6, T12 = BEAT / 12;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneJahit()], [3, 6, () => sceneRumah()]];
+const SHOTS = [
+  ['jahit', 0, 0.0, 3.0, 'linen in a hoop: a wreath sews itself, a felt heart drops on and a needle blanket-stitches it down'],
+  ['rumah', 1, 3.0, 6.0, 'the heart becomes a felt house on denim: cross-stitch border, button sun, the felt bear waves'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 1/12s grid (a 2s step = a triplet 32nd at 60 BPM), so stitches land with the score
+  cues: { wreath: -1.0, drop: -2 * T12, sew: 3 * T12, flower: 2 * T3, knots: 1.5, spark: 25 * T12, border: 3.0, bear: 3.5, sun: 3 + 2 * T3, stars: 4.0 },
+  acts: [
+    { name: '1 Jahit', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Rumah', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.6, title: 'the needle sews the felt heart down', sound: 'music box waltz, needle ticks', next: 'the heart becomes a house' },
+    { t: 5.2, title: 'the felt bear waves by its house', sound: 'the waltz an octave up, twinkles', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/stitch/kit.js — STITCH: hand embroidery and felt appliqué on woven cloth. Shapes are felt patches (flat,
+//  fuzzy-edged, a soft shadow) sewn down with blanket or running stitch; lines are thread, drawn stitch by stitch:
+//  running, back, chain, blanket, cross, satin fill, French knots; buttons and sequins are the accents. The ground
+//  is natural linen (optionally stretched in a wooden hoop) or deep denim. Letters are embroidered (satin threads
+//  clipped to the glyphs, a stitched outline) and captions sit on a sewn-on fabric label. The hero is Beru, a felt
+//  plush bear with button eyes. Motion on 2s: stitches land one per step, patches drop on and then get sewn down;
+//  nothing boils (stitch positions are seeded by path), the cloth only breathes a little (post).
+//  Built on kit/core.js. Helpers are prefixed stc…; the palette is STC. Needs from the piece head: CX (caption centre x).
+// =====================================================================
+const STC = {
+  linen: '#e2d3b5', linenD: '#c7b48f', denim: '#22344f', denimD: '#16233a', sageCloth: '#93a685',   // grounds
+  brick: '#b5482f', mustard: '#d9a531', sage: '#8aa37b', sageD: '#5f7a55', pink: '#d99a9c', cream: '#f4ead2', teal: '#3d8c8a', tealD: '#2a6462',
+  bear: '#c47a3e', ink: '#3a2a22', wood: '#d2a56c', woodD: '#a67842', brass: '#c9a24a', steel: '#cfd4d8',
+};
+STC.paper = STC.sageCloth;
+const STC_FONT = '"Arial Rounded MT Bold", "Varela Round", Nunito, "Segoe UI", "Trebuchet MS", "DejaVu Sans", "Noto Sans", Arial, sans-serif';
+
+// ---------------------------------------------------------------------
+//  basics: paths, area, offsets, shades of a colour (hex or rgb()), a cache for static layers (keyed, seeded)
+// ---------------------------------------------------------------------
+function stcPath(P, closed) { ctx.beginPath(); for (let i = 0; i < P.length; i++) { if (i) ctx.lineTo(P[i][0], P[i][1]); else ctx.moveTo(P[i][0], P[i][1]); } if (closed) ctx.closePath(); }
+const stcCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+function stcArea(P) { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a[0] * b[1] - b[0] * a[1]; } return s / 2; }   // > 0 = clockwise on screen
+// a closed outline moved d px toward its inside (d < 0: outward)
+function stcOffset(P, d) {
+  const n = P.length, s = stcArea(P) >= 0 ? 1 : -1;
+  return P.map((p, i) => { const a = P[(i - 1 + n) % n], b = P[(i + 1) % n], tx = b[0] - a[0], ty = b[1] - a[1], l = Math.hypot(tx, ty) || 1; return [p[0] - ty / l * d * s, p[1] + tx / l * d * s]; });
+}
+const STC_SHADES = new Map();
+function stcRGB(c) { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); const m = c.match(/[\d.]+/g); return m ? m.slice(0, 3).map(Number) : [128, 128, 128]; }
+// k > 0 lightens toward warm white, k < 0 darkens toward dark brown
+function stcShade(c, k) {
+  const id = c + '|' + k; let v = STC_SHADES.get(id); if (v) return v;
+  const a = stcRGB(c), t = k > 0 ? [255, 248, 232] : [26, 15, 10], u = Math.abs(k);
+  v = `rgb(${a.map((x, i) => Math.round(lerp(x, t[i], u))).join(',')})`; STC_SHADES.set(id, v); return v;
+}
+const STC_CACHE = {};
+function stcCache(key, w, h, draw) {
+  if (STC_CACHE[key]) return STC_CACHE[key];
+  const cv = document.createElement('canvas'); cv.width = Math.ceil(w); cv.height = Math.ceil(h);
+  const keep = ctx; ctx = cv.getContext('2d'); try { draw(); } finally { ctx = keep; }
+  return (STC_CACHE[key] = cv);
+}
+// one stitch lands every 1/rate s from t0: the fraction of n stitches done (a steady rhythm on 2s)
+const stcStep = (t0, n, rate = 12) => (TT < t0 - 1e-6 ? 0 : clamp((Math.floor((TT - t0) * rate + 1e-6) + 1) / n));
+
+// ---------------------------------------------------------------------
+//  cloth: the weave (warp and weft threads, slubs, a soft mottle) is one cached neutral layer laid over any ground
+//  colour, in world coords (it moves with the camera). stcCloth(c) accepts hex or rgb().
+// ---------------------------------------------------------------------
+const STC_M = 200;   // the cloth reaches this far past the frame on every side
+function stcWeave() {
+  return stcCache('weave', W + STC_M * 2, H + STC_M * 2, () => {
+    const R = RNG('stcweave'), w = W + STC_M * 2, h = H + STC_M * 2;
+    for (let i = 0; i < 26; i++) { const x = R.r(0, w), y = R.r(0, h), r = R.r(180, 480), g = ctx.createRadialGradient(x, y, 0, x, y, r), d = i % 2; g.addColorStop(0, d ? 'rgba(30,18,8,0.07)' : 'rgba(255,246,224,0.07)'); g.addColorStop(1, d ? 'rgba(30,18,8,0)' : 'rgba(255,246,224,0)'); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2); }
+    ctx.lineWidth = 2;
+    for (let y = 1; y < h; y += 5) { ctx.strokeStyle = `rgba(28,16,8,${R.r(0.05, 0.16).toFixed(3)})`; ctx.beginPath(); ctx.moveTo(0, y + R.n(0.5)); ctx.lineTo(w, y + R.n(0.5)); ctx.stroke(); }   // weft
+    for (let x = 1; x < w; x += 5) { ctx.strokeStyle = `rgba(255,246,224,${R.r(0.05, 0.15).toFixed(3)})`; ctx.beginPath(); ctx.moveTo(x + R.n(0.5), 0); ctx.lineTo(x + R.n(0.5), h); ctx.stroke(); }   // warp
+    ctx.fillStyle = 'rgba(28,16,8,0.085)'; for (let y = 0; y < h; y += 5) for (let x = (y / 5 % 2) * 5; x < w; x += 10) ctx.fillRect(x + 3, y + 3, 2.4, 2.4);   // the holes of a plain weave
+    for (let i = 0; i < 420; i++) { const d = i % 3 === 0; ctx.fillStyle = d ? `rgba(28,16,8,${R.r(0.05, 0.12).toFixed(3)})` : `rgba(255,246,224,${R.r(0.06, 0.15).toFixed(3)})`; if (i % 2) ctx.fillRect(R.r(0, w), R.r(0, h), R.r(18, 90), 2); else ctx.fillRect(R.r(0, w), R.r(0, h), 2, R.r(18, 90)); }   // slubs
+  });
+}
+function stcCloth(c = STC.linen) { ctx.save(); ctx.fillStyle = c; ctx.fillRect(-STC_M, -STC_M, W + STC_M * 2, H + STC_M * 2); ctx.drawImage(stcWeave(), -STC_M, -STC_M); ctx.restore(); }
+// felt fibres: a seamless tile of short pale and dark hairs, used as a pattern over a patch's flat colour
+function stcFibre() {
+  if (STC_CACHE.fibrePat) return STC_CACHE.fibrePat;
+  const S = 180, cv = stcCache('fibre', S, S, () => {
+    const R = RNG('stcfibre'); ctx.lineCap = 'round';
+    for (let i = 0; i < 1500; i++) {
+      const x = R.r(0, S), y = R.r(0, S), a = R.r(0, TAU), l = R.r(3, 10); ctx.lineWidth = R.r(0.7, 1.5);
+      ctx.strokeStyle = i % 2 ? `rgba(255,248,232,${R.r(0.05, 0.16).toFixed(3)})` : `rgba(26,15,10,${R.r(0.04, 0.12).toFixed(3)})`;
+      for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) { ctx.beginPath(); ctx.moveTo(x + ox, y + oy); ctx.lineTo(x + ox + Math.cos(a) * l, y + oy + Math.sin(a) * l); ctx.stroke(); }
+    }
+  });
+  return (STC_CACHE.fibrePat = ctx.createPattern(cv, 'repeat'));
+}
+
+// ---------------------------------------------------------------------
+//  THREAD. stcThread draws a batch of stitches so each sits on top of the cloth: a shadow down-right, the thread,
+//  a short highlight up-left. A stitch is [x0, y0, x1, y1], a loop [cx, cy, rx, ry, angle] (chain link, petal) or a
+//  polyline [[x, y], ...] (an edge stitch that follows its outline round a corner).
+// ---------------------------------------------------------------------
+function stcThread(S, c, w) {
+  if (!S.length) return;
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const pass = (dx, dy, col, lw, k) => {
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+    for (const s of S) {
+      if (Array.isArray(s[0])) { s.forEach((q, i) => (i ? ctx.lineTo(q[0] + dx, q[1] + dy) : ctx.moveTo(q[0] + dx, q[1] + dy))); continue; }   // a stitch that bends round a corner
+      if (s.length === 5) { ctx.moveTo(s[0] + dx + Math.cos(s[4]) * s[2], s[1] + dy + Math.sin(s[4]) * s[2]); ctx.ellipse(s[0] + dx, s[1] + dy, s[2], s[3], s[4], 0, TAU); continue; }
+      const mx = (s[0] + s[2]) / 2 + dx, my = (s[1] + s[3]) / 2 + dy, hx = (s[2] - s[0]) / 2 * k, hy = (s[3] - s[1]) / 2 * k; ctx.moveTo(mx - hx, my - hy); ctx.lineTo(mx + hx, my + hy);
+    }
+    ctx.stroke();
+  };
+  pass(w * 0.22, w * 0.44, 'rgba(24,14,8,0.38)', w, 1); pass(0, 0, c, w, 1); pass(-w * 0.14, -w * 0.2, stcShade(c, 0.42), w * 0.3, 0.6);
+  ctx.restore();
+}
+// an arc-length reader for a polyline: at(s) -> [x, y, tx, ty]; span(s, d) -> the piece of the path from s to s + d
+function stcRun(P, closed) {
+  const Q = closed ? P.concat([P[0]]) : P, S = [0]; for (let i = 1; i < Q.length; i++) S.push(S[i - 1] + dist(Q[i - 1], Q[i]));
+  const L = S[S.length - 1];
+  return { L, span(s0, d) {
+    const a = closed ? mod(s0, L) : s0, out = [], put = (q) => out.push([q[0], q[1]]), mid = (u, v) => { for (let i = 0; i < Q.length; i++) if (S[i] > u + 0.01 && S[i] < v - 0.01) put(Q[i]); };
+    put(this.at(a)); if (closed && a + d > L) { mid(a, L + 1); mid(-1, a + d - L); } else mid(a, a + d); put(this.at(a + d)); return out;
+  }, at(s) {
+    s = closed ? mod(s, L) : clamp(s, 0, L); let lo = 1, hi = Q.length - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (S[m] < s) lo = m + 1; else hi = m; }
+    const a = Q[lo - 1], b = Q[lo], d = S[lo] - S[lo - 1] || 1, k = (s - S[lo - 1]) / d; return [lerp(a[0], b[0], k), lerp(a[1], b[1], k), (b[0] - a[0]) / d, (b[1] - a[1]) / d];
+  } };
+}
+// ---------------------------------------------------------------------
+//  stcStitch(P, o): stitches along any path, appearing in order. o: { type: 'running' | 'back' | 'chain' | 'blanket' |
+//  'cross' | 'knot', c, w (thread width), len (stitch length; for blanket the spacing), gap, n (fix the count, so the
+//  stitches follow a morphing outline), closed, frac (0..1 of the stitches sewn), key (seeds the tiny hand jitter),
+//  prong (blanket: length of the teeth), out (blanket teeth point outward) }.
+//  Returns the needle position { x, y, ang } while frac < 1, else null.
+// ---------------------------------------------------------------------
+function stcStitch(P, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0 || P.length < 2) return null;
+  const type = o.type ?? 'running', closed = !!o.closed, w = o.w ?? 5, c = o.c ?? STC.cream, run = stcRun(P, closed), L = run.L; if (L < 2) return null;
+  const len = o.len ?? w * ({ running: 3.2, back: 3.6, chain: 3.4, blanket: 4.4, cross: 2.6, knot: 2 }[type]), gap = o.gap ?? (type === 'running' ? len * 0.8 : type === 'cross' || type === 'knot' ? len : 0);
+  const n = o.n ?? Math.max(closed ? 3 : 1, closed || !gap ? Math.round(L / (len + gap)) : Math.floor((L + gap) / (len + gap)));
+  const pitch = closed || !gap ? L / n : len + gap, body = closed ? pitch * len / (len + gap) : len, start = closed || !gap ? 0 : (L - (n * pitch - gap)) / 2;
+  const show = frac >= 1 ? n : Math.floor(n * frac + 1e-6), R = RNG('stc', o.key ?? type), S = [], K = [], sgn = (closed ? (stcArea(P) >= 0 ? 1 : -1) : 1) * (o.out ? -1 : 1), e = Math.min(pitch * 0.14, w * 0.5 + 0.6);
+  for (let i = 0; i < show; i++) {
+    const s0 = start + i * pitch, j = R.n(w * 0.12), j2 = R.n(0.06);
+    if (type === 'running') { const a = run.at(s0 + (closed ? (pitch - body) / 2 : 0)), b = run.at(s0 + (closed ? (pitch + body) / 2 : body)); S.push([a[0] - a[3] * j, a[1] + a[2] * j, b[0] + b[3] * j, b[1] - b[2] * j]); }
+    else if (type === 'back') S.push(run.span(s0 + e, pitch - e * 2));
+    else if (type === 'chain') { const a = run.at(s0 + pitch / 2); S.push([a[0], a[1], pitch * 0.58, w * 1.05, Math.atan2(a[3], a[2])]); }
+    else if (type === 'blanket') {
+      const a = run.at(s0), pr = (o.prong ?? w * 3.2) * (1 + j2); S.push(run.span(s0, pitch - e * 0.5));
+      S.push([a[0], a[1], a[0] - a[3] * pr * sgn + a[2] * j, a[1] + a[2] * pr * sgn + a[3] * j]);
+    } else if (type === 'cross') { const a = run.at(s0 + pitch / 2), h = body / 2, ux = a[2] * h, uy = a[3] * h; K.push([a[0] - ux + uy, a[1] - uy - ux, a[0] + ux - uy, a[1] + uy + ux]); S.push([a[0] - ux - uy, a[1] - uy + ux, a[0] + ux + uy, a[1] + uy - ux]); }
+    else { const a = run.at(s0 + pitch / 2); stcKnot(a[0], a[1], w, c); }
+  }
+  if (K.length) stcThread(K, stcShade(c, -0.2), type === 'cross' ? w * 0.8 : w);
+  stcThread(S, c, type === 'chain' ? w * 0.6 : type === 'cross' ? w * 0.8 : w);
+  if (frac >= 1) return null;
+  const t = run.at(start + show * pitch); return { x: t[0], y: t[1], ang: Math.atan2(t[3], t[2]) };
+}
+// a French knot: a tight coil of thread that stands proud of the cloth
+function stcKnot(x, y, r, c, k = 1) {
+  if (k <= 0) return; r *= k; ctx.save();
+  ctx.fillStyle = 'rgba(24,14,8,0.36)'; ctx.beginPath(); ctx.arc(x + r * 0.22, y + r * 0.4, r, 0, TAU); ctx.fill();
+  ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  ctx.strokeStyle = stcShade(c, -0.3); ctx.lineWidth = r * 0.28; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(x, y, r * 0.52, 0.6, 4.4); ctx.stroke();
+  ctx.fillStyle = stcShade(c, 0.5); ctx.beginPath(); ctx.arc(x - r * 0.34, y - r * 0.38, r * 0.24, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+// ---------------------------------------------------------------------
+//  stcSatin(P, c, o): satin stitch — dense parallel threads clipped to outline P, with a sheen across them.
+//  o: { ang (thread direction), gap, frac (threads laid so far, 0..1), sheen (0..1 position of the shine), edge
+//  (colour of a backstitched outline), ew, key }
+// ---------------------------------------------------------------------
+function stcSatin(P, c, o = {}) {
+  const frac = clamp(o.frac ?? 1); if (frac <= 0) return;
+  const gap = o.gap ?? 3.6, bb = bbox(P), cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 2, top = -rad + rad * 2 * frac;
+  ctx.save(); ctx.save(); ctx.translate(1.5, 3); stcPath(P, true); ctx.fillStyle = 'rgba(24,14,8,0.3)'; if (frac >= 1) ctx.fill(); ctx.restore();
+  stcPath(P, true); ctx.clip(); ctx.translate(cx, cy); ctx.rotate(o.ang ?? -0.5);
+  ctx.fillStyle = stcShade(c, -0.28); ctx.fillRect(-rad, -rad, rad * 2, top + rad);
+  for (const [k, off] of [[0, 0], [0.16, gap]]) { ctx.strokeStyle = k ? stcShade(c, k) : c; ctx.lineWidth = gap * 0.82; ctx.beginPath(); for (let d = -rad + off; d < top; d += gap * 2) { ctx.moveTo(-rad, d); ctx.lineTo(rad, d); } ctx.stroke(); }
+  const sh = lerp(-rad, rad, o.sheen ?? 0.38), g = ctx.createLinearGradient(sh - rad * 0.5, 0, sh + rad * 0.5, 0);
+  g.addColorStop(0, 'rgba(255,250,235,0)'); g.addColorStop(0.5, 'rgba(255,250,235,0.3)'); g.addColorStop(1, 'rgba(255,250,235,0)'); ctx.fillStyle = g; ctx.fillRect(-rad, -rad, rad * 2, top + rad);
+  ctx.restore();
+  if (o.edge && frac >= 1) stcStitch(P, { type: 'back', closed: true, c: o.edge, w: o.ew ?? 3, key: o.key ?? 'satin' });
+}
+// ---------------------------------------------------------------------
+//  cross-stitch. stcXs(cells, cell, frac): little X's at [x, y, colour] (top-left corners), sewn in list order.
+//  stcCross(rows, x, y, cell, o): a small bitmap, one X per character; o.pal maps characters to colours ('.' and ' '
+//  are empty), o.frac. stcCrossBorder(x, y, w, h, cell, o): a frame of X's, o.cols cycles along it, o.frac.
+// ---------------------------------------------------------------------
+function stcXs(cells, cell, frac = 1) {
+  const show = Math.floor(cells.length * clamp(frac) + 1e-6), by = new Map(), m = cell * 0.16, w = cell * 0.2;
+  for (let i = 0; i < show; i++) { const [x, y, c] = cells[i]; if (!by.has(c)) by.set(c, [[], []]); const g = by.get(c); g[0].push([x + m, y + m, x + cell - m, y + cell - m]); g[1].push([x + m, y + cell - m, x + cell - m, y + m]); }
+  for (const [c, g] of by) { stcThread(g[0], stcShade(c, -0.2), w); stcThread(g[1], c, w); }
+}
+function stcCross(rows, x, y, cell, o = {}) {
+  const pal = o.pal ?? { '#': STC.brick }, cells = [];
+  rows.forEach((row, j) => [...row].forEach((ch, i) => { if (pal[ch]) cells.push([x + i * cell, y + j * cell, pal[ch]]); }));
+  stcXs(cells, cell, o.frac ?? 1);
+}
+function stcCrossBorder(x, y, w, h, cell, o = {}) {
+  const nx = Math.round(w / cell), ny = Math.round(h / cell), cols = o.cols ?? [STC.cream, STC.cream, STC.brick], ring = [], cells = [];
+  for (let i = 0; i < nx; i++) ring.push([i, 0, 0, 1]); for (let j = 0; j < ny; j++) ring.push([nx - 1, j, -1, 0]);
+  for (let i = nx - 1; i >= 0; i--) ring.push([i, ny - 1, 0, -1]); for (let j = ny - 1; j >= 0; j--) ring.push([0, j, 1, 0]);
+  ring.forEach(([i, j, ix, iy], k) => {
+    const c = cols[k % cols.length]; cells.push([x + i * cell, y + j * cell, c]);
+    if (k % cols.length === cols.length - 1 && i + ix * 2 >= 2 && i + ix * 2 <= nx - 3 && j + iy * 2 >= 2 && j + iy * 2 <= ny - 3) cells.push([x + (i + ix * 2) * cell, y + (j + iy * 2) * cell, o.dot ?? STC.mustard]);   // a second, sparse row inside
+  });
+  stcXs(cells, cell, o.frac ?? 1);
+}
+
+// ---------------------------------------------------------------------
+//  stcFelt(P, c, o): a felt patch from any closed outline — a soft shadow, flat colour, fibres, a fuzzy edge — sewn
+//  down along its edge. o: { key, stitch: 'blanket' | 'running' | 'back' | 'none', thread, sw (thread width), pitch
+//  (stitch spacing), n (fixed stitch count), sewn (0..1 of the edge stitched), drop (0..1: the patch landing on the
+//  cloth), lift (shadow size), tex: 'weave' = a woven label instead of felt }. Returns stcStitch's needle position.
+// ---------------------------------------------------------------------
+function stcFelt(P, c, o = {}) {
+  const drop = clamp(o.drop ?? 1); if (drop <= 0) return null;
+  const lift = (o.lift ?? 1) * lerp(2.6, 1, EZ.o2(drop)), sw = o.sw ?? 4.5, bb = bbox(P, 6);
+  ctx.save();
+  if (drop < 1) { const m = stcCentroid(P), k = lerp(1.2, 1, EZ.o3(drop)); ctx.translate(m[0], m[1] - (1 - EZ.o2(drop)) * 46); ctx.scale(k, k); ctx.translate(-m[0], -m[1]); ctx.globalAlpha *= clamp(drop * 4); }
+  ctx.save(); ctx.shadowColor = 'rgba(24,14,8,0.42)'; ctx.shadowBlur = 9 * lift; ctx.shadowOffsetX = 2.5 * lift; ctx.shadowOffsetY = 5 * lift; stcPath(P, true); ctx.fillStyle = c; ctx.fill(); ctx.restore();
+  ctx.save(); stcPath(P, true); ctx.lineJoin = 'round';
+  if (o.tex !== 'weave') { ctx.strokeStyle = stcShade(c, 0.14); ctx.lineWidth = 3.2; ctx.setLineDash([1.6, 2.4]); ctx.stroke(); ctx.setLineDash([]); }   // the fuzzy edge
+  ctx.clip();
+  if (o.tex === 'weave') { ctx.globalAlpha *= 0.7; ctx.drawImage(stcWeave(), bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0, bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); ctx.globalAlpha /= 0.7; }
+  else { ctx.fillStyle = stcFibre(); ctx.fillRect(bb.x0, bb.y0, bb.x1 - bb.x0, bb.y1 - bb.y0); }
+  stcPath(P, true); ctx.strokeStyle = 'rgba(24,14,8,0.1)'; ctx.lineWidth = 12; ctx.stroke(); ctx.restore();   // the edge rolls away from the light
+  const st = o.stitch ?? 'blanket'; let tip = null;
+  if (st !== 'none' && drop >= 1) tip = stcStitch(st === 'blanket' ? P : stcOffset(P, sw * 2.2), { type: st, closed: true, c: o.thread ?? STC.cream, w: sw, len: o.pitch ?? (st === 'blanket' ? sw * 4.4 : undefined), n: o.n, frac: o.sewn ?? 1, key: o.key ?? 'felt', prong: o.prong });
+  ctx.restore(); return tip;
+}
+// a button: two or four holes with thread through them. o: { holes, thread, rot, pop (scale 0..1+) }
+function stcButton(x, y, r, c, o = {}) {
+  const k = o.pop ?? 1; if (k <= 0) return; const holes = o.holes ?? 4, d = r * 0.21;
+  ctx.save(); ctx.translate(x, y); ctx.scale(k, k); ctx.rotate(o.rot ?? 0);
+  ctx.save(); ctx.shadowColor = 'rgba(24,14,8,0.5)'; ctx.shadowBlur = 8; ctx.shadowOffsetX = 3; ctx.shadowOffsetY = 5; ctx.fillStyle = c; ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill(); ctx.restore();
+  ctx.lineCap = 'round'; ctx.lineWidth = r * 0.1;
+  ctx.strokeStyle = stcShade(c, -0.28); ctx.beginPath(); ctx.arc(0, 0, r * 0.68, 0, TAU); ctx.stroke(); ctx.beginPath(); ctx.arc(0, 0, r * 0.95, 0.2, 1.9); ctx.stroke();
+  ctx.strokeStyle = stcShade(c, 0.4); ctx.beginPath(); ctx.arc(0, 0, r * 0.93, 3.5, 4.9); ctx.stroke(); ctx.beginPath(); ctx.arc(0, 0, r * 0.6, 0.4, 1.6); ctx.stroke();
+  const H = holes === 2 ? [[-d, 0], [d, 0]] : [[-d, -d], [d, -d], [d, d], [-d, d]];
+  ctx.fillStyle = stcShade(c, -0.7); for (const [hx, hy] of H) { ctx.beginPath(); ctx.arc(hx, hy, r * 0.1, 0, TAU); ctx.fill(); }
+  stcThread(holes === 2 ? [[-d, 0, d, 0]] : [[-d, -d, d, d], [d, -d, -d, d]], o.thread ?? STC.cream, r * 0.13);
+  ctx.restore();
+}
+// a sequin: a shiny disc held by one stitch; its glint comes and goes
+function stcSequin(x, y, r, c, o = {}) {
+  const k = o.pop ?? 1; if (k <= 0) return; const tw = 0.5 + 0.5 * Math.sin(TT * 5.2 + (o.ph ?? x * 0.013));
+  ctx.save(); ctx.translate(x, y); ctx.scale(k, k);
+  ctx.fillStyle = 'rgba(24,14,8,0.4)'; ctx.beginPath(); ctx.arc(1.5, 3, r, 0, TAU); ctx.fill();
+  const g = ctx.createLinearGradient(-r, -r, r, r); g.addColorStop(0, stcShade(c, 0.45)); g.addColorStop(0.5, c); g.addColorStop(1, stcShade(c, -0.3)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+  stcThread([[0, 0, r * 0.95, r * 0.1]], o.thread ?? STC.cream, Math.max(1.6, r * 0.16));
+  ctx.fillStyle = `rgba(255,252,240,${(0.25 + 0.75 * tw).toFixed(3)})`; const q = r * (0.5 + 0.7 * tw);
+  ctx.beginPath(); ctx.moveTo(-r * 0.3 - q, -r * 0.3); ctx.quadraticCurveTo(-r * 0.3, -r * 0.3, -r * 0.3, -r * 0.3 - q); ctx.quadraticCurveTo(-r * 0.3, -r * 0.3, -r * 0.3 + q, -r * 0.3); ctx.quadraticCurveTo(-r * 0.3, -r * 0.3, -r * 0.3, -r * 0.3 + q); ctx.quadraticCurveTo(-r * 0.3, -r * 0.3, -r * 0.3 - q, -r * 0.3); ctx.fill();
+  ctx.restore();
+}
+// the needle, its point at (x, y), trailing thread from the last stitch. o: { ang (point -> eye), len, c (thread),
+// from: [x, y] (where the thread leaves the cloth), dip (0..1: how much of the point is through the cloth) }
+function stcNeedle(x, y, o = {}) {
+  const ang = o.ang ?? -1.0, len = (o.len ?? 215) * (1 - (o.dip ?? 0) * 0.4), ux = Math.cos(ang), uy = Math.sin(ang), px = -uy, py = ux, w0 = (o.dip ?? 0) * 5 + 0.8;
+  const ex = x + ux * len * 0.93, ey = y + uy * len * 0.93, f = o.from ?? [x, y], c = o.c ?? STC.cream;
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const [dx, dy, col, lw] of [[2, 4, 'rgba(24,14,8,0.3)', 4], [0, 0, c, 3.4]]) {   // the thread: a slack curve to the eye, then a loose tail
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(f[0] + dx, f[1] + dy);
+    ctx.quadraticCurveTo((f[0] + ex) / 2 + px * 46 + dx, (f[1] + ey) / 2 + py * 46 + 26 + dy, ex + dx, ey + dy);
+    ctx.bezierCurveTo(ex + px * 40 + dx, ey + py * 40 + dy, ex + 54 + dx, ey + 44 + dy, ex + 38 + dx, ey + 104 + dy); ctx.stroke();
+  }
+  const body = (dx, dy) => { ctx.beginPath(); ctx.moveTo(x + px * w0 + dx, y + py * w0 + dy); ctx.lineTo(x + ux * len + px * 6 + dx, y + uy * len + py * 6 + dy); ctx.lineTo(x + ux * len - px * 6 + dx, y + uy * len - py * 6 + dy); ctx.lineTo(x - px * w0 + dx, y - py * w0 + dy); ctx.closePath(); };
+  body(5, 9); ctx.fillStyle = 'rgba(24,14,8,0.28)'; ctx.fill();
+  body(0, 0); ctx.fillStyle = STC.steel; ctx.fill(); ctx.strokeStyle = '#5c646b'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(x + ux * len * 0.12 - px, y + uy * len * 0.12 - py); ctx.lineTo(x + ux * len * 0.8 - px * 1.6, y + uy * len * 0.8 - py * 1.6); ctx.stroke();
+  ctx.strokeStyle = STC.ink; ctx.lineWidth = 2.6; ctx.beginPath(); ctx.moveTo(x + ux * len * 0.9, y + uy * len * 0.9); ctx.lineTo(x + ux * len * 0.96, y + uy * len * 0.96); ctx.stroke();   // the eye
+  ctx.restore();
+}
+// a wooden embroidery hoop around (cx, cy), inner radius r: the cloth outside it hangs loose (darker), the ring casts
+// a shadow on the taut cloth inside, a brass screw clasp sits on top. Static: cached.
+function stcHoop(cx, cy, r, o = {}) {
+  const wd = o.w ?? 36, pad = 110, S = (r + wd + pad) * 2, m = S / 2;
+  const cv = stcCache('hoop' + r + '|' + wd, S, S, () => {
+    const R = RNG('stchoop', r), rc = r + wd / 2;
+    ctx.fillStyle = 'rgba(40,24,10,0.15)'; ctx.beginPath(); ctx.rect(0, 0, S, S); ctx.arc(m, m, r + wd, 0, TAU, true); ctx.fill('evenodd');   // loose cloth outside
+    const g = ctx.createRadialGradient(m, m, r - 46, m, m, r); g.addColorStop(0, 'rgba(24,14,8,0)'); g.addColorStop(1, 'rgba(24,14,8,0.3)'); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(m, m, r, 0, TAU); ctx.fill();
+    ctx.save(); ctx.shadowColor = 'rgba(24,14,8,0.5)'; ctx.shadowBlur = 16; ctx.shadowOffsetX = 5; ctx.shadowOffsetY = 10; ctx.strokeStyle = STC.wood; ctx.lineWidth = wd; ctx.beginPath(); ctx.arc(m, m, rc, 0, TAU); ctx.stroke(); ctx.restore();
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 90; i++) { const rr = rc + R.n(wd * 0.44), a = R.r(0, TAU); ctx.strokeStyle = i % 2 ? `rgba(120,78,36,${R.r(0.18, 0.4).toFixed(3)})` : `rgba(255,236,196,${R.r(0.15, 0.35).toFixed(3)})`; ctx.lineWidth = R.r(1, 2.2); ctx.beginPath(); ctx.arc(m, m, rr, a, a + R.r(0.2, 0.9)); ctx.stroke(); }   // grain
+    ctx.strokeStyle = 'rgba(90,56,24,0.6)'; ctx.lineWidth = 2.5; for (const rr of [r + 1, r + wd * 0.42, r + wd - 1]) { ctx.beginPath(); ctx.arc(m, m, rr, 0, TAU); ctx.stroke(); }   // inner ring | outer ring
+    ctx.strokeStyle = 'rgba(255,244,214,0.5)'; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(m, m, r + wd * 0.74, 3.5, 5.0); ctx.stroke();
+    const y0 = m - r - wd - 44;   // the clasp: two wooden lugs, a brass bolt and a round nut
+    ctx.fillStyle = STC.woodD; ctx.fillRect(m - 40, y0 + 8, 26, 50); ctx.fillRect(m + 14, y0 + 8, 26, 50); ctx.fillStyle = 'rgba(24,14,8,0.5)'; ctx.fillRect(m - 14, y0 + 30, 28, 30);
+    ctx.strokeStyle = STC.brass; ctx.lineWidth = 9; ctx.beginPath(); ctx.moveTo(m - 58, y0 + 28); ctx.lineTo(m + 62, y0 + 28); ctx.stroke();
+    ctx.strokeStyle = 'rgba(90,60,10,0.55)'; ctx.lineWidth = 1.5; ctx.beginPath(); for (let x = m - 12; x <= m + 12; x += 5) { ctx.moveTo(x, y0 + 24); ctx.lineTo(x + 2, y0 + 32); } ctx.stroke();
+    ctx.fillStyle = STC.brass; ctx.beginPath(); ctx.arc(m + 68, y0 + 28, 17, 0, TAU); ctx.fill(); ctx.strokeStyle = stcShade(STC.brass, -0.4); ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.fillStyle = stcShade(STC.brass, 0.5); ctx.beginPath(); ctx.arc(m + 63, y0 + 23, 5, 0, TAU); ctx.fill();
+  });
+  ctx.save(); ctx.fillStyle = 'rgba(40,24,10,0.15)'; ctx.beginPath(); ctx.rect(-STC_M, -STC_M, W + STC_M * 2, H + STC_M * 2); ctx.rect(cx - m, cy - m, S, S); ctx.fill('evenodd'); ctx.drawImage(cv, cx - m, cy - m); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  shapes and small embroidered motifs
+// ---------------------------------------------------------------------
+function stcHeartPts(x, y, r, n = 72) { const P = []; for (let i = 0; i < n; i++) { const t = i / n * TAU; P.push([x + 16 * Math.sin(t) ** 3 * r / 16, y + (-(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) - 2.5) * r / 16]); } return P; }
+// a house silhouette (roof with eaves on a body) centred on (x, y), w wide at the eaves, h tall
+function stcHousePts(x, y, w, h) { const t = y - h / 2, e = t + h * 0.38, b = w * 0.42; return [[x, t], [x + w / 2, e], [x + b, e], [x + b, y + h / 2], [x - b, y + h / 2], [x - b, e], [x - w / 2, e]]; }
+function stcLeafPts(x0, y0, x1, y1, wid, n = 9) { const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy) || 1, px = -dy / L, py = dx / L, A = [], Bk = []; for (let i = 0; i <= n; i++) { const u = i / n, hw = wid * Math.sin(Math.PI * u ** 0.8); A.push([x0 + dx * u + px * hw, y0 + dy * u + py * hw]); if (i > 0 && i < n) Bk.unshift([x0 + dx * u - px * hw, y0 + dy * u - py * hw]); } return A.concat(Bk); }
+// a satin-stitched leaf with a backstitched vein. k = growth 0..1
+function stcLeaf(x0, y0, x1, y1, wid, c = STC.sage, k = 1) {
+  if (k <= 0) return; const e = EZ.o2(k), X = lerp(x0, x1, e), Y = lerp(y0, y1, e);
+  stcSatin(stcLeafPts(x0, y0, X, Y, wid * e), c, { ang: Math.atan2(Y - y0, X - x0) + 0.9, gap: 3.2 });
+  stcStitch([[x0, y0], [lerp(x0, X, 0.8), lerp(y0, Y, 0.8)]], { type: 'back', c: stcShade(c, -0.4), w: 2.4, key: 'vein' });
+}
+// a lazy-daisy flower: looped petals sewn one by one around a French knot. o: { n, frac, rot, centre }
+function stcFlower(x, y, r, c = STC.pink, o = {}) {
+  const n = o.n ?? 6, show = Math.floor(n * clamp(o.frac ?? 1) + 1e-6), S = [], T = []; if (show <= 0) return;
+  for (let i = 0; i < show; i++) { const a = (o.rot ?? 0) + i / n * TAU, ca = Math.cos(a), sa = Math.sin(a); S.push([x + ca * r * 0.56, y + sa * r * 0.56, r * 0.42, r * 0.2, a]); T.push([x + ca * r * 0.94, y + sa * r * 0.94, x + ca * r * 1.08, y + sa * r * 1.08]); }
+  stcThread(S, c, Math.max(2.4, r * 0.11)); stcThread(T, stcShade(c, -0.25), Math.max(2, r * 0.09));
+  if (show >= n) stcKnot(x, y, r * 0.2, o.centre ?? STC.mustard);
+}
+// a straight-stitch star (four threads crossing). k = pop 0..1+
+function stcStar(x, y, r, c = STC.cream, k = 1, rot = 0) {
+  if (k <= 0) return; const S = []; for (let i = 0; i < 4; i++) { const a = rot + i * Math.PI / 4, q = r * k * (i % 2 ? 0.6 : 1); S.push([x - Math.cos(a) * q, y - Math.sin(a) * q, x + Math.cos(a) * q, y + Math.sin(a) * q]); }
+  stcThread(S, c, Math.max(2, r * 0.16));
+}
+// a tuft of grass: a fan of straight stitches
+function stcTuft(x, y, h, c = STC.sageD, k = 1) { if (k > 0) stcThread([-0.5, -0.12, 0.3].map((a, i) => [x + i * 3 - 3, y, x + i * 3 - 3 + Math.sin(a) * h * k, y - Math.cos(a) * h * k * (i === 1 ? 1 : 0.76)]), c, 3.2); }
+
+// a little felt house: brick body, sage roof with a cross-stitch heart in the gable, satin-stitch windows, a cream
+// door, a chimney. Same box as stcHousePts(x, y, w, h). o: { key, body, roof, sheen (0..1: where the windows shine) }
+const STC_HEART = [' # # ', '#####', '#####', ' ### ', '  #  '];
+function stcHouse(x, y, w, h, o = {}) {
+  const t = y - h / 2, e = t + h * 0.38, b = w * 0.42, bot = y + h / 2, key = o.key ?? 'house', F = { sw: 5, pitch: 26, prong: 14 };
+  stcFelt([[x - b * 0.62, t + h * 0.06], [x - b * 0.32, t + h * 0.06], [x - b * 0.32, t + h * 0.26], [x - b * 0.62, t + h * 0.26]], o.body ?? STC.brick, { sw: 3, pitch: 13, prong: 8, key: key + 'ch' });
+  stcFelt([[x - b, e - 8], [x + b, e - 8], [x + b, bot], [x - b, bot]], o.body ?? STC.brick, { ...F, key: key + 'body' });
+  stcFelt([[x, t], [x + w / 2, e], [x - w / 2, e]], o.roof ?? STC.sage, { ...F, key: key + 'roof' });
+  stcStitch([[x - w * 0.3, e - h * 0.105], [x + w * 0.3, e - h * 0.105]], { type: 'running', c: STC.sageD, w: 4, key: key + 'tile' });
+  const cell = w / 24; stcCross(STC_HEART, x - cell * 2.5, t + h * 0.115, cell, { pal: { '#': o.body ?? STC.brick } });
+  const dw = b * 0.24, dh = h * 0.27, door = [[x + dw, bot - 6], [x - dw, bot - 6], [x - dw, bot - dh + dw]].concat(arcPts(x, bot - dh + dw, dw, Math.PI, TAU, 12));
+  stcFelt(door, STC.cream, { stitch: 'running', thread: STC.brick, sw: 3, lift: 0.4, key: key + 'door' }); stcKnot(x + dw * 0.45, bot - dh * 0.45, 5.5, STC.mustard);
+  for (const d of [-1, 1]) {
+    const ws = b * 0.21, wx = x + d * b * 0.62, wy = e + (bot - e) * 0.2, P = rrectPts(wx - ws, wy, ws * 2, ws * 2, 5, 3);
+    stcSatin(P, STC.mustard, { ang: 0.5, sheen: o.sheen ?? 0.4, edge: STC.cream, ew: 3, key: key + 'win' + d });
+    stcStitch([[wx, wy + 3], [wx, wy + ws * 2 - 3]], { type: 'back', c: STC.cream, w: 3, n: 3 }); stcStitch([[wx - ws + 3, wy + ws], [wx + ws - 3, wy + ws]], { type: 'back', c: STC.cream, w: 3, n: 3 });
+  }
+}
+
+// ---------------------------------------------------------------------
+//  lettering: system bold rounded glyphs rendered as embroidery — satin threads clipped to the letters, a stitched
+//  (dashed) outline in a deeper shade, a thread shadow. Static per string: cached. Reveal letter by letter with o.frac.
+//  o: { frac, align: 'center', ls (letter spacing px), weight }
+// ---------------------------------------------------------------------
+function stcFontSet(size, o = {}) { ctx.font = `${o.weight ?? 700} ${size}px ${STC_FONT}`; if ('letterSpacing' in ctx) ctx.letterSpacing = (o.ls ?? 0) + 'px'; ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left'; }
+function stcWordW(str, size, o = {}) { ctx.save(); stcFontSet(size, o); const w = ctx.measureText(str).width; ctx.restore(); return w; }
+function stcWord(str, x, y, size, c, o = {}) {
+  const frac = clamp(o.frac ?? 1), w = stcWordW(str, size, o); if (frac <= 0 || !str.trim()) return w;
+  const pad = Math.ceil(size * 0.3), by = pad + Math.ceil(size * 1.1), x0 = o.align === 'center' ? x - w / 2 : x;
+  const cv = stcCache(['word', str, size, c, o.ls ?? 0, o.weight ?? 700].join('|'), w + pad * 2, by + size * 0.45 + pad, () => {
+    const cw = w + pad * 2, ch = by + size * 0.45 + pad, g = Math.max(3, size * 0.06);
+    stcFontSet(size, o); ctx.fillStyle = c; ctx.fillText(str, pad, by);
+    ctx.globalCompositeOperation = 'source-atop'; ctx.lineWidth = g * 0.5;
+    for (const [k, off] of [[0.2, 0], [-0.16, g / 2]]) { ctx.strokeStyle = stcShade(c, k); ctx.beginPath(); for (let d = -ch + off; d < cw; d += g) { ctx.moveTo(d, ch); ctx.lineTo(d + ch * 0.55, 0); } ctx.stroke(); }
+    ctx.globalCompositeOperation = 'source-over'; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.strokeStyle = stcShade(c, -0.38); ctx.lineWidth = Math.max(1.6, size * 0.04); ctx.setLineDash([size * 0.1, size * 0.085]); ctx.strokeText(str, pad, by);
+  });
+  ctx.save();
+  if (frac < 1) { const k = Math.floor(str.length * frac + 1e-6); ctx.beginPath(); ctx.rect(x0 - pad, y - by, pad + stcWordW(str.slice(0, k), size, o) + 1, cv.height); ctx.clip(); }
+  ctx.shadowColor = 'rgba(24,14,8,0.4)'; ctx.shadowBlur = 2; ctx.shadowOffsetX = 1.5; ctx.shadowOffsetY = 3; ctx.drawImage(cv, x0 - pad, y - by);
+  ctx.restore(); return w;
+}
+
+// ---------------------------------------------------------------------
+//  the hero: BERU, a felt plush bear — caramel felt sewn with cream blanket stitch, button eyes, a satin nose, a
+//  backstitched smile, a heart patch on the tummy. (x, y) = its middle, s = half its height.
+//  o: { key, wave (true: the right arm waves), drop (0..1 landing), face: -1 mirrors }. Idle: bob, head tilt, ear wiggle.
+// ---------------------------------------------------------------------
+function stcBear(x, y, s, o = {}) {
+  const drop = clamp(o.drop ?? 1); if (drop <= 0) return;
+  const key = o.key ?? 'beru', ph = key.length * 0.7, bob = Math.sin(TT * 2.4 + ph) * s * 0.018, tilt = Math.sin(TT * 1.7 + ph) * 0.07, tw = Math.max(0, Math.sin(TT * TAU / 1.5 + ph)) ** 8;
+  const sw = Math.max(2.2, s * 0.02), pitch = Math.max(9, s * 0.085), F = { thread: STC.cream, sw, pitch, prong: sw * 2.6, lift: 0.6 }, E = (cx, cy, rx, ry, rot = 0, n = 40) => ellipsePts(cx * s, cy * s, rx * s, ry * s, rot, n);
+  ctx.save(); ctx.translate(x, y + bob); SPARK_AT = toScreen(0, 0);
+  if (drop < 1) { const k = lerp(1.25, 1, EZ.o3(drop)); ctx.translate(0, -(1 - EZ.o2(drop)) * s * 0.4); ctx.scale(k * (o.face ?? 1), k); ctx.globalAlpha *= clamp(drop * 4); } else if (o.face === -1) ctx.scale(-1, 1);
+  for (const d of [-1, 1]) { stcFelt(E(d * 0.25, 0.82, 0.2, 0.17), STC.bear, { ...F, key: key + 'leg' + d }); stcFelt(E(d * 0.26, 0.85, 0.1, 0.085, 0, 20), STC.cream, { stitch: 'none', lift: 0.2 }); }
+  stcFelt(E(0, 0.37, 0.43, 0.46), STC.bear, { ...F, key: key + 'body' });
+  stcFelt(E(0, 0.43, 0.25, 0.27, 0, 30), STC.cream, { stitch: 'running', thread: STC.bear, sw: sw * 0.8, lift: 0.3, key: key + 'tum' });
+  stcFelt(stcHeartPts(0, 0.42 * s, 0.105 * s, 30), STC.brick, { stitch: 'none', lift: 0.3 });
+  for (const d of [-1, 1]) {   // arms, in front of the body: the left hangs, the right can wave
+    const a = d === 1 && o.wave ? -2.25 + Math.sin(TT * 7.5) * 0.32 : d * -0.5 + Math.sin(TT * 2.4 + d) * 0.05;
+    ctx.save(); ctx.translate(d * 0.37 * s, 0.14 * s); ctx.rotate(a); stcFelt(E(0, 0.2, 0.125, 0.25, 0, 30), STC.bear, { ...F, key: key + 'arm' + d }); ctx.restore();
+  }
+  ctx.translate(0, -0.42 * s); ctx.rotate(tilt);
+  for (const d of [-1, 1]) { ctx.save(); ctx.translate(d * 0.36 * s, -0.33 * s); ctx.rotate(d * (0.1 + (d === 1 ? tw : 0) * 0.42)); stcFelt(E(0, -0.1, 0.19, 0.19, 0, 30), STC.bear, { ...F, key: key + 'ear' + d }); stcFelt(E(0, -0.085, 0.085, 0.085, 0, 20), STC.pink, { stitch: 'none', lift: 0.2 }); ctx.restore(); }
+  stcFelt(E(0, 0, 0.54, 0.47, 0, 48), STC.bear, { ...F, key: key + 'head' });
+  for (const d of [-1, 1]) stcFelt(E(d * 0.35, 0.14, 0.075, 0.06, 0, 16), STC.pink, { stitch: 'none', lift: 0.15 });
+  stcFelt(E(0, 0.15, 0.23, 0.17, 0, 30), STC.cream, { stitch: 'running', thread: STC.bear, sw: sw * 0.8, lift: 0.3, key: key + 'muz' });
+  stcSatin(E(0, 0.07, 0.075, 0.05, 0, 18), STC.ink, { ang: 0, gap: 2.6 });
+  stcStitch([[0, 0.12 * s], [0, 0.18 * s]], { type: 'back', c: STC.ink, w: sw * 0.9, n: 1 });
+  stcStitch(arcPts(0, 0.1 * s, 0.14 * s, 0.5, Math.PI - 0.5, 12), { type: 'back', c: STC.ink, w: sw * 0.9, n: 5, key: 'smile' });
+  for (const d of [-1, 1]) stcButton(d * 0.21 * s, -0.07 * s, 0.085 * s, STC.ink, { holes: 2, thread: STC.cream, rot: d * 0.35 });
+  ctx.restore();
+}
+function stcBearPts(x, y, r) { return ellipsePts(x, y, r * 0.62, r, 0, 64); }
+
+// ---------------------------------------------------------------------
+//  captions and tags (DEFER: after the camera, at screen size). The caption is a sewn-on fabric label: a cream
+//  ribbon with pinked ends drops on, a running stitch sews along its edges, the embroidered lines appear letter by
+//  letter; *a phrase* is in brick red with a mustard chain-stitch underline. The tag is a small teal felt tab with a
+//  button. Both fade in the first 0.3s of a bridge's shrink and stay hidden while the next era's window grows:
+//  after a bridge of half-length d, give the tag { at: d } and the caption { at: d + 0.4 } or later.
+// ---------------------------------------------------------------------
+function stcLeaving() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.3)); if (TT >= r.tc && TT < r.tc + d - 1e-6) return 0; }
+  return 1;
+}
+function stcRibbonPts(x, y, w, h, tooth = 13) { const P = [[x, y], [x + w, y]], n = Math.max(2, Math.round(h / tooth)); for (let i = 0; i < n; i++) P.push([x + w - tooth * 0.6, y + (i + 0.5) * h / n], [x + w, y + (i + 1) * h / n]); P.push([x, y + h]); for (let i = n - 1; i >= 0; i--) P.push([x + tooth * 0.6, y + (i + 0.5) * h / n], [x, y + i * h / n]); P.pop(); return P; }
+function stcCaptionNow(str, o = {}) {
+  const al = stcLeaving(), at = E0 + (o.at ?? 0.5), land = ev(at - 0.42, 0.25); if (al <= 0.001 || land <= 0) return;
+  const size = o.size ?? 62, lh = size * 1.22, raw = str.split('\n'), yLast = o.y ?? 1444, cx = o.x ?? CX;
+  const lines = raw.map((line) => { const parts = line.split(/(\*[^*]+\*)/).filter(Boolean).map((g) => (g[0] === '*' ? { s: g.slice(1, -1), hi: true } : { s: g, hi: false })); parts.forEach((p) => { p.w = stcWordW(p.s, size); }); return { parts, w: parts.reduce((a, p) => a + p.w, 0), n: parts.reduce((a, p) => a + p.s.length, 0) }; });
+  const bw = Math.max(...lines.map((l) => l.w)) + 120, top = yLast - (lines.length - 1) * lh - size * 0.98 - 26, bot = yLast + size * 0.36 + 28, x0 = cx - bw / 2;
+  ctx.save(); ctx.globalAlpha = al;
+  stcFelt(stcRibbonPts(x0, top, bw, bot - top), o.bg ?? STC.cream, { tex: 'weave', stitch: 'none', drop: land, lift: 1.1 });
+  const sewn = stcStep(at - 1 / 6, 24, 24);   // the running stitch along the top and bottom edges: 12 stitches each
+  for (const [yy, k] of [[top + 13, 'T'], [bot - 13, 'B']]) stcStitch([[x0 + 24, yy], [x0 + bw - 24, yy]], { type: 'running', c: o.thread ?? STC.brick, w: 4, n: 12, len: (bw - 48) / 12 * 0.56, gap: (bw - 48) / 12 * 0.44, frac: clamp(sewn * 2 - (k === 'B' ? 1 : 0)), key: 'cap' + k });
+  lines.forEach((line, li) => {
+    const fr = ev(at + li * 0.33, 0.5); if (fr <= 0) return;
+    const yy = yLast - (lines.length - 1 - li) * lh; let xx = cx - line.w / 2, left = Math.floor(line.n * fr + 1e-6);
+    for (const p of line.parts) {
+      const f = clamp(left / p.s.length); left = Math.max(0, left - p.s.length);
+      if (p.hi && f >= 1) stcStitch([[xx + 2, yy + size * 0.2], [xx + p.w - 2, yy + size * 0.2]], { type: 'chain', c: o.under ?? STC.mustard, w: 4.4, frac: stcStep(at + li * 0.33 + 0.5, Math.round(p.w / 15)), key: 'under' });
+      stcWord(p.s, xx, yy, size, p.hi ? (o.hi ?? STC.brick) : (o.c ?? STC.ink), { frac: f }); xx += p.w;
+    }
+  });
+  ctx.restore();
+}
+function stcTagNow(label, o = {}) {
+  const al = stcLeaving(), land = ev(E0 + (o.at ?? 0.15), 0.25); if (al <= 0.001 || land <= 0) return;
+  const x = o.x ?? 64, y = o.y ?? 258, h = 72, size = 36, w = 74 + stcWordW(label, size, { ls: 3 }) + 30;
+  ctx.save(); ctx.globalAlpha = al;
+  stcFelt(rrectPts(x, y, w, h, 14), o.bg ?? STC.tealD, { stitch: 'running', thread: STC.cream, sw: 3, drop: land, sewn: stcStep(E0 + (o.at ?? 0.15) + 0.25, 24, 48), n: 24, key: 'tag' });
+  if (land >= 1) { stcButton(x + 40, y + h / 2, 17, STC.mustard, { holes: 2, thread: STC.brick, rot: 0.5 + Math.sin(TT * 1.3) * 0.12 }); stcWord(label, x + 74, y + h / 2 + size * 0.36, size, STC.cream, { ls: 3, frac: ev(E0 + (o.at ?? 0.15) + 0.25, 0.4) }); }
+  ctx.restore();
+}
+const stcCaption = (str, o = {}) => { const f = () => stcCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const stcTag = (label, o = {}) => { const f = () => stcTagNow(label, o); if (DEFER) DEFER.push(f); else f(); };
+
+// the cloth breathes: a soft fold of light and shade drifts a little (on 2s), under a vignette
+function stcPost() {
+  ctx.save(); screen(); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  const ph = Math.sin(TT * 1.3), g = ctx.createLinearGradient(0, 0, W, H * 0.62);
+  g.addColorStop(0, `rgba(255,246,224,${(0.06 + 0.025 * ph).toFixed(3)})`); g.addColorStop(0.36 + 0.03 * ph, 'rgba(255,246,224,0)'); g.addColorStop(0.5 + 0.03 * ph, 'rgba(24,14,8,0)');
+  g.addColorStop(0.72 + 0.02 * ph, `rgba(24,14,8,${(0.06 - 0.02 * ph).toFixed(3)})`); g.addColorStop(1, 'rgba(24,14,8,0)'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const v = ctx.createRadialGradient(W / 2, H / 2, H * 0.36, W / 2, H / 2, H * 0.76); v.addColorStop(0, 'rgba(24,14,8,0)'); v.addColorStop(1, 'rgba(24,14,8,0.34)'); ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'stitch',
+  paper: STC.paper,                                                     // the sage cloth a morph happens on
+  backdrop(c) { stcCloth(c); },                                         // any colour of the same woven cloth (hex or rgb())
+  // a hole cut in the top cloth, the era showing through it: the cut edge shades the layer below, and the hem is
+  // sewn with a fixed number of blanket stitches whose teeth point out onto the top cloth
+  window(P, key, src) {
+    ctx.save(); stcPath(P, true); ctx.clip(); ctx.drawImage(src, 0, 0); stcPath(P, true); ctx.lineJoin = 'round'; ctx.strokeStyle = 'rgba(24,14,8,0.2)'; ctx.lineWidth = 34; ctx.stroke(); ctx.strokeStyle = 'rgba(24,14,8,0.3)'; ctx.lineWidth = 12; ctx.stroke(); ctx.restore();
+    const L = pathLen(P.concat([P[0]])), n = 56, pitch = L / n; if (pitch > 420) return;   // the hem has left the frame
+    ctx.save(); stcPath(P, true); ctx.lineJoin = 'round'; ctx.strokeStyle = 'rgba(255,246,224,0.4)'; ctx.lineWidth = 5; ctx.stroke(); ctx.restore();
+    stcStitch(P, { type: 'blanket', closed: true, out: true, n, c: STC.cream, w: clamp(pitch * 0.14, 3.5, 7), prong: clamp(pitch * 0.5, 9, 30), key: 'hem' });
+  },
+  // the morphing shape: a felt patch whose blanket stitching (a fixed count) follows the changing edge
+  blob(P, c, key) { stcFelt(P, c, { n: 40, sw: 6, prong: 20, key: 'blob', lift: 1.3 }); },
+  hero(x, y, r, o = {}) { stcBear(x, y, r, { key: o.key }); },
+  heroColor: STC.bear,
+  heroPts(x, y, r) { return stcBearPts(x, y, r); },
+  post() { stcPost(); },
+  ones: false,
+};
+// =====================================================================
+//  SCENES — stitch demo. World units = px at zoom 1; time TT on 2s. Content kept inside x 60-940, y 250-1500.
+//  Era 1 on linen in a hoop, era 2 on denim. Brick red is the heart's colour: the patch, the house, the bear's tummy.
+// =====================================================================
+const cu = TIMELINE.cues;
+const HOOP = { x: 500, y: 836, r: 392 };
+const HRT = { x: 500, y: 832, r: 160 };                    // the felt heart (bridge A)
+const HOUSE = { x: 600, y: 884, w: 330, h: 470 };          // the felt house (bridge B)
+const BERU = { x: 268, y: 978, s: 138 };
+const HEART_N = 22;                                        // blanket stitches round the heart, one per 2s step
+
+// ---- era 1: a heart is sewn onto linen in a hoop
+function sceneJahit() {
+  stcCloth(STC.linen);
+  // loose buttons on the slack cloth outside the hoop
+  stcButton(846, 352, 40, STC.mustard, { thread: STC.brick, rot: 0.3 + Math.sin(TT * 1.1) * 0.1 });
+  stcButton(752, 300, 25, STC.teal, { holes: 2, rot: -0.4 + Math.sin(TT * 1.4 + 1) * 0.14 });
+  stcButton(118, 1190, 30, STC.pink, { thread: STC.tealD, rot: 0.8 + Math.sin(TT * 1.2 + 2) * 0.12 });
+  // the wreath: a chain-stitch ring that is still being sewn when the piece opens, satin leaves coming out behind it
+  const wf = ev(cu.wreath, 2.0), ring = ellipsePts(HRT.x, HRT.y, 290, 290, 0, 96).map((_, i, P) => P[(i + 72) % 96]);   // start at the top
+  stcStitch(ring, { type: 'chain', closed: true, c: STC.sageD, w: 5.5, frac: wf, key: 'wreath' });
+  for (let i = 0; i < 12; i++) {
+    const a = -Math.PI / 2 + (i + 0.5) / 12 * TAU, bx = HRT.x + Math.cos(a) * 290, by = HRT.y + Math.sin(a) * 290, out = i % 2 ? 1 : -1, d = a + Math.PI / 2 + out * -1.0;
+    stcLeaf(bx, by, bx + Math.cos(d) * 66, by + Math.sin(d) * 66, 18, i % 2 ? STC.sage : STC.teal, clamp((wf * 12 - i - 0.6) / 1.2));
+  }
+  for (let i = 0; i < 4; i++) { const a = Math.PI / 4 + i * Math.PI / 2; stcFlower(HRT.x + Math.cos(a) * 290, HRT.y + Math.sin(a) * 290, 34, i % 2 ? STC.mustard : STC.pink, { frac: stcStep(cu.flower + i * T3, 6), rot: i, centre: i % 2 ? STC.brick : STC.mustard }); }
+  for (let i = 0; i < 4; i++) { const a = 0.36 + i * Math.PI / 2, k = popS(cu.knots + i * T6); for (const d of [-0.09, 0, 0.09]) stcKnot(HRT.x + Math.cos(a + d) * (d ? 236 : 226), HRT.y + Math.sin(a + d) * (d ? 236 : 226), d ? 6 : 8, d ? STC.mustard : STC.brick, k); }
+  // the heart: a felt patch drops on, then the needle sews it down
+  const hp = stcHeartPts(HRT.x, HRT.y, HRT.r), sewn = stcStep(cu.sew, HEART_N);
+  const tip = stcFelt(hp, STC.brick, { n: HEART_N, sw: 7, prong: 24, drop: ev(cu.drop, 0.25), sewn, key: 'blob', lift: 1.3 });
+  [[360, 672, STC.mustard], [655, 944, STC.teal], [372, 948, STC.pink]].forEach(([x, y, c], i) => stcSequin(x, y, 15, c, { pop: popS(cu.spark + i * T6), ph: i * 2.1 }));
+  stcHoop(HOOP.x, HOOP.y, HOOP.r);
+  // the needle: waits above the heart, leads the stitching (in and out on alternate steps), then rests in the cloth
+  const st = hp[0], park = [694, 872];
+  if (tip) stcNeedle(tip.x, tip.y, { ang: -1.05 + (B % 2) * 0.12, dip: B % 2 ? 0.7 : 0.1, from: [tip.x, tip.y] });
+  else if (sewn <= 0) { const u = EZ.o2(ev(cu.sew - 0.5, 0.42)); stcNeedle(lerp(st[0] + 130, st[0], u), lerp(st[1] - 190, st[1], u), { ang: -1.05, from: [st[0] + 300, st[1] - 420] }); }
+  else { const u = EZ.o2(ev(cu.spark - T12, 0.25)); stcNeedle(lerp(st[0], park[0], u), lerp(st[1], park[1], u), { ang: lerp(-1.05, -1.35, u), dip: 0.35 * u, len: 190, from: st }); }
+  stcTag('JAHIT');
+  stcCaption('dijahit dengan\n*sepenuh hati*');
+}
+
+// ---- era 2: the felt house on denim
+const HILL = (() => { const P = []; for (let i = 0; i <= 28; i++) { const u = i / 28; P.push([150 + 700 * u, 1130 - 28 * Math.sin(Math.PI * u) - 7 * Math.sin(3 * Math.PI * u) + (i === 0 || i === 28 ? 14 : 0)]); } return P.concat([[850, 1186], [838, 1198], [162, 1198], [150, 1186]]); })();
+const STARS = [[190, 520, 15, 0, 1], [338, 596, 17, 1, 0], [176, 706, 13, 2, 0], [432, 506, 13, 3, 1], [322, 772, 11, 4, 0], [585, 500, 12, 5, 0]];
+function sceneRumah() {
+  stcCloth(STC.denim);
+  stcCrossBorder(80, 410, 840, 860, 20, { frac: ev(cu.border, 1.75), cols: [STC.cream, STC.cream, STC.pink], dot: STC.mustard });
+  STARS.forEach(([x, y, r, i, seq]) => { const k = popS(cu.stars + i * T6); if (seq) stcSequin(x, y, r, i % 2 ? STC.pink : STC.cream, { pop: k, ph: i }); else stcStar(x, y, r * (1 + 0.16 * Math.sin(TT * 4 + i * 2)), i % 2 ? STC.cream : STC.mustard, k, TT * 0.3 + i); });
+  // the button sun: its rays are sewn one per step, then they breathe
+  const rays = Math.floor(stcStep(cu.sun + T6, 12) * 12 + 1e-6), S = [];
+  for (let i = 0; i < rays; i++) { const a = -Math.PI / 2 + i / 12 * TAU, r1 = 98 + (i % 2 ? -10 : 6) + 5 * Math.sin(TT * 3 + i); S.push([744 + Math.cos(a) * 70, 576 + Math.sin(a) * 70, 744 + Math.cos(a) * r1, 576 + Math.sin(a) * r1]); }
+  stcThread(S, STC.mustard, 6);
+  stcButton(744, 576, 54, STC.mustard, { thread: STC.brick, rot: TT * 0.22, pop: popS(cu.sun) });
+  stcFelt(HILL, STC.sage, { stitch: 'running', thread: STC.cream, sw: 4, key: 'hill' });
+  [[196, 1150, 26], [420, 1136, 30], [470, 1140, 22], [826, 1150, 26]].forEach(([x, y, h], i) => stcTuft(x, y, h, i % 2 ? STC.cream : STC.sageD, ev(3.4 + i * T6, 0.25)));
+  stcStitch([[806, 1128], [806, 1086]], { type: 'back', c: STC.sageD, w: 4, n: 3, frac: ev(4.0, 0.25) });
+  stcFlower(806, 1062, 26, STC.pink, { frac: stcStep(4.25, 6), rot: TT * 0.2 });
+  // chimney smoke: French knots rising on a loop
+  for (let i = 0; i < 5; i++) { const u = mod(TT * 0.42 + i / 5, 1), k = Math.min(1, u * 6) * (1 - smooth(0.7, 1, u)); stcKnot(534 - u * 44 + Math.sin(u * 5 + i) * 12, 676 - u * 150, lerp(5, 11, u), STC.cream, k); }
+  stcHouse(HOUSE.x, HOUSE.y, HOUSE.w, HOUSE.h, { sheen: 0.4 + 0.25 * Math.sin(TT * 2.2) });
+  stcBear(BERU.x, BERU.y, BERU.s, { drop: ev(cu.bear, 0.3), wave: TT > cu.bear + 0.5 });
+  stcTag('RUMAH', { at: 0.6 });
+  stcCaption('jadilah rumah\n*yang hangat*', { at: 1.0 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — stitch demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [STC.linen, STC.denim];
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.25, 2.25, { z: 1.05, p: [HRT.x, HRT.y], to: [HRT.x, HRT.y] });
+  const z = springMove(3.0, 1.06, 1.0, { k: 22, d: 9.5 });
+  return camOf({ z, p: [HOUSE.x, HOUSE.y], to: [HOUSE.x, HOUSE.y] });
+}
+const BRIDGES = [
+  // the sewn felt heart -> the felt house (both about as wide as tall), brick red the whole way
+  { tc: 3.0,
+    A: () => ({ P: stcHeartPts(HRT.x, HRT.y, HRT.r), c: STC.brick }),
+    B: () => ({ P: stcHousePts(HOUSE.x, HOUSE.y, HOUSE.w, HOUSE.h), c: STC.brick }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — stitch demo (inside buildScore(); see kit/score-head.js). A music-box lullaby waltz: 60 BPM in
+  // triplets (two bars of three beats, D major then G - A), the melody on the triplet 8ths, an oom-pah-pah bass,
+  // and the needle ticking on the 2s grid (1/12 s) exactly where the picture lands a stitch.
+  const T = TIMELINE, q = T.cues;
+  const PN = ['D5', 'E5', 'Fs5', 'A5', 'B5', 'D6', 'E6', 'Fs6', 'A6'].map(nz);
+  const tick = (t, vel, pan = 0) => { to = 's'; noiseHit(t, 0.022, 'highpass', 6200, 0.7, vel, pan, 0.05); };
+  const pof = (t, vel) => { to = 's'; noiseHit(t, 0.14, 'lowpass', 520, 0.8, vel, 0, 0.1); blip(t, 170, 95, 0.12, vel * 0.8, 0); };
+  to = 'm';
+  pad(0.0, 3.05, ['D3', 'A3', 'Fs4'], 0.036, { type: 'triangle', cut: 900, att: 0.5, rel: 0.5, send: 0.5 });
+  pad(3.0, 4.55, ['G3', 'D4', 'B4'], 0.05, { type: 'triangle', cut: 900, att: 0.3, rel: 0.4, send: 0.5 });
+  pad(4.5, 6.05, ['A3', 'E4', 'Cs5'], 0.05, { type: 'triangle', cut: 900, att: 0.3, rel: 0.5, send: 0.5 });
+  const mel = [2, 3, 5, 4, 3, 2, 3, 1, 0, 3, 4, 6, 5, 4, 3, 4, 6, 8];   // one note a triplet 8th
+  mel.forEach((d, i) => pluck(i * T3, PN[d], (i % 3 ? 0.05 : 0.06) * (i < 9 ? 0.85 : 1), i % 2 ? 0.25 : -0.2, 0.75, 5200, 0.45));
+  [[0, 'D2'], [3, 'G2'], [4.5, 'A2']].forEach(([t, n]) => bass(t, nz(n), 0.06));
+  [[1, ['A3', 'D4']], [2, ['A3', 'Fs4']], [4, ['B3', 'D4']], [5, ['Cs4', 'E4']]].forEach(([t, ns]) => ns.forEach((n, i) => pluck(t, nz(n), 0.032, i ? 0.3 : -0.3, 0.5, 1800, 0.3)));
+  chime(0.0, [PN[0], PN[3]], 0.035, -0.2); chime(3.0, [PN[3], PN[5], PN[7]], 0.026, 0);
+  // sfx: the felt lands, the needle ticks once per stitch (the pull a little louder every other one), petals, sequins
+  pof(Math.max(0, q.drop + 0.1), 0.035);
+  for (let i = 0; i < 22; i++) tick(q.sew + i * T12, i % 2 ? 0.01 : 0.018, -0.3 + i * 0.027);
+  to = 's';
+  for (let i = 0; i < 4; i++) blip(q.flower + i * T3, 1500 + i * 180, 1900 + i * 180, 0.06, 0.012, i % 2 ? 0.4 : -0.4);
+  for (let i = 0; i < 3; i++) blip(q.spark + i * T6, 3000 + i * 400, 3500 + i * 400, 0.05, 0.016, 0.4 - i * 0.3);
+  sweep(2.45, 3.0, 0.012, 600, 2600, 0);
+  // era 2: cross-stitches run round the border, the bear lands, the button sun clicks on and gets its rays, stars
+  for (let i = 0; i < 9; i++) tick(3.25 + i * T6, 0.011, 0.5 - i * 0.12);
+  pof(q.bear + 0.2, 0.035);
+  to = 's'; blip(q.sun, 950, 520, 0.05, 0.028, 0.4); noiseHit(q.sun, 0.03, 'bandpass', 2400, 2, 0.03, 0.4, 0.1);
+  for (let i = 0; i < 12; i++) tick(q.sun + T6 + i * T12, 0.011, 0.4);
+  to = 's';
+  for (let i = 0; i < 6; i++) blip(q.stars + i * T6, 2800 + (i % 3) * 380, 3300 + (i % 3) * 380, 0.05, 0.013, i % 2 ? 0.4 : -0.4);
+  blip(5.0, 620, 880, 0.09, 0.02, -0.3); blip(5.17, 700, 990, 0.1, 0.02, -0.3);   // the bear says hello
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

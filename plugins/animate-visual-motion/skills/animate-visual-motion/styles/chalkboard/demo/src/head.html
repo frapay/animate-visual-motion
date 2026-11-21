@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chalkboard demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111a16; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  CHALKBOARD DEMO — 9:16, 6.0s @ 120 BPM, 24fps. An eraser wipes last lesson off the board; the sun is chalked in,
+//  scribbled yellow, its temperature written beside it; the sun's circle becomes the Earth, the Moon circles it and
+//  "1 putaran ≈ 27 hari" writes itself. The hero, a stick of pink chalk, points and waves.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/chalkboard/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const HAND = '"Chalkboard SE", "Chalkboard", "Segoe Print", "Ink Free", "Comic Sans MS", "Comic Neue", cursive';
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneSun()], [3, 6, () => sceneEarth()]];
+const SHOTS = [
+  ['sun', 0, 0.0, 3.0, 'last lesson is wiped off; the sun is chalked in, scribbled yellow, its temperature written beside it'],
+  ['earth', 1, 3.0, 6.0, 'the sun circle becomes the Earth; the Moon circles it; 1 putaran ≈ 27 hari writes itself'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { wipe: 0.1, sun: 0.5, temp: 1.5, ring: 2.0, earth: 3.5, arrow: 3.75, month: 4.0, tick: 5.0, hop1: 5.0, hop2: 5.5 },
+  acts: [
+    { name: '1 Matahari', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Bumi', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.0, title: 'the sun is chalked in', sound: 'chalk scratches on 16ths', next: 'its temperature writes itself' },
+    { t: 4.5, title: 'the Earth and its Moon', sound: 'warm pad, plucks on the hops', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

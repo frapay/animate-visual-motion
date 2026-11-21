@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aurora demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05051a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  AURORA DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A launch film for an invented, unnamed product. Dusk: a violet,
+//  magenta and orange mesh drifts on navy, a curtain of light undulates, a warm orb rises and settles inside hairline
+//  orbits with a small satellite circling it, and a teaser arrives word by word. At 3.0s the dusk closes onto the orb,
+//  which turns from orange to mint and opens a second, teal / lime / sky world: the orb now sits inside a tilted
+//  gradient ring, the satellite rides the ring, and the payoff lands with a pill.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/aurora/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneDusk()], [3, 6, () => sceneMint()]];
+const SHOTS = [
+  ['dusk', 0, 0.0, 3.0, 'the teaser: a dusk mesh drifts, a curtain of light undulates, a warm orb rises inside hairline orbits, a satellite circles it'],
+  ['mint', 1, 3.0, 6.0, 'the payoff: the orb turns mint inside a tilted gradient ring, the satellite rides the ring, "Now available." and a pill'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.1, orbit: 0.5, words: 0.25, line: 1.25, close: 2.5, turn: 3.0, ring: 3.5, payoff: 3.75, arcs: 4.0, pill: 4.5, tick: 5.0 },
+  acts: [
+    { name: '1 Teaser', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Payoff', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'something brighter is near', sound: 'an airy minor-ninth pad, soft bell notes as the words land, a breath of air', next: 'the dusk closes onto the orb: orange turns to mint' },
+    { t: 5.25, title: 'now available', sound: 'the pad opens to major, a bell chord on the payoff, a soft tick for the pill', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

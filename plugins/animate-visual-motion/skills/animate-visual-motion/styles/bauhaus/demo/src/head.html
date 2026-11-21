@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bauhaus demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #191715; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  BAUHAUS DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a gridded sheet a black square, a blue circle and a yellow
+//  triangle arrive one per beat and stack; Bola, the red disc, rolls in and bumps the stack, and the triangle is
+//  knocked up into the air. At 3.0s the triangle becomes the sun over a city that assembles itself from bars,
+//  squares and a quarter circle: windows light up, a big wheel turns, a bird flies, Bola rolls in and hops.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/bauhaus/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneBentuk()], [3, 6, () => sceneKota()]];
+const SHOTS = [
+  ['bentuk', 0, 0.0, 3.0, 'a square, a circle and a triangle arrive on the grid and stack; the hero rolls in and bumps them; the triangle jumps'],
+  ['kota',   1, 3.0, 6.0, 'the triangle becomes the sun; a city assembles under it, windows light up, a wheel turns; the hero rolls in and hops'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { sq: 0.5, ci: 1.0, tri: 1.5, roll: 1.5, bump: 2.0, rays: 3.5, b1: 3.75, b2: 4.0, b3: 4.25, b4: 4.5, roll2: 4.0, stop: 4.5, lit: 4.5, hop1: 5.0, hop2: 5.5 },
+  acts: [
+    { name: '1 Bentuk', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Kota',   role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'three basic shapes', sound: 'a dry march, a clack as each shape stops dead', next: 'the triangle becomes the sun' },
+    { t: 5.0, title: 'arranged into a city', sound: 'the march opens up; rising blips, window ticks', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

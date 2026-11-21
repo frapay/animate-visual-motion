@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blueprint demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a3261; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  BLUEPRINT DEMO — 9:16, 6.0s @ 120 BPM, 24fps. "Cara kerja": on a blue gridded sheet a gear draws itself on its
+//  centre lines, a pinion meshes with it, a dimension line measures it, an amber callout counts its teeth, and it
+//  starts to turn while Jangka (a little pair of compasses) watches. At 3.0s the gear morphs into a light bulb:
+//  the filament is drawn in amber, the lamp lights on the beat, callouts name its parts, current marches in.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/blueprint/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneGear()], [3, 6, () => sceneBulb()]];
+const SHOTS = [
+  ['gear', 0, 0.0, 3.0, 'a gear draws itself on, is measured and called out, then turns the dynamo'],
+  ['bulb', 1, 3.0, 6.0, 'the gear becomes a light bulb; the filament is drawn and the lamp lights'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { gear: -0.4, hub: 0.6, pin: 1.0, dim: 1.25, spin: 1.5, call: 2.0,
+          base: 3.2, stem: 3.25, fil: 3.5, kaca: 3.65, lit: 4.0, ulir: 4.5, dim2: 4.9 },
+  acts: [
+    { name: '1 Roda gigi', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Lampu',     role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.4, title: 'the gear is drawn, measured and turning', sound: 'pen scratches, a plucked arpeggio', next: 'the gear becomes a bulb' },
+    { t: 5.0, title: 'the lamp is lit', sound: 'kick, arpeggio, a chime on the light', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

@@ -1,0 +1,12 @@
+{
+  "name": "animate-visual-motion",
+  "version": "1.0.0",
+  "description": "Make short procedural animations — explainers, histories, stories, product launches — as single-file canvas videos with a synthesized score, rendered to MP4. 50 built-in styles plus new ones from your references.",
+  "author": {
+    "name": "frapay"
+  },
+  "homepage": "https://github.com/frapay/animate-visual-motion",
+  "repository": "https://github.com/frapay/animate-visual-motion",
+  "license": "MIT",
+  "keywords": ["animation", "video", "motion-graphics", "canvas", "mp4", "explainer"]
+}

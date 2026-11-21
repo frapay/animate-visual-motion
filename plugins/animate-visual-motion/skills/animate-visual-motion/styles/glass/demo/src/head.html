@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glass demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0a26; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  GLASS DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A finance app in frosted glass over an aurora: a balance card counts
+//  up while its chart draws, a savings ring fills, toggles flip on the beat, and Embun the glass orb lands on the
+//  card. At 3.0s the savings ring morphs into a rounded "Berhasil" badge card on a small dashboard: a transfer
+//  row, weekly bars, and the same ring reaching 100%. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/glass/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneWallet()], [3, 6, () => sceneDash()]];
+const SHOTS = [
+  ['wallet', 0, 0.0, 3.0, 'the balance counts up, the chart draws, the ring fills, toggles flip; the orb lands on the card'],
+  ['dash',   1, 3.0, 6.0, 'the ring becomes a success badge card; a transfer row, bars and a full ring float in'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { ringCard: 0.1, togCard: 0.3, count: 0.3, chart: 0.2, land: 0.5, ring: 0.4, tog1: 1.0, done: 1.5, tog2: 1.5, tog3: 2.0,
+          check: 3.3, hero2: 3.25, row: 3.35, chipA: 3.5, chipB: 3.6, bars: 3.6, ring2: 3.75, fill: 4.0, full: 5.0 },
+  acts: [
+    { name: '1 Dompet', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Dasbor', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'everything in one app', sound: 'glass plucks, a soft pad, UI ticks', next: 'the ring becomes a badge' },
+    { t: 5.2, title: 'done in seconds', sound: 'kick, bass, a success chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Batik demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #24130a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  BATIK DEMO — 9:16, 6.0s @ 80 BPM, 24fps. A sogan cloth: a kawung pattern grows outward from the centre, parang
+//  borders draw on, and a canting waxes Kukila the bird onto a plain medallion; above it a big kawung flower is
+//  waxed and filled. At 3.0s the flower morphs into a mega mendung cloud on an indigo cloth: clouds open contour by
+//  contour, truntum stars come out, Kukila flies. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/batik/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 80, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneKawung()], [3, 6, () => sceneMega()]];
+const SHOTS = [
+  ['kawung', 0, 0.0, 3.0, 'a kawung pattern grows across sogan cloth; a canting waxes the bird; a big kawung flower fills'],
+  ['mega',   1, 3.0, 6.0, 'the flower becomes a mega mendung cloud on indigo; clouds open, stars come out, the bird flies'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { field: -1.5, border: -0.7, bird: -0.2, flower: 0.75, glow: 1.5, spark: 1.875, clouds: 3.0, fly: 3.0, stars: 3.75 },
+  acts: [
+    { name: '1 Kawung',       role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Mega Mendung', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the bird is waxed, the flower is filled', sound: 'siter plucks, a soft gong', next: 'the flower becomes a cloud' },
+    { t: 5.2, title: 'the bird flies through mega mendung', sound: 'plucks an octave up, chimes', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

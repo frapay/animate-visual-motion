@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Line art demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f6f2ea; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LINE ART DEMO — 9:16, 6.0s @ 80 BPM, 24fps. One unbroken line runs along a table, draws a coffee cup and then
+//  Garis the cat sitting beside it; a honey-coloured blob pops in behind the cup and steam rises. At 3.0s the blob
+//  morphs into the morning sun: on a sage ground the same line leaves the cat, runs along the sill, closes a pot
+//  and grows a plant leaf by leaf while the sun's rays tick on and a bird crosses.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/line-art/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 80, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneCoffee()], [3, 6, () => scenePlant()]];
+const SHOTS = [
+  ['coffee', 0, 0.0, 3.0, 'one line draws a cup and the cat; the accent blob pops in; steam rises'],
+  ['plant',  1, 3.0, 6.0, 'the blob becomes the sun; the line grows a potted plant; rays, a bird'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { line: -1.0, lineDur: 2.35, blob: 1.5, steam: 1.6, line2: 2.9, line2Dur: 1.85, rays: 3.55, bird: 3.2, done2: 4.75 },
+  acts: [
+    { name: '1 Pagi',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Tumbuh', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'the cup and the cat, one line', sound: 'felt plucks, a pen hiss', next: 'the blob becomes the sun' },
+    { t: 5.2, title: 'the plant has grown', sound: 'plucks, a soft chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

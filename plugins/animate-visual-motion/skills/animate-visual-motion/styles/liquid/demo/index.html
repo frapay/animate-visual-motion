@@ -1,0 +1,1501 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1040; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LIQUID DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a light ground a wave band sweeps away, Tetes the drop falls
+//  into its puddle and splashes while a coral blob of ideas pulls droplets in and out of itself. At 3.0s the
+//  blob morphs into a rounded heart on a deep ground: waves roll, bubbles rise, the heart drips into the water
+//  and Tetes pops up to ride the wave. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/liquid/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneIde()], [3, 6, () => sceneKarya()]];
+const SHOTS = [
+  ['ide',   0, 0.0, 3.0, 'a wave sweeps off; the drop falls into its puddle and splashes; a blob of ideas merges and splits'],
+  ['karya', 1, 3.0, 6.0, 'the blob becomes a heart over rolling waves; it drips, bubbles rise, the drop rides the wave'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { fall: 0.25, land: 0.75, split1: 1.0, split2: 1.5, join: 2.0, waves: 3.2, pop: 3.75, drip1: 4.0, drip2: 5.0 },
+  acts: [
+    { name: '1 Ide',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Karya', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.5, title: 'ideas flow', sound: 'soft pad, marimba, a plop', next: 'the blob becomes a heart' },
+    { t: 5.0, title: 'the work is loved', sound: 'kick, arpeggio, drips', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/liquid/kit.js — LIQUID: borderless organic blobs with bold two-stop gradients, a soft specular
+//  highlight and a small soft shadow, on a clean light or deep ground. Blobs wobble (closed curves whose
+//  radius is a sum of sines), merge and split through neck shapes (a faked metaball: no pixel field, no blur),
+//  wave bands sweep, drops fall and splash, bubbles rise. Rounded bold sans type on white pills.
+//  Built on kit/core.js. Motion on 1s. Helpers are prefixed lq…; the palette is LQ. Needs from the piece head: CX.
+// =====================================================================
+const LQ = {
+  paper: '#fff6ee', paperB: '#ffe9e2',            // the light ground (top, bottom)
+  deep: '#1a1040', deepB: '#2c1768',              // the deep ground (top, bottom)
+  ink: '#2a1b4d', inkL: '#7d6d9e', white: '#ffffff',
+  shadow: 'rgba(44,16,84,0.055)',                 // one of three stacked shadow layers
+  g: {                                            // gradient pairs [light stop, deep stop]
+    sky: ['#5fd2ff', '#5a55f2'],                  // the hero (Tetes) and its own water: reserved
+    coral: ['#ff8f5c', '#f0388a'],                // coral -> magenta: the main subject
+    heart: ['#ff7092', '#d02fb6'],                // pink -> magenta: love, the result
+    berry: ['#4f86ff', '#9a4dff'],                // blue -> violet: waves, wipes
+    violet: ['#8a6cff', '#4a2bb8'],               // violet -> deep violet: back waves on the deep ground
+    lime: ['#c8f250', '#17c2a4'],                 // lime -> teal: the fresh accent, front waves
+    sun: ['#ffd84a', '#ff8a3c'],                  // yellow -> orange: small accents only
+    peach: ['#ffe2d2', '#ffd0e4'], lilac: ['#ece4ff', '#dcd6ff'], mint: ['#e2f8e0', '#cdf1ee'],   // pale drifters on the light ground
+    dusk: ['#34207c', '#27155e'],                 // dim drifters on the deep ground
+    dusk2: ['#5a3cc8', '#33208a'],                // the farthest wave on the deep ground
+  },
+};
+const LQ_SANS = '"Arial Rounded MT Bold", "Varela Round", "Nunito", "Quicksand", "Segoe UI", "Helvetica Neue", Arial, "DejaVu Sans", sans-serif';
+
+// ---------------------------------------------------------------------
+//  colour
+// ---------------------------------------------------------------------
+function lqRGB(c) { if (c[0] === '#') return [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)); const m = c.match(/[\d.]+/g); return [+m[0], +m[1], +m[2]]; }
+const lqMix = (a, b, u) => { const x = lqRGB(a), y = lqRGB(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+const lqA = (c, al) => { const x = lqRGB(c); return `rgba(${x[0]},${x[1]},${x[2]},${al})`; };
+// a gradient pair from anything: a pair stays; one colour becomes [lighter, deeper and a little more violet]
+const lqPair = (c) => (Array.isArray(c) ? c : [lqMix(c, '#ffffff', 0.2), lqMix(c, '#7a1fb0', 0.3)]);
+
+// ---------------------------------------------------------------------
+//  geometry: every outline is a list of points drawn as one smooth closed curve (no corners)
+// ---------------------------------------------------------------------
+function lqBB(P) { let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; } return [x0, y0, x1, y1]; }
+function lqCentroid(P) { let x = 0, y = 0; for (const p of P) { x += p[0]; y += p[1]; } return [x / P.length, y / P.length]; }
+function lqSmooth(P, it = 2) {   // round a closed outline: average each point with its neighbours
+  for (let k = 0; k < it; k++) { const n = P.length; P = P.map((p, i) => { const a = P[(i + n - 1) % n], b = P[(i + 1) % n]; return [(a[0] + 2 * p[0] + b[0]) / 4, (a[1] + 2 * p[1] + b[1]) / 4]; }); }
+  return P;
+}
+function lqArea(P) { let s = 0; for (let i = 0, n = P.length; i < n; i++) { const a = P[i], b = P[(i + 1) % n]; s += a[0] * b[1] - b[0] * a[1]; } return s / 2; }
+// the smooth closed path through P (quadratic curves through the midpoints). add = true appends a sub-path.
+function lqPath(P, add) {
+  if (!add) ctx.beginPath();
+  const n = P.length, m = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], s = m(P[n - 1], P[0]);
+  ctx.moveTo(s[0], s[1]);
+  for (let i = 0; i < n; i++) { const e = m(P[i], P[(i + 1) % n]); ctx.quadraticCurveTo(P[i][0], P[i][1], e[0], e[1]); }
+  ctx.closePath();
+}
+// a wobbling blob: a circle whose radius is a sum of three sines of the angle, phases from the key, drifting with time
+//   o: key, amp (0.07 = calm, 0.14 = lively), speed, n, sx, sy (squash / stretch), rot, t (default TT)
+function lqBlobPts(x, y, r, o = {}) {
+  const R = RNG('lqblob', o.key ?? 'b'), p0 = R.r(0, TAU), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const amp = o.amp ?? 0.07, sp = o.speed ?? 1, t = o.t ?? TT, n = o.n ?? 72, sx = o.sx ?? 1, sy = o.sy ?? 1, rot = o.rot ?? 0;
+  const cr = Math.cos(rot), sr = Math.sin(rot), P = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU, k = 1 + amp * (0.5 * Math.sin(2 * a + p0 + t * sp * 1.3) + 0.3 * Math.sin(3 * a + p1 - t * sp * 1.9) + 0.2 * Math.sin(5 * a + p2 + t * sp * 2.6));
+    const px = Math.cos(a) * r * k * sx, py = Math.sin(a) * r * k * sy;
+    P.push([x + px * cr - py * sr, y + px * sr + py * cr]);
+  }
+  return P;
+}
+// a drop: a round body (centre x, y, radius r) with a soft rounded tip on top. o: tip (0.55), lean (rad), sx, sy, sig, n
+function lqDropPts(x, y, r, o = {}) {
+  const tip = o.tip ?? 0.55, up = -Math.PI / 2 + (o.lean ?? 0), sig = o.sig ?? 0.4, n = o.n ?? 72, sx = o.sx ?? 1, sy = o.sy ?? 1, P = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU; let d = a - up; d = Math.atan2(Math.sin(d), Math.cos(d));
+    const k = 1 + tip * Math.exp(-((d / sig) ** 2));
+    P.push([x + Math.cos(a) * r * k * sx, y + Math.sin(a) * r * k * sy]);
+  }
+  return P;
+}
+// a rounded heart about (x, y), half-width ~r: the classic curve with its notch and point smoothed away
+function lqHeartPts(x, y, r, n = 96) {
+  const P = [];
+  for (let i = 0; i < n; i++) { const t = i / n * TAU, s = Math.sin(t); P.push([x + 16 * s * s * s * r / 16.4, y - (13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t) + 2.6) * r / 16.4]); }
+  return lqSmooth(P, 7);
+}
+const lqCirclePts = (x, y, r, n = 48) => lqBlobPts(x, y, r, { amp: 0, n });
+// a pill (stadium) outline
+function lqPillPts(x, y, w, h) {
+  const r = Math.min(w, h) / 2, P = [], n = 14;
+  for (let i = 0; i <= n; i++) { const a = -Math.PI / 2 + i / n * Math.PI; P.push([x + w - r + Math.cos(a) * r, y + r + Math.sin(a) * r]); }
+  for (let i = 0; i <= n; i++) { const a = Math.PI / 2 + i / n * Math.PI; P.push([x + r + Math.cos(a) * r, y + r + Math.sin(a) * r]); }
+  return P;
+}
+function lqPoly(P, add) { if (!add) ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); }
+
+// ---------------------------------------------------------------------
+//  the neck between two round blobs a = [x, y, r], b = [x, y, r]: the faked metaball. Two curves tangent to
+//  both circles; it thins as they move apart and breaks at `reach` (in small-radius units past touching).
+//  Returns a closed polygon (through both centres, so it also fills the overlap), or null when they are apart.
+// ---------------------------------------------------------------------
+function lqNeck(a, b, v = 0.5, reach = 2.2) {
+  const [x1, y1, r1] = a, [x2, y2, r2] = b, d = Math.hypot(x2 - x1, y2 - y1), maxD = r1 + r2 + Math.min(r1, r2) * reach;
+  if (r1 < 1 || r2 < 1 || d <= Math.abs(r1 - r2) + 1 || d >= maxD) return null;
+  const far = seg(d, r1 + r2, maxD); v *= 1 - far ** 1.6;
+  let u1 = 0, u2 = 0;
+  if (d < r1 + r2) { u1 = Math.acos(clamp((r1 * r1 + d * d - r2 * r2) / (2 * r1 * d), -1, 1)); u2 = Math.acos(clamp((r2 * r2 + d * d - r1 * r1) / (2 * r2 * d), -1, 1)); }
+  const ab = Math.atan2(y2 - y1, x2 - x1), ms = Math.acos(clamp((r1 - r2) / d, -1, 1));
+  const a1 = ab + u1 + (ms - u1) * v, a2 = ab - u1 - (ms - u1) * v, a3 = ab + Math.PI - u2 - (Math.PI - u2 - ms) * v, a4 = ab - Math.PI + u2 + (Math.PI - u2 - ms) * v;
+  const vec = (x, y, an, r) => [x + Math.cos(an) * r, y + Math.sin(an) * r];
+  const p1 = vec(x1, y1, a1, r1), p2 = vec(x1, y1, a2, r1), p3 = vec(x2, y2, a3, r2), p4 = vec(x2, y2, a4, r2);
+  const d2 = Math.min(v * 2.4, Math.hypot(p1[0] - p3[0], p1[1] - p3[1]) / (r1 + r2)) * Math.min(1, d * 2 / (r1 + r2));
+  const h1 = vec(p1[0], p1[1], a1 - Math.PI / 2, r1 * d2), h2 = vec(p2[0], p2[1], a2 + Math.PI / 2, r1 * d2);
+  const h3 = vec(p3[0], p3[1], a3 + Math.PI / 2, r2 * d2), h4 = vec(p4[0], p4[1], a4 - Math.PI / 2, r2 * d2);
+  const bez = (A, B2, C2, D, out) => { for (let i = 0; i <= 14; i++) { const t = i / 14, m = 1 - t; out.push([m * m * m * A[0] + 3 * m * m * t * B2[0] + 3 * m * t * t * C2[0] + t * t * t * D[0], m * m * m * A[1] + 3 * m * m * t * B2[1] + 3 * m * t * t * C2[1] + t * t * t * D[1]]); } };
+  const P = []; bez(p1, h1, h3, p3, P); P.push([x2, y2]); bez(p4, h4, h2, p2, P); P.push([x1, y1]);
+  return P;
+}
+
+// ---------------------------------------------------------------------
+//  paint: the liquid surface. build() adds sub-paths to the current path; bb = [x0, y0, x1, y1] of the whole shape.
+//  Three stacked offset fills make the soft shadow (no blur); a two-stop gradient across the box; then, clipped
+//  to the shape, a soft sheen and a crisp glint per gloss spot [cx, cy, rx, ry].
+//   o: al, angle (gradient direction, rad; 0.95 = towards bottom-right), shadow (false | px), gloss (0..1), spots
+// ---------------------------------------------------------------------
+function lqGloss(cx, cy, rx, ry, g) {
+  const R = Math.max(rx, ry), hx = cx - rx * 0.34, hy = cy - ry * 0.4;
+  const sh = ctx.createRadialGradient(hx, hy, 0, hx, hy, R * 0.8); sh.addColorStop(0, `rgba(255,255,255,${0.44 * g})`); sh.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = sh; ctx.fillRect(hx - R * 0.8, hy - R * 0.8, R * 1.6, R * 1.6);
+  const lw = Math.min(rx, ry) * 0.1; if (lw < 1.2) return;
+  ctx.save(); ctx.strokeStyle = `rgba(255,255,255,${0.8 * g})`; ctx.fillStyle = ctx.strokeStyle; ctx.lineCap = 'round'; ctx.lineWidth = lw;
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx * 0.7, ry * 0.7, 0, -2.62, -2.02); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx + Math.cos(-2.9) * rx * 0.7, cy + Math.sin(-2.9) * ry * 0.7, lw * 0.56, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function lqPaint(build, bb, c, o = {}) {
+  const pair = lqPair(c), w = bb[2] - bb[0], h = bb[3] - bb[1], cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2, s = Math.min(w, h);
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1;
+  if (o.shadow !== false && s > 36) {
+    const off = typeof o.shadow === 'number' ? o.shadow : clamp(s * 0.075, 6, 26);
+    ctx.fillStyle = LQ.shadow;
+    for (let i = 0; i < 3; i++) { ctx.save(); ctx.translate(cx, cy + off * (0.5 + i * 0.45)); ctx.scale(1 + i * 0.012, 1 + i * 0.012); ctx.translate(-cx, -cy); ctx.beginPath(); build(); ctx.fill(); ctx.restore(); }
+  }
+  const an = o.angle ?? 0.95, dx = Math.cos(an) * w / 2, dy = Math.sin(an) * h / 2;
+  const g = ctx.createLinearGradient(cx - dx, cy - dy, cx + dx, cy + dy); g.addColorStop(0, pair[0]); g.addColorStop(1, pair[1]);
+  ctx.beginPath(); build(); ctx.fillStyle = g; ctx.fill();
+  const gl = o.gloss ?? 1;
+  if (gl > 0) { ctx.clip(); for (const sp of o.spots ?? [[cx, cy, w / 2, h / 2]]) lqGloss(sp[0], sp[1], sp[2], sp[3], gl); }
+  ctx.restore();
+}
+// one closed outline, painted. o as lqPaint + raw (true = P is a polygon, drawn with straight segments)
+function lqFill(P, c, o = {}) { lqPaint(() => (o.raw ? lqPoly(P, true) : lqPath(P, true)), lqBB(P), c, o); }
+// several blobs as ONE liquid body: their outlines plus a neck between every pair that is close enough, filled
+// together (one gradient, one shadow), a glint on each.
+//   items: { x, y, r, key, amp, speed, sx, sy }   a wobbling blob, or
+//          { P, x, y, r }                          a custom outline whose neck circle is (x, y, r); neck: false = never necks
+//   o: as lqPaint + v (neck fatness 0.5), reach (2.2)
+function lqGoo(items, c, o = {}) {
+  const polys = [], smooth = [], spots = [];
+  for (const it of items) {
+    if (!(it.r > 0.5)) continue;
+    const P = it.P || lqBlobPts(it.x, it.y, it.r, it);
+    polys.push(lqArea(P) < 0 ? P.slice().reverse() : P); smooth.push(true);
+    if (it.gloss !== false) spots.push(it.spot || [it.x, it.y, it.r * (it.sx ?? 1), it.r * (it.sy ?? 1)]);
+  }
+  const live = items.filter((it) => it.r > 0.5 && it.neck !== false);
+  for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
+    const N = lqNeck([live[i].x, live[i].y, live[i].r * 0.96], [live[j].x, live[j].y, live[j].r * 0.96], o.v ?? 0.5, o.reach ?? 2.2);
+    if (N) { polys.push(lqArea(N) < 0 ? N.reverse() : N); smooth.push(false); }
+  }
+  if (!polys.length) return;
+  const bb = lqBB(polys.flat());
+  lqPaint(() => polys.forEach((P, i) => (smooth[i] ? lqPath(P, true) : lqPoly(P, true))), bb, c, { ...o, spots: o.gloss === 0 ? [] : spots });
+}
+
+// ---------------------------------------------------------------------
+//  ground, drifting background blobs, bubbles
+// ---------------------------------------------------------------------
+function lqGround(top = LQ.paper, bottom = LQ.paperB) {
+  ctx.save(); screen(); const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, top); g.addColorStop(1, bottom); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
+}
+// big quiet blobs drifting slowly behind everything. pairs: a list of gradient pairs. o: r [min, max], al, box [x0, y0, x1, y1], speed
+function lqDrift(key, n, pairs, o = {}) {
+  const [x0, y0, x1, y1] = o.box ?? [0, 0, W, H], rr = o.r ?? [150, 300], sp = o.speed ?? 1;
+  for (let i = 0; i < n; i++) {
+    const R = RNG('lqdrift', key, i), bx = R.r(x0, x1), by = R.r(y0, y1), r = R.r(rr[0], rr[1]), ph = R.r(0, TAU), f = R.r(0.25, 0.5) * sp;
+    lqFill(lqBlobPts(bx + Math.sin(TT * f + ph) * 60, by + Math.cos(TT * f * 0.8 + ph) * 46, r, { key: key + i, amp: 0.12, speed: 0.5 * sp, n: 40 }), pairs[i % pairs.length], { shadow: false, gloss: 0, al: o.al ?? 1 });
+  }
+}
+// small bubbles rising and swaying, each popping in and out at the ends of its path.
+//   o: box [x0, yBottom, x1, yTop], r [min, max], c (rim colour), al, speed
+function lqBubbles(key, n, o = {}) {
+  const [x0, yb, x1, yt] = o.box ?? [0, H + 40, W, -40], rr = o.r ?? [8, 24], c = o.c ?? '#ffffff', al = o.al ?? 0.7, sp = o.speed ?? 1;
+  for (let i = 0; i < n; i++) {
+    const R = RNG('lqbub', key, i), per = R.r(3.2, 6.5) / sp, u = mod(TT / per + R.r(0, 1), 1), bx = R.r(x0, x1), sw = R.r(8, 26), sf = R.r(1, 2.4), ph = R.r(0, TAU);
+    const rad = R.r(rr[0], rr[1]) * smooth(0, 0.07, u) * (1 - smooth(0.9, 1, u)); if (rad < 1) continue;
+    const x = bx + Math.sin(TT * sf + ph) * sw, y = lerp(yb, yt, u);
+    const g = ctx.createRadialGradient(x, y, rad * 0.35, x, y, rad); g.addColorStop(0, lqA(c, 0.1 * al)); g.addColorStop(0.75, lqA(c, 0.3 * al)); g.addColorStop(1, lqA(c, 0.85 * al));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, rad, 0, TAU); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,${0.9 * al})`; ctx.beginPath(); ctx.arc(x - rad * 0.36, y - rad * 0.38, rad * 0.17, 0, TAU); ctx.fill();
+  }
+}
+
+// ---------------------------------------------------------------------
+//  waves. lqWaveY gives the surface height at x (to float things on it); lqWave fills from the surface down.
+//   o: key, amp (40), len (640, the wavelength), speed (1), t, depth (gradient length, 700), bottom (y to fill to),
+//      al, gloss (crest line 0..1), shadow (false = none)
+// ---------------------------------------------------------------------
+function lqWaveY(x, y, o = {}) {
+  const R = RNG('lqwave', o.key ?? 'w'), p1 = R.r(0, TAU), p2 = R.r(0, TAU), amp = o.amp ?? 40, len = o.len ?? 640, sp = o.speed ?? 1, t = o.t ?? TT;
+  return y + amp * (0.62 * Math.sin(x / len * TAU + p1 + t * sp * 1.9) + 0.38 * Math.sin(x / (len * 0.43) * TAU + p2 - t * sp * 2.7));
+}
+function lqWaveEdge(y, o, x0, x1, step = 30) {
+  const R = RNG('lqwave', o.key ?? 'w'), p1 = R.r(0, TAU), p2 = R.r(0, TAU), amp = o.amp ?? 40, len = o.len ?? 640, sp = o.speed ?? 1, t = o.t ?? TT, E = [];
+  for (let x = x0; x <= x1 + 1; x += step) E.push([x, y + amp * (0.62 * Math.sin(x / len * TAU + p1 + t * sp * 1.9) + 0.38 * Math.sin(x / (len * 0.43) * TAU + p2 - t * sp * 2.7))]);
+  return E;
+}
+function lqEdgeLine(E, dy = 0) { ctx.beginPath(); E.forEach(([x, y], i) => { if (!i) ctx.moveTo(x, y + dy); else { const p = E[i - 1]; ctx.quadraticCurveTo(p[0], p[1] + dy, (p[0] + x) / 2, (p[1] + y) / 2 + dy); } }); }
+function lqWave(y, c, o = {}) {
+  const pair = lqPair(c), amp = o.amp ?? 40, x0 = o.x0 ?? -160, x1 = o.x1 ?? W + 160, bottom = o.bottom ?? H + 400, E = lqWaveEdge(y, o, x0, x1);
+  const body = (dy) => { lqEdgeLine(E, dy); ctx.lineTo(x1, bottom); ctx.lineTo(x0, bottom); ctx.closePath(); };
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1;
+  if (o.shadow !== false) { ctx.fillStyle = LQ.shadow; for (let i = 0; i < 3; i++) { body(-8 - i * 9); ctx.fill(); } }
+  const g = ctx.createLinearGradient(0, y - amp, 0, y + (o.depth ?? 700)); g.addColorStop(0, pair[0]); g.addColorStop(1, pair[1]);
+  body(0); ctx.fillStyle = g; ctx.fill();
+  const gl = o.gloss ?? 1;
+  if (gl > 0) {   // the crest: a soft light band just under the surface and a thin bright line
+    ctx.clip(); ctx.lineCap = 'round';
+    lqEdgeLine(E, 30); ctx.lineWidth = 44; ctx.strokeStyle = `rgba(255,255,255,${0.13 * gl})`; ctx.stroke();
+    lqEdgeLine(E, 17); ctx.lineWidth = 7; ctx.strokeStyle = `rgba(255,255,255,${0.5 * gl})`; ctx.stroke();
+  }
+  ctx.restore();
+}
+// a wave band sweeping the whole frame as a transition (screen space). u: 0 = not yet in, 0.5 = the frame is
+// covered (swap the scene here), 1 = gone. o: dir (1 = upwards, -1 = downwards), key, amp, len, c2 (a second,
+// trailing band in another pair)
+function lqWipe(u, c, o = {}) {
+  if (u <= 0 || u >= 1) return;
+  const dir = o.dir ?? 1, band = H * 1.25, amp = o.amp ?? 70, len = o.len ?? 760, key = o.key ?? 'wipe';
+  const one = (uu, cc, k) => {
+    if (uu <= 0 || uu >= 1) return;
+    const pair = lqPair(cc), top = lerp(H + amp + 20, -band - amp - 20, uu), wo = { key: key + k, amp, len, speed: 1.4 };
+    const A = lqWaveEdge(top, wo, -40, W + 40), Bt = lqWaveEdge(top + band, { ...wo, key: key + k + 'b' }, -40, W + 40);
+    const body = (dy) => { lqEdgeLine(A, dy); for (let i = Bt.length - 1; i >= 0; i--) ctx.lineTo(Bt[i][0], Bt[i][1] + dy); ctx.closePath(); };
+    ctx.fillStyle = LQ.shadow; for (let i = 0; i < 3; i++) { body(10 + i * 10); ctx.fill(); body(-8 - i * 9); ctx.fill(); }
+    const g = ctx.createLinearGradient(0, top, 0, top + band); g.addColorStop(0, pair[0]); g.addColorStop(1, pair[1]);
+    body(0); ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ctx.clip(); ctx.lineCap = 'round';
+    lqEdgeLine(A, 30); ctx.lineWidth = 44; ctx.strokeStyle = 'rgba(255,255,255,0.13)'; ctx.stroke();
+    lqEdgeLine(A, 17); ctx.lineWidth = 7; ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.stroke();
+    ctx.restore();
+  };
+  ctx.save(); screen(); if (dir < 0) { ctx.translate(0, H); ctx.scale(1, -1); }
+  if (o.c2) one(u * 1.12 - 0.12, o.c2, '2');
+  one(u, c, '1');
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  a splash at (x, y): t = seconds since the impact. A flat ripple ring that spreads and fades, and a crown of
+//  droplets thrown up and outwards on arcs (a crown, open in the middle; stretched along their speed) that fall back.
+//   o: key, n (9), power (1), r (droplet 13), spread (px: how far from x the droplets start, to clear what landed)
+// ---------------------------------------------------------------------
+function lqSplash(x, y, t, c, o = {}) {
+  const dur = 0.85; if (t < 0 || t > dur) return;
+  const pair = lqPair(c), u = t / dur, pw = o.power ?? 1, n = o.n ?? 9, r0 = o.r ?? 13, key = o.key ?? 'splash';
+  ctx.save();
+  for (let k = 0; k < 2; k++) {
+    const uu = clamp(u * 1.25 - k * 0.22); if (uu <= 0 || uu >= 1) continue;
+    ctx.beginPath(); ctx.ellipse(x, y, (36 + 190 * EZ.o2(uu)) * pw, (9 + 40 * EZ.o2(uu)) * pw, 0, 0, TAU);
+    ctx.lineWidth = 11 * (1 - uu) * pw + 1; ctx.strokeStyle = lqA(pair[0], 0.75 * (1 - uu)); ctx.stroke();
+  }
+  for (let i = 0; i < n; i++) {
+    const R = RNG('lqsplash', key, i), sg = i % 2 ? 1 : -1, an = -Math.PI / 2 + sg * R.r(0.25, 0.95), sp = R.r(380, 780) * pw, grav = 2100, rr = R.r(0.6, 1.3) * r0 * (1 - u * 0.45);
+    const vx = Math.cos(an) * sp, vy = Math.sin(an) * sp + grav * t, px = x + sg * (o.spread ?? 0) + vx * t, py = y + Math.sin(an) * sp * t + 0.5 * grav * t * t;
+    if (py > y + 6 && vy > 0) continue;
+    const st = 1 + Math.min(0.7, Math.hypot(vx, vy) / 1500);
+    ctx.save(); ctx.translate(px, py); ctx.rotate(Math.atan2(vy, vx)); ctx.scale(st, 1 / st);
+    ctx.fillStyle = i % 2 ? pair[0] : pair[1]; ctx.beginPath(); ctx.arc(0, 0, rr, 0, TAU); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.beginPath(); ctx.arc(px - rr * 0.3, py - rr * 0.34, rr * 0.24, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+// squash from a landing at time t0: a damped wobble (wide, then tall, then settles). Add it to a blob's squash.
+const lqLand = (t0, amt = 0.4, freq = 17, damp = 6.5) => (TT < t0 ? 0 : amt * Math.exp(-(TT - t0) * damp) * Math.cos((TT - t0) * freq));
+// 0 -> 1 with an overshoot that settles (a playful spring) from time t0
+const lqPop = (t0, k = 260, d = 15) => springEase(TT - t0, k, d);
+
+// ---------------------------------------------------------------------
+//  the hero: TETES, a drop with two simple eyes. (x, y) = the centre of its round body, r = the body radius;
+//  the tip rises ~0.55r above it. Sets SPARK_AT.
+//   o: key, squash (+ wide and low, - tall and thin; the base stays put), lean (rad, the tip trails), tip, look (-1..1),
+//      lookY, mood ('smile' | 'wow' | 'calm'), bob (px; default an idle float), c (pair), shadow, eyes (false = none)
+// ---------------------------------------------------------------------
+function lqHeroShape(x, y, r, o = {}) {
+  const q = o.squash ?? 0, sx = 1 + q, sy = 1 / (1 + q);
+  return { sx, sy, cy: y + r * (1 - sy), tip: o.tip ?? 0.55, lean: o.lean ?? 0 };
+}
+function lqHeroPts(x, y, r, o = {}) { const s = lqHeroShape(x, y, r, o); return lqDropPts(x, s.cy, r, { tip: s.tip, lean: s.lean, sx: s.sx, sy: s.sy }); }
+function lqHero(x, y, r, o = {}) {
+  const key = o.key ?? 'tetes';
+  y += o.bob ?? Math.sin(TT * TAU * 0.8 + key.length) * r * 0.045;
+  const s = lqHeroShape(x, y, r, o), cy = s.cy, rx = r * s.sx, ry = r * s.sy;
+  SPARK_AT = toScreen(x, cy);
+  lqFill(lqHeroPts(x, y, r, o), o.c ?? LQ.g.sky, { spots: [[x, cy, rx, ry]], shadow: o.shadow });
+  if (o.eyes === false) return;
+  const mood = o.mood ?? 'smile', look = clamp(o.look ?? 0, -1, 1), ex = rx * 0.33, ey = cy - ry * 0.04 + (o.lookY ?? 0) * ry * 0.1, ox = look * rx * 0.1;
+  const blink = mood !== 'wow' && mod(TT + (key.length % 5) * 0.37, 2.9) < 0.1;
+  const ew = r * (mood === 'wow' ? 0.135 : 0.105), eh = blink ? r * 0.02 : r * (mood === 'wow' ? 0.165 : 0.145) * Math.min(1, s.sy + 0.15);
+  ctx.save();
+  for (const sg of [-1, 1]) {
+    ctx.fillStyle = LQ.ink; ctx.beginPath(); ctx.ellipse(x + ox + sg * ex, ey, ew, eh, 0, 0, TAU); ctx.fill();
+    if (!blink) { ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(x + ox + sg * ex + ew * 0.3 + look * ew * 0.2, ey - eh * 0.36, ew * 0.34, 0, TAU); ctx.fill(); }
+  }
+  const my = ey + ry * 0.3, mx = x + ox * 1.2;
+  if (mood === 'wow') { ctx.fillStyle = LQ.ink; ctx.beginPath(); ctx.ellipse(mx, my + r * 0.03, r * 0.075, r * 0.1, 0, 0, TAU); ctx.fill(); }
+  else if (mood !== 'calm') { ctx.strokeStyle = LQ.ink; ctx.lineWidth = r * 0.055; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(mx, my - r * 0.1, r * 0.17, Math.PI * 0.2, Math.PI * 0.8); ctx.stroke(); }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  type: a rounded bold sans. lqText draws one string; o: align, base, weight, al, grad (a pair: gradient-filled)
+// ---------------------------------------------------------------------
+const lqFont = (size, weight = 800) => { ctx.font = `${weight} ${size}px ${LQ_SANS}`; };
+function lqTextW(str, size, weight = 800) { ctx.save(); lqFont(size, weight); const w = ctx.measureText(str).width; ctx.restore(); return w; }
+function lqText(str, x, y, size, c, o = {}) {
+  const al = o.al ?? 1; if (al <= 0.001) return 0;
+  ctx.save(); lqFont(size, o.weight ?? 800); ctx.textAlign = o.align ?? 'left'; ctx.textBaseline = o.base ?? 'alphabetic'; ctx.globalAlpha *= al;
+  const w = ctx.measureText(str).width;
+  if (o.grad) { const x0 = x - (ctx.textAlign === 'center' ? w / 2 : ctx.textAlign === 'right' ? w : 0), g = ctx.createLinearGradient(x0, y - size, x0 + w, y); g.addColorStop(0, o.grad[0]); g.addColorStop(1, o.grad[1]); ctx.fillStyle = g; }
+  else ctx.fillStyle = c;
+  ctx.fillText(str, x, y); ctx.restore(); return w;
+}
+// a borderless plate (a pill) with the kit's soft shadow, no gloss
+function lqPlate(x, y, w, h, c = '#ffffff', al = 1) {
+  const P = lqPillPts(x, y, w, h);
+  ctx.save(); ctx.globalAlpha *= al;
+  ctx.fillStyle = 'rgba(44,16,84,0.06)'; for (let i = 0; i < 3; i++) { ctx.save(); ctx.translate(0, 5 + i * 5); lqPoly(P); ctx.fill(); ctx.restore(); }
+  lqPoly(P); ctx.fillStyle = c; ctx.fill(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  captions and tags (DEFER: after the camera, at screen size). Each caption line sits on its own white pill that
+//  springs open; words rise in one by one; *a phrase* is filled with a gradient. They fade out as a bridge starts
+//  to shrink and fade in when the next era has opened.
+// ---------------------------------------------------------------------
+function lqBridgeAl() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.25));
+    if (TT >= r.tc && TT < r.tc + d + 0.2) return EZ.o2(seg(TT, r.tc + d - 0.15, r.tc + d + 0.2));
+  }
+  return 1;
+}
+//   o: y (baseline of the last line, 1452), size (70), at (seconds after the era starts, 0.6), hi (pair for the
+//      *phrase*), c (text), plate (pill colour; false = no pill), x (centre)
+function lqCaptionNow(str, o = {}) {
+  const al = lqBridgeAl(); if (al <= 0.001) return;
+  const size = o.size ?? 70, ph = size * 1.5, gap = size * 0.2, t0 = E0 + (o.at ?? 0.6), lines = str.split('\n'), yLast = o.y ?? 1452, cx = o.x ?? CX;
+  const hi = o.hi ?? LQ.g.coral, col = o.c ?? LQ.ink;
+  let k = 0;
+  ctx.save(); ctx.globalAlpha = al;
+  lines.forEach((line, li) => {
+    const words = line.split(/(\*[^*]+\*)/).filter((g) => g.trim()).flatMap((g) => (g[0] === '*' ? g.slice(1, -1).trim().split(/\s+/).map((w) => ({ w, hi: true })) : g.trim().split(/\s+/).map((w) => ({ w, hi: false }))));
+    lqFont(size); const sp = ctx.measureText(' ').width, ws = words.map((d) => lqTextW(d.w, size)), tw = ws.reduce((a, b) => a + b, 0) + sp * (words.length - 1);
+    const by = yLast - (lines.length - 1 - li) * (ph + gap), tl = t0 + li * 0.14, p = lqPop(tl, 300, 20);
+    if (TT < tl) { k += words.length; return; }
+    if (o.plate !== false) {
+      const pw = (tw + size * 1.1) * lerp(0.35, 1, p), hh = ph * lerp(0.6, 1, Math.min(1, p));
+      lqPlate(cx - pw / 2, by - size * 0.36 - hh / 2, pw, hh, o.plate ?? '#ffffff', clamp((TT - tl) * 8));
+    }
+    let xx = cx - tw / 2;
+    words.forEach((d, i) => {
+      const tw0 = tl + 0.08 + i * 0.07, q = lqPop(tw0, 280, 17), a = clamp((TT - tw0) * 9); k++;
+      if (a > 0) lqText(d.w, xx, by + (1 - q) * size * 0.45, size, col, { al: a, grad: d.hi ? hi : null });
+      xx += ws[i] + sp;
+    });
+  });
+  ctx.restore();
+}
+//   a small tag, top-left: a gradient bead with the number, then the label. o: c (pair), x, y
+function lqTagNow(num, label, o = {}) {
+  const al = lqBridgeAl(), t0 = E0 + (o.at ?? 0.15); if (al <= 0.001 || TT < t0) return;
+  const x = o.x ?? 70, y = o.y ?? 262, h = 72, size = 32, p = lqPop(t0, 300, 20), lw = lqTextW(label, size), w = (h + 16 + lw + 34) * lerp(0.4, 1, p);
+  ctx.save(); ctx.globalAlpha = al * clamp((TT - t0) * 8);
+  lqPlate(x, y, w, h, '#ffffff');
+  lqFill(lqCirclePts(x + h / 2, y + h / 2, h / 2 - 8, 32), o.c ?? LQ.g.coral, { shadow: false, gloss: 0.7 });
+  const a = clamp((TT - t0 - 0.1) * 8);
+  lqText(num, x + h / 2, y + h / 2 + 2, 26, '#ffffff', { align: 'center', base: 'middle', al: a });
+  lqText(label, x + h + 12, y + h / 2 + 2, size, LQ.ink, { base: 'middle', al: a });
+  ctx.restore();
+}
+const lqTag = (num, label, o = {}) => { const f = () => lqTagNow(num, label, o); if (DEFER) DEFER.push(f); else f(); };
+const lqCaption = (str, o = {}) => { const f = () => lqCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// ---------------------------------------------------------------------
+//  bridges: register the two gradient pairs of a morph so the shape keeps its real gradients while it changes
+//  (the renderer only hands STYLE.blob one blended colour). Call once, beside BRIDGES: lqBridgePair(3.0, pairA, pairB).
+// ---------------------------------------------------------------------
+const LQ_BRIDGE = {};
+function lqBridgePair(tc, a, b) { LQ_BRIDGE['morph' + tc] = [a, b]; LQ_BRIDGE['mA' + tc] = [a, a]; LQ_BRIDGE['mB' + tc] = [b, b]; }
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'liquid',
+  paper: LQ.paper,
+  // a bridge happens on the clean paper (blending two grounds half-way gives a grey that no liquid frame has)
+  backdrop(c, o) { fillAll(o && o.phase ? STYLE.paper : c); },
+  // the era seen through the liquid outline P; a rim of the shape's own gradient swells as the window leaves the object
+  window(P, key, src, o = {}) {
+    ctx.save(); lqPath(P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    const u = o.u ?? 0, wd = 40 * (o.phase === 'grow' ? Math.min(1, u * 5) : Math.min(1, (1 - u) * 5));
+    if (wd < 0.5) return;
+    const pair = (LQ_BRIDGE[key] || [lqPair(o.c ?? LQ.g.coral[0])])[0], bb = lqBB(P);
+    const x0 = Math.max(bb[0], -200), y0 = Math.max(bb[1], -200), x1 = Math.min(bb[2], W + 200), y1 = Math.min(bb[3], H + 200);
+    const g = ctx.createLinearGradient(x0, y0, x1, y1); g.addColorStop(0, pair[0]); g.addColorStop(1, pair[1]);
+    ctx.save(); ctx.lineJoin = 'round';
+    lqPath(P); ctx.lineWidth = wd; ctx.strokeStyle = g; ctx.stroke();
+    lqPath(P); ctx.lineWidth = wd * 0.16; ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.stroke();
+    ctx.restore();
+  },
+  // the morphing shape: the same liquid surface, its two gradients blended, with a jelly squash through the change
+  blob(P, c, key, u = 0) {
+    const reg = LQ_BRIDGE[key], pair = reg ? [lqMix(reg[0][0], reg[1][0], u), lqMix(reg[0][1], reg[1][1], u)] : lqPair(c);
+    const ce = lqCentroid(P), q = 0.09 * Math.sin(u * TAU), sx = 1 + q, sy = 1 / (1 + q);
+    lqFill(lqSmooth(P.map(([x, y]) => [ce[0] + (x - ce[0]) * sx, ce[1] + (y - ce[1]) * sy]), 1), pair);
+  },
+  hero(x, y, r, o = {}) { lqHero(x, y, r * 0.8, { key: o.key, mood: o.mood }); },
+  heroColor: LQ.g.sky[1],
+  heroPts(x, y, r) { return lqHeroPts(x, y, r * 0.8); },
+  post() {},
+  ones: true,
+};
+// =====================================================================
+//  SCENES — liquid demo. World units = px at zoom 1; time TT on 1s. Content inside x 60-940, y 250-1500.
+//  Era 1 on the light ground, era 2 on the deep ground.
+// =====================================================================
+const cu = TIMELINE.cues;
+const IDE = { x: 560, y: 690, r: 185 };
+const HEART = { x: 500, y: 640, r: 200 };
+const PUD = { x: 290, y: 1196 };
+const HERO_R = 92;
+
+// ---- era 1: ideas flow
+const ideOpt = () => { const q = lqLand(cu.land, 0.07, 15, 5) + lqLand(cu.join + 0.3, 0.08, 16, 6); return { key: 'ide', amp: 0.075, speed: 1.2, sx: 1 + q, sy: 1 / (1 + q) }; };
+const idePts = () => lqBlobPts(IDE.x, IDE.y, IDE.r, ideOpt());
+function sceneIde() {
+  lqGround(LQ.paper, LQ.paperB);
+  lqDrift('bg1', 4, [LQ.g.peach, LQ.g.lilac, LQ.g.mint], { r: [170, 300], box: [60, 200, 1000, 1700] });
+  lqBubbles('b1', 14, { c: LQ.g.berry[1], al: 0.55, r: [9, 24] });
+  // a lime pair in the corner that keeps merging and splitting
+  const lg = 62 + 58 * Math.sin(TT * 2.1);
+  lqGoo([{ x: 800 - lg, y: 420 + Math.sin(TT * 1.3) * 14, r: 50, key: 'l1', amp: 0.08 }, { x: 800 + lg * 0.55, y: 436 - Math.sin(TT * 1.3) * 14, r: 32, key: 'l2', amp: 0.08 }], LQ.g.lime, { v: 0.55 });
+  // the blob of ideas: two droplets pull out of it, hang on a neck, snap off, then flow back in
+  const back = 1 - EZ.io(seg(TT, cu.join, cu.join + 0.4));
+  const o1 = EZ.io(seg(TT, cu.split1, cu.split1 + 0.6)) * back, o2 = EZ.io(seg(TT, cu.split2, cu.split2 + 0.5)) * back;
+  const s1 = { x: IDE.x + (150 + 190 * o1) * Math.cos(0.62), y: IDE.y + (150 + 190 * o1) * Math.sin(0.62) + Math.sin(TT * 3) * 8 * o1, r: 26 + 40 * Math.min(1, o1 * 2.5), key: 's1', amp: 0.09 };
+  const s2 = { x: IDE.x + (140 + 170 * o2) * Math.cos(3.75), y: IDE.y + (140 + 170 * o2) * Math.sin(3.75) + Math.cos(TT * 3) * 8 * o2, r: 22 + 30 * Math.min(1, o2 * 2.5), key: 's2', amp: 0.09 };
+  lqGoo([{ x: IDE.x, y: IDE.y, r: IDE.r, P: idePts() }, s1, s2], LQ.g.coral, { v: 0.5, reach: 2.6 });
+  // the puddle and the hero: Tetes falls, lands with a squash, splashes
+  const hit = TT - cu.land, pw = 150 + 70 * lqPop(cu.land, 200, 13);
+  lqFill(lqBlobPts(PUD.x, PUD.y, pw, { key: 'pud', amp: 0.05, sy: 0.19, speed: 1.4 }), LQ.g.sky, { gloss: 0.6, shadow: 8 });
+  const fu = seg(TT, cu.fall, cu.land), foot = PUD.y - 10;
+  if (TT >= cu.fall) {
+    const y = lerp(-220, foot - HERO_R, EZ.i2(fu)), falling = fu < 1;
+    lqHero(PUD.x, y, HERO_R, { key: 'tetes', bob: falling ? 0 : undefined, squash: falling ? -0.12 : lqLand(cu.land, 0.42), tip: falling ? 0.95 : 0.55 + lqLand(cu.land, -0.3, 14, 5), look: falling ? 0 : 0.7, lookY: falling ? 1 : -0.6, mood: hit > 0 && hit < 0.7 ? 'wow' : 'smile' });
+  }
+  lqSplash(PUD.x, foot + 4, hit, LQ.g.sky, { key: 'land', n: 12, power: 1.25, spread: 105, r: 18 });
+  // the opening: a wave band sweeps up and away
+  if (TT < 0.6) lqWipe(lerp(0.76, 1, EZ.io(TT / 0.6)), LQ.g.berry, { key: 'open' });
+  lqTag('01', 'IDE', { c: LQ.g.coral });
+  lqCaption('Biarkan ide\n*mengalir bebas*', { at: 0.9 });
+}
+
+// ---- era 2: the work is loved
+const heartPts = () => { const q = TT < 3.6 ? 0 : 0.06 * Math.exp(-mod(TT - 3, BEAT) * 7); return lqHeartPts(HEART.x, HEART.y + Math.sin(TT * 1.6) * 8 * seg(TT, 3.6, 4.2), HEART.r * (1 + q)); };
+const SEA = { back: { key: 'w1', amp: 34, len: 700, speed: 0.6 }, mid: { key: 'w2', amp: 38, len: 560, speed: 0.9 }, front: { key: 'w3', amp: 42, len: 640, speed: 1.2 } };
+function sceneKarya() {
+  lqGround(LQ.deep, LQ.deepB);
+  lqDrift('bg2', 4, [LQ.g.dusk], { r: [190, 320], box: [60, 200, 1000, 1200] });
+  lqBubbles('b2a', 16, { c: '#ffffff', al: 0.5, r: [8, 22], box: [40, 1150, 1040, 180] });
+  const rise = (1 - springEase(TT - cu.waves, 70, 15)) * 620;   // the sea sweeps up as the era opens
+  const yB = 1090 + rise, yM = 1170 + rise * 1.15, yF = 1262 + rise * 1.3;
+  lqWave(yB, LQ.g.dusk2, SEA.back);
+  // the heart, and the drops that hang from it, stretch, let go and fall into the sea
+  const HP = heartPts(), tipY = HEART.y + HEART.r * 0.86, drops = [];
+  for (const [i, t0] of [cu.drip1, cu.drip2].entries()) {
+    const t = TT - t0, dx = HEART.x + (i ? -6 : 6), seaY = lqWaveY(dx, yM, SEA.mid) + 14; if (t < 0) continue;
+    const hang = EZ.io(seg(t, 0, 0.4)), fall = Math.max(0, t - 0.4), y = tipY - 30 + hang * 78 + 0.5 * 2600 * fall * fall;
+    if (y < seaY) drops.push({ x: dx, y, r: 10 + 22 * hang, key: 'dr' + i, amp: 0.05, sy: 1 + Math.min(0.5, fall * 2.2), sx: 1 / Math.sqrt(1 + Math.min(0.5, fall * 2.2)) });
+  }
+  lqGoo([{ P: HP, x: HEART.x, y: tipY - 62, r: 56, spot: [HEART.x, HEART.y - 6, HEART.r * 0.98, HEART.r * 0.86] }, ...drops], LQ.g.heart, { v: 0.6, reach: 2.4 });
+  lqWave(yM, LQ.g.violet, SEA.mid);
+  for (const [i, t0] of [cu.drip1, cu.drip2].entries()) {   // each drop's splash, where it met the sea
+    const dx = HEART.x + (i ? -6 : 6), seaY0 = 1170 + 14, fallT = Math.sqrt(2 * (seaY0 - (tipY + 48)) / 2600);
+    lqSplash(dx, lqWaveY(dx, yM, SEA.mid) + 14, TT - t0 - 0.4 - fallT, LQ.g.heart, { key: 'drip' + i, n: 7, power: 0.7, r: 11 });
+  }
+  // Tetes pops out of the water and rides the front wave
+  const hx = 250, wy = lqWaveY(hx, yF, SEA.front), up = lqPop(cu.pop, 150, 11);
+  if (TT >= cu.pop) lqHero(hx, lerp(wy + 300, wy - 78, up), 104, { key: 'tetes', bob: 0, squash: lqLand(cu.pop + 0.28, -0.2, 14, 5), lean: Math.sin(TT * 2.3) * 0.12, look: 0.75, lookY: -0.9, mood: TT < cu.pop + 0.8 || (TT > cu.drip2 + 0.6 && TT < cu.drip2 + 1.2) ? 'wow' : 'smile' });
+  lqWave(yF, LQ.g.lime, SEA.front);
+  lqSplash(hx, wy + 6, TT - cu.pop - 0.05, LQ.g.lime, { key: 'pop', n: 12, power: 1.15, spread: 120, r: 17 });
+  lqBubbles('b2b', 9, { c: '#ffffff', al: 0.6, r: [7, 16], box: [40, 1900, 1040, 1300] });
+  lqTag('02', 'KARYA', { c: LQ.g.heart });
+  lqCaption('jadi karya\nyang *disukai*', { at: 0.95 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — liquid demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [LQ.paper, LQ.deep];
+function pieceCam(era, t) {
+  if (era === 0) return push(t, 0.9, 2.5, { z: 1.04, p: [IDE.x, IDE.y], to: [IDE.x, IDE.y] });
+  const z = springMove(3.0, 1.1, 1.0, { k: 22, d: 9.5 });
+  return camOf({ z, p: [HEART.x, HEART.y], to: [HEART.x, HEART.y] });
+}
+const BRIDGES = [
+  // the blob of ideas (round) -> the heart (rounded, same size): similar proportions; coral -> pink stays vivid
+  { tc: 3.0,
+    A: () => ({ P: idePts(), c: LQ.g.coral[0] }),
+    B: () => ({ P: heartPts(), c: LQ.g.heart[0] }) },
+];
+lqBridgePair(3.0, LQ.g.coral, LQ.g.heart);
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — liquid demo (inside buildScore(); see kit/score-head.js). Soft and bubbly: a warm triangle pad,
+  // marimba-like plucks, a gentle kick in the second half; every drop is a rising "bloop", every splash a short wet noise.
+  const T = TIMELINE, q = T.cues;
+  const bloop = (t, f, vel, pan = 0) => blip(t, f, f * 2.6, 0.09, vel, pan);                       // a water drop
+  const splash = (t, vel, pan = 0) => { noiseHit(t, 0.28, 'bandpass', 2800, 0.8, vel, pan, 0.45, 700); noiseHit(t + 0.02, 0.12, 'highpass', 5200, 0.7, vel * 0.5, pan, 0.3); };
+  to = 'm';
+  pad(0.0, 3.1, ['C3', 'G3', 'E4', 'A4'], 0.022, { type: 'triangle', cut: 1700, att: 0.5, rel: 0.3, send: 0.5 });
+  pad(3.0, 6.05, ['F2', 'C3', 'A3', 'E4', 'G4'], 0.026, { type: 'triangle', cut: 2300, att: 0.12, rel: 0.3, send: 0.5 });
+  const mA = ['E5', 'G5', 'C5', 'A5', 'G5', 'E5', 'D5', 'G5'], mB = ['A5', 'C6', 'F5', 'E6', 'C6', 'A5', 'G5', 'C6'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; if (t < 0.9 && i % 2) continue; pluck(t, nz((t < 3 ? mA : mB)[i % 8]), t < 3 ? 0.045 : 0.055, i % 2 ? 0.3 : -0.3, 0.3, t < 3 ? 2600 : 3600, 0.3); }
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; bass(t, nz(t < 3 ? (i % 4 < 2 ? 'C2' : 'A1') : (i % 4 < 2 ? 'F2' : 'C2')) * 2, t < 3 ? 0.07 : 0.1); }
+  for (let i = 0; i < 6; i++) { sub(3.0 + i * BEAT, i ? 0.2 : 0.3); noiseHit(3.0 + i * BEAT + E8, 0.05, 'highpass', 7000, 0.7, 0.028, i % 2 ? 0.25 : -0.25); }
+  chime(3.0, [nz('F5'), nz('A5'), nz('C6')], 0.06, 0);
+  chime(q.drip2 + 0.65, [nz('C6'), nz('E6'), nz('G6')], 0.04, 0.2);
+  to = 's';
+  sweep(0.0, 0.55, 0.02, 500, 2600, 0);                                    // the opening wave leaves
+  blip(q.fall, 1500, 520, 0.45, 0.022, -0.3);                              // Tetes falls
+  bloop(q.land, 300, 0.08, -0.3); splash(q.land + 0.01, 0.05, -0.3);      // and lands
+  bloop(q.split1 + 0.45, 620, 0.04, 0.3); bloop(q.split2 + 0.4, 760, 0.04, -0.2);   // droplets snap off
+  bloop(q.join + 0.3, 420, 0.05, 0);                                       // and flow back
+  sweep(2.4, 3.0, 0.014, 400, 3200, 0);
+  noiseHit(3.0, 0.3, 'bandpass', 1200, 0.9, 0.03, 0, 0.4, 400);
+  sweep(q.waves, q.waves + 0.5, 0.016, 300, 1800, 0);                      // the sea rises
+  bloop(q.pop, 260, 0.07, -0.35); splash(q.pop + 0.05, 0.045, -0.35);     // Tetes pops out
+  for (const t of [q.drip1, q.drip2]) { blip(t + 0.4, 1100, 600, 0.25, 0.018, 0); bloop(t + 0.66, 480, 0.06, 0); splash(t + 0.67, 0.03, 0); }
+  [0.4, 1.3, 1.75, 2.2, 3.9, 4.6, 5.3, 5.7].forEach((t, i) => bloop(t, 900 + (i * 137) % 500, 0.014, i % 2 ? 0.5 : -0.5));   // bubbles
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

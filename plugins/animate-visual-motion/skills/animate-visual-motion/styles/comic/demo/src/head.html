@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comic demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #15120f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  COMIC DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Panel 1: Bang, a red squircle kid, is stuck ("HMM…"); on beat 2 a
+//  yellow starburst pops with "TING!", a bulb lights over his head and he shouts "AKU PUNYA IDE!". At 3.0s the
+//  starburst morphs into a sun disc in panel 2: a slanted action panel, speed lines, Bang shoots across it with
+//  "WUSS!". Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/comic/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+const CM_MISREG = 3;   // the comic kit's option: the colour plate sits 3px off the ink plate
+
+const ERA_LIST = [[0, 3, () => sceneIdea()], [3, 6, () => sceneDash()]];
+const SHOTS = [
+  ['idea', 0, 0.0, 3.0, 'panel 1: the hero is stuck, then TING! a starburst, a bulb, a speech bubble'],
+  ['dash', 1, 3.0, 6.0, 'panel 2: the starburst is now a sun; speed lines; the hero shoots across: WUSS!'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { ting: 0.5, bubble: 0.75, cap1: 1.0, sun: 3.25, zoom: 3.5, wuss: 3.75, cap2: 4.0 },
+  acts: [
+    { name: '1 Ide',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Aksi', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'the idea lands', sound: 'sneaky plucks, a ding, a pop', next: 'the starburst becomes a sun' },
+    { t: 5.0, title: 'the hero takes off', sound: 'whoosh, kick and snare, a riff', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

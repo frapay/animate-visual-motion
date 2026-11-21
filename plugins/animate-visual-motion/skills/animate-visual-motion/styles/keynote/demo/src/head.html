@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keynote demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050507; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  KEYNOTE DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A product launch on a dark stage. A pebble-shaped case stands in the
+//  dark with only its rim lit; the beam comes up, dust drifts in it, the key light sweeps across and the gold finish
+//  appears, a specular band crosses it and its status light comes on. At 3.0s the stage closes onto the case and it
+//  becomes what was inside: a watch-like puck. Three hairline leaders reach out of it and three numerals count up
+//  one at a time (48 h, 2x, 0.3 mm) while its charge ring fills.
+//  Proves the style kit renders, morphs and stays deterministic. The product is invented and unbranded.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/keynote/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneTeaser()], [3, 6, () => sceneSpecs()]];
+const SHOTS = [
+  ['teaser', 0, 0.0, 3.0, 'a case in the dark, only its rim lit: the beam comes up, the key light sweeps across, the finish appears, a glint crosses it, its light comes on'],
+  ['specs',  1, 3.0, 6.0, 'the case becomes the puck inside it: leaders reach out, three numerals count up one at a time, the charge ring fills, a glint crosses the glass'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rim: 0.0, beam: 0.25, sweep: 0.75, glint: 1.75, led: 2.0, morph: 3.0, lead1: 3.5, spec1: 3.75, lead2: 4.0, spec2: 4.25, lead3: 4.5, spec3: 4.75, charge: 3.5, glint2: 5.0 },
+  acts: [
+    { name: '1 Teaser', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Specs',  role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'out of the dark', sound: 'a low drone, a slow pulse, air that brightens as the light sweeps across', next: 'the stage closes onto the case: it becomes the puck' },
+    { t: 5.5, title: 'the numbers land', sound: 'a warm major chord; soft ticks as each numeral counts, a bell as it settles', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

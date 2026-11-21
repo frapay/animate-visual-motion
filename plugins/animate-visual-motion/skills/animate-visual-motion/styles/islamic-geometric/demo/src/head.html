@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Islamic geometric demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c1f36; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ISLAMIC GEOMETRIC DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A night city under a full moon: compass circles
+//  construct an 8-fold rosette around the moon, a frieze of woven strapwork builds itself, lanterns sway and
+//  the glowing star (the hero) glides in. The moon becomes a turquoise dome by day; the star rises above it
+//  and gains points (8 -> 12) while zellige tiles construct inside the great arch.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/islamic-geometric/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 250, bottom: 420, right: 140 };
+const CX = 500;
+const HAND = 'Georgia, "Palatino Linotype", Palatino, "Book Antiqua", "DejaVu Serif", "Times New Roman", serif';   // the storyboard's title font
+
+const ERA_LIST = [[0, 3, () => sceneNight()], [3, 6, () => sceneMasjid()]];
+const SHOTS = [
+  ['night',  0, 0.0, 3.0, 'a night city under the full moon; a rosette and a frieze construct themselves'],
+  ['masjid', 1, 3.0, 6.0, 'the moon becomes the dome; the star gains points; zellige builds in the arch'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 16th grid (0.125s at 120 BPM) so the score's notes land with the picture
+  cues: { moon: 0.0, frieze: 0.25, rosette: 0.5, hero: 0.5, squares: 1.25, outer: 1.5, done: 2.0, arch: 3.75, star: 3.75, gain: 4.5, ring: 5.0 },
+  acts: [
+    { name: '1 Malam',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Masjid', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.9, title: 'the moon and its rosette', sound: 'a soft pad, plucks as circles close', next: 'the moon becomes a dome' },
+    { t: 5.2, title: 'the star gains points', sound: 'a chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Art Deco demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04050a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ART DECO DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A theatre card draws itself on a black-navy ground: the frame closes
+//  in from its corners, stepped towers rise tier by tier, a full moon's rim draws on and fills, a sunburst fan opens
+//  behind it, and Bangau, the gold crane asleep under it, lifts its head to look. At 3.0s the moon becomes a round
+//  lantern hanging in an arch on an emerald ground: its rays go out one after another, the side lanterns light, the
+//  fountains start, and the crane opens its tail like a fan. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/art-deco/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // what matters stays in x 140–940 (mirrored about 540), y 250–1500
+const CX = 540;                                               // the centre line: everything is mirrored about it
+
+const ERA_LIST = [[0, 3, () => sceneMalam()], [3, 6, () => sceneCahaya()]];
+const SHOTS = [
+  ['malam',  0, 0.0, 3.0, 'the frame closes in, towers rise, the full moon fills and its sunburst opens; the crane wakes and looks up'],
+  ['cahaya', 1, 3.0, 6.0, 'the moon becomes a lantern in an arch; rays, side lanterns and fountains start; the crane opens its tail'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.25, ring: 0.75, moon: 1.0, fan: 1.5, look: 1.75, lit: 2.0, rays: 3.5, side: 3.75, jet: 4.0, tail: 4.5, ripple: 5.0, bow: 5.5 },
+  acts: [
+    { name: '1 Malam',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Cahaya', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the full moon shines', sound: 'a soft pad, harp plucks, a tick for every tier, a shimmer as the fan opens', next: 'the moon becomes a lantern' },
+    { t: 5.2, title: 'the lantern lights up', sound: 'a warmer pad, a rising harp, chimes for the lanterns, water', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

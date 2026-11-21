@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vintage map demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a1c10; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  VINTAGE MAP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. An old explorer's map draws itself: the quill inks a desert
+//  coast, a port town appears, and Unta the caravan camel sets off along a red dashed route past dunes and palms
+//  to a round oasis pool. At 3.0s the pool is redrawn as a round walled city on the far shore: mountains, a river
+//  and a forest are inked in, ships bob in the harbour, and Unta walks the last of the route to the X and its flag.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/vintage-map/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneBerangkat()], [3, 6, () => sceneTiba()]];
+const SHOTS = [
+  ['berangkat', 0, 0.0, 3.0, 'the quill inks a desert coast and a port; the camel sets off along the red route to a round oasis pool'],
+  ['tiba',      1, 3.0, 6.0, 'the pool is redrawn as a round walled city; mountains and a river are inked in; the camel reaches the X'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { coast: 0.0, city: 0.5, go: 0.75, dune: 1.0, dune2: 1.25, gurun: 1.5, palm: 1.75, oasis: 2.0, arrive: 2.25,
+          mount: 3.5, go2: 3.6, river: 3.75, forest: 4.0, arrive2: 4.75, flag: 5.0, hop2: 5.5 },
+  acts: [
+    { name: '1 Berangkat', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Tiba',      role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'the caravan sets off', sound: 'oud plucks, frame drum, quill scratches', next: 'the oasis pool is redrawn as a walled city' },
+    { t: 5.25, title: 'it arrives at the round city', sound: 'fuller plucks, a chime, the X and the flag', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

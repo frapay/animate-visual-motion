@@ -1,0 +1,1520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07050f; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  THERMAL DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A handheld infrared camera. A cold kitchen counter: a kettle pours,
+//  the mug fills and glows up the ramp from purple to white, heat creeps along a spoon, steam rises, a hand print
+//  cools on the table and cold pools round a glass of ice. At 3.0s the shutter clicks and the hot mug becomes a cat
+//  sitting in a hallway: paw prints fade behind it, a radiator warms fin by fin, a cold window leaks a draught and
+//  a mouse runs along the wall. The HUD's readings are measured from the picture.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/thermal/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneKitchen()], [3, 6, () => sceneHall()]];
+const SHOTS = [
+  ['kitchen', 0, 0.0, 3.0, 'a kettle pours into a cold mug: it fills and glows, steam rises, heat creeps up a spoon, a hand print cools, cold pools round a glass of ice'],
+  ['hall',    1, 3.0, 6.0, 'the hot mug becomes a cat: paw prints fade behind it, a radiator warms fin by fin, a window leaks cold, a mouse runs along the wall'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { frost: 0.0, pour: 0.5, fill: 0.75, steam: 1.0, spoon: 1.0, stop: 2.0, nuc: 3.0, rad: 3.5, draught: 3.5, mouse: 4.5, ear: 4.75, blink: 5.5 },
+  acts: [
+    { name: '1 Kitchen', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Hallway', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.0, title: 'pour the heat', sound: 'a cool pulse, a tone that rises as the mug fills, soft sensor ticks', next: 'the shutter clicks: the mug becomes the cat' },
+    { t: 5.25, title: 'find the cat', sound: 'the pulse warms to major; fins tick as they heat, a mouse squeaks, a purr', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/thermal/kit.js — an infrared camera image. Built on kit/core.js.
+//  Nothing has a colour: every object is a TEMPERATURE 0..1. Scenes draw a greyscale heat field (grey = temperature);
+//  STYLE.post shrinks it to the sensor's resolution, maps it through one false-colour ramp (iron), adds the sensor's
+//  noise, scales it back up and only then draws the camera HUD on top, unmapped, with readings measured from the
+//  frame itself (max, min, the centre spot, the hottest point).
+//  Colours handed to the renderer (ERA_BG, bridge shapes' c, heroColor) are temperature greys: thmC(t).
+//  Optional piece constants (declare before the kit, e.g. in the head): THM_SPAN = [[lo, hi], ...] degrees per era;
+//  THM_NUC = [t, ...] shutter recalibrations; THM_HUD = { bar, cross, hot, cold, brackets, mode, clock, unit }.
+// =====================================================================
+const THM = {
+  // the ramp: temperature 0..1 -> false colour (iron)
+  stops: [[0.00, '#05030f'], [0.13, '#1b0c52'], [0.27, '#4a0f8a'], [0.42, '#9a1b8f'], [0.55, '#d2315f'], [0.68, '#f0602a'], [0.80, '#fb9a1c'], [0.90, '#fdd23c'], [0.97, '#fff7b0'], [1.00, '#ffffff']],
+  amb: 0.22,                         // room temperature: the blank sheet a morph happens on
+  hud: '#f3f5f7', hudD: 'rgba(8,5,22,0.6)', hudInk: '#1b0c52',
+  res: 4,                            // the sensor: the frame is sampled at 1/res (270 x 480) and scaled back up
+  span: [0, 90],                     // degrees shown for temperature 0 and 1 when the piece gives no THM_SPAN
+  emis: 0.95,
+  noise: 2.0, fpn: 1.5, band: 1.2, vig: 10,   // sensor character, in grey levels (of 255)
+};
+const THM_FONT = MONO;
+const thmV = (t) => Math.round(clamp(t) * 255);
+// a temperature as a canvas / renderer colour (a 6-digit grey), and with alpha
+const thmC = (t) => { const h = thmV(t).toString(16).padStart(2, '0'); return '#' + h + h + h; };
+const thmA = (t, a) => { const v = thmV(t); return `rgba(${v},${v},${v},${clamp(a)})`; };
+const THM_LUT = (() => {
+  const n = 1024, L = new Uint8ClampedArray(n * 3), S = THM.stops.map(([t, h]) => [t, parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]);
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1); let k = 0; while (k < S.length - 2 && t > S[k + 1][0]) k++;
+    const a = S[k], b = S[k + 1], u = clamp((t - a[0]) / (b[0] - a[0]));
+    for (let c = 0; c < 3; c++) L[i * 3 + c] = Math.round(lerp(a[c + 1], b[c + 1], u));
+  }
+  return L;
+})();
+// the false colour of a temperature (HUD, documents): '#rrggbb'
+const thmRamp = (t) => { const i = Math.round(clamp(t) * 1023) * 3; return '#' + [0, 1, 2].map((c) => THM_LUT[i + c].toString(16).padStart(2, '0')).join(''); };
+// the temperature of a colour: a grey ('#9a9a9a', 'rgb(154,154,154)') is read directly; any other colour is the nearest ramp colour
+function thmTemp(c) {
+  if (typeof c === 'number') return clamp(c);
+  let r, g, b; const s = String(c);
+  if (s[0] === '#') { r = parseInt(s.slice(1, 3), 16); g = parseInt(s.slice(3, 5), 16); b = parseInt(s.slice(5, 7), 16); }
+  else { const m = s.match(/[\d.]+/g) || [0, 0, 0]; r = +m[0]; g = +m[1]; b = +m[2]; }
+  if (Math.max(r, g, b) - Math.min(r, g, b) <= 10) return (r + g + b) / 765;
+  let best = 0, bd = 1e12;
+  for (let i = 0; i < 1024; i++) { const d = (THM_LUT[i * 3] - r) ** 2 + (THM_LUT[i * 3 + 1] - g) ** 2 + (THM_LUT[i * 3 + 2] - b) ** 2; if (d < bd) { bd = d; best = i; } }
+  return best / 1023;
+}
+// the span in degrees at the current time: each era's own, blended across a bridge's morph (the camera re-spans)
+function thmSpanAt() {
+  const S = typeof THM_SPAN !== 'undefined' ? THM_SPAN : null; if (!S) return THM.span;
+  const era = (t) => Math.max(0, ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6)), at = (e) => S[Math.min(e, S.length - 1)];
+  if (typeof BRIDGES !== 'undefined') for (const r of BRIDGES) {
+    const d = r.d ?? 0.6, m = r.m ?? (r.d != null ? r.d / 3 : 0.2);
+    if (Math.abs(TT - r.tc) < d) { const a = at(era(r.tc - 0.01)), b = at(era(r.tc + 0.01)), u = EZ.io(seg(TT, r.tc - m, r.tc + m)); return [lerp(a[0], b[0], u), lerp(a[1], b[1], u)]; }
+  }
+  return at(era(TT));
+}
+const thmDeg = (t, span = thmSpanAt()) => span[0] + clamp(t) * (span[1] - span[0]);
+// 1 outside bridges, 0 inside one (0.2s ramps): scene captions and spots hide while the world is seen through a window
+function thmBridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  let k = 1; for (const r of BRIDGES) k = Math.min(k, clamp((Math.abs(TT - r.tc) - (r.d ?? 0.6)) / 0.2));
+  return k;
+}
+// 0..1 progress of something that starts at t0 and takes d seconds (smooth: heat has no hard starts)
+const thmIn = (t0, d = 0.5) => EZ.io(seg(TT, t0, t0 + d));
+// Newton cooling / warming: a value that moves from a to b from time t0 with time constant tau
+const thmWarm = (t0, a, b, tau = 0.6) => (TT <= t0 ? a : b + (a - b) * Math.exp(-(TT - t0) / tau));
+
+// ---------------------------------------------------------------------
+//  heat drawing: everything takes a temperature, never a colour
+// ---------------------------------------------------------------------
+const thmCen = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+// a body from any closed outline: a core at o.t, an edge that is cooler (o.edge), a bloom of heat round it.
+// o: t, edge, soft (px the edge reaches in), bloom (px of halo outside), a (alpha), cold (a cold body: the halo darkens), mode
+function thmBody(P, o = {}) {
+  const t = o.t ?? 0.7, edge = o.edge ?? t - 0.14, bb = bbox(P), dim = Math.min(bb.x1 - bb.x0, bb.y1 - bb.y0);
+  const soft = o.soft ?? dim * 0.3, bloom = o.bloom ?? Math.max(14, dim * 0.1), al = o.a ?? 1;
+  ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  if (o.raw === false) { ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); } else trace(P, true);
+  if (bloom > 0) {
+    ctx.globalCompositeOperation = o.cold ? 'darken' : 'lighten'; ctx.strokeStyle = thmC(edge);
+    for (let i = 0; i < 5; i++) { ctx.lineWidth = bloom * 2 * (1 - i / 5); ctx.globalAlpha = al * (o.halo ?? 0.2); ctx.stroke(); }
+  }
+  ctx.globalCompositeOperation = o.mode ?? 'source-over'; ctx.globalAlpha = al; ctx.fillStyle = thmC(t); ctx.fill();
+  if (soft > 0 && edge !== t) {
+    ctx.clip(); ctx.strokeStyle = thmC(edge);
+    for (let i = 0; i < 7; i++) { ctx.lineWidth = soft * 2 * (1 - i / 7) + 2; ctx.globalAlpha = al * 0.3; ctx.stroke(); }
+  }
+  ctx.restore();
+}
+// run fn clipped to an outline (hot cores, liquid levels, markings inside a body)
+function thmClip(P, fn) { ctx.save(); trace(P, true); ctx.clip(); fn(); ctx.restore(); }
+// a soft heat blob. By default it only warms what is under it ('lighten'); o.cold = it only cools; o.set = it replaces.
+// o: ry, rot, a, hard (0..1: the fraction of the radius that is fully at t)
+function thmBlob(x, y, r, t, o = {}) {
+  if (r <= 0.5) return;
+  const a = o.a ?? 1, hard = clamp(o.hard ?? 0, 0, 0.95);
+  ctx.save(); ctx.translate(x, y); if (o.rot) ctx.rotate(o.rot); ctx.scale(1, (o.ry ?? r) / r);
+  const g = ctx.createRadialGradient(0, 0, r * hard, 0, 0, r);
+  g.addColorStop(0, thmA(t, a)); g.addColorStop(0.35, thmA(t, a * 0.74)); g.addColorStop(0.7, thmA(t, a * 0.24)); g.addColorStop(1, thmA(t, 0));
+  ctx.globalCompositeOperation = o.set ? 'source-over' : o.cold ? 'darken' : 'lighten';
+  ctx.fillStyle = g; ctx.fillRect(-r, -r, r * 2, r * 2); ctx.restore();
+}
+// round the corners of an open path (Chaikin), keeping its ends
+function thmSmooth(P, it = 2) {
+  for (let k = 0; k < it; k++) { const Q = [P[0]]; for (let i = 0; i < P.length - 1; i++) { const a = P[i], b = P[i + 1]; Q.push([lerp(a[0], b[0], 0.25), lerp(a[1], b[1], 0.25)], [lerp(a[0], b[0], 0.75), lerp(a[1], b[1], 0.75)]); } Q.push(P[P.length - 1]); P = Q; }
+  return P;
+}
+// heat conducting along an open path from its first point. o: w, taper (end width as a fraction), t0 (the source end),
+// t1 (the far end once heat has arrived), base (the unheated temperature; null = not drawn), frac (0..1: how far the heat has got)
+function thmConduct(P, o = {}) {
+  const w = o.w ?? 20, t0 = o.t0 ?? 0.85, t1 = o.t1 ?? t0 - 0.25, base = o.base ?? null, frac = clamp(o.frac ?? 1), taper = o.taper ?? 1;
+  const Q = resample(P.length > 2 ? thmSmooth(P) : P, false, Math.max(3, w * 0.3)), n = Q.length; if (n < 2) return;
+  const heat = (s) => clamp((frac * 1.25 - s) / 0.25), T = (s) => { const h = heat(s), hot = lerp(t0, t1, s); return base == null ? hot : lerp(base, hot, h * h * (3 - 2 * h)); };
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (o.bloom !== 0) {   // the bloom: only round the part the heat has reached
+    const end = base == null ? n : Math.max(2, Math.ceil(n * Math.min(1, frac * 1.1)));
+    ctx.globalCompositeOperation = 'lighten'; ctx.strokeStyle = thmC(lerp(t0, t1, 0.5) - 0.1); ctx.globalAlpha = 0.16 * (base == null ? 1 : Math.min(1, frac * 3));
+    for (let k = 0; k < 3; k++) { ctx.lineWidth = w + (o.bloom ?? w * 1.4) * (1 - k / 3); ctx.beginPath(); for (let i = 0; i < end; i++) (i ? ctx.lineTo(Q[i][0], Q[i][1]) : ctx.moveTo(Q[i][0], Q[i][1])); ctx.stroke(); }
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  }
+  for (let i = 0; i < n - 1; i++) {
+    const s = i / (n - 1); if (base == null && s > frac) break;
+    ctx.strokeStyle = thmC(T(s)); ctx.lineWidth = w * lerp(1, taper, s);
+    ctx.beginPath(); ctx.moveTo(Q[i][0], Q[i][1]); ctx.lineTo(Q[i + 1][0], Q[i + 1][1]); ctx.stroke();
+  }
+  ctx.restore();
+}
+// a residual print left on a surface: outline(s) P at temperature o.t when fresh, cooling to the surface (o.amb) as
+// o.age goes 0..1: it fades, its edge softens and it shrinks toward its middle (edges cool first).
+function thmPrint(P, o = {}) {
+  const parts = Array.isArray(P[0][0]) ? P : [P], age = clamp(o.age ?? 0); if (age >= 1) return;
+  const amb = o.amb ?? THM.amb, t = lerp(o.t ?? 0.45, amb, age ** 0.7), k = 1 - 0.14 * age, al = (o.a ?? 1) * (1 - age * age);
+  for (const Q of parts) {
+    const c = thmCen(Q), bb = bbox(Q), dim = Math.min(bb.x1 - bb.x0, bb.y1 - bb.y0);
+    thmBody(Q.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]), { t, edge: lerp(t, amb, 0.6), soft: dim * (0.3 + 0.3 * age), bloom: dim * (0.25 + 0.5 * age), halo: 0.12, a: al, mode: 'lighten' });
+  }
+}
+// a hand print (palm heel, finger pads, thumb) and a paw print (pad and four toes): outlines for thmPrint
+function thmHandPts(x, y, s, rot = 0) {
+  const P = [ellipsePts(0, 0.42, 0.4, 0.3, 0, 20), ellipsePts(-0.03, 0.02, 0.4, 0.17, -0.1, 18)];
+  [[-0.4, -0.52, 0.085, 0.3, -0.26], [-0.15, -0.72, 0.09, 0.38, -0.08], [0.1, -0.72, 0.09, 0.37, 0.06], [0.33, -0.56, 0.085, 0.31, 0.22]].forEach(([fx, fy, rx, ry, a]) => P.push(ellipsePts(fx, fy, rx, ry, a, 14)));
+  P.push(ellipsePts(0.62, 0.1, 0.1, 0.3, 0.9, 14));
+  return P.map((Q) => xform(Q, x, y, rot, s));
+}
+function thmPawPts(x, y, s, rot = 0) {
+  const P = [ellipsePts(0, 0.25, 0.46, 0.36, 0, 16)];
+  [[-0.46, -0.22, -0.4], [-0.17, -0.5, -0.12], [0.17, -0.5, 0.12], [0.46, -0.22, 0.4]].forEach(([tx, ty, a]) => P.push(ellipsePts(tx, ty, 0.15, 0.2, a, 10)));
+  return P.map((Q) => xform(Q, x, y, rot, s));
+}
+// steam, breath, warm air: faint warm wisps that rise from (x, y), widen and cool. Stateless: a function of TT.
+// o: h (rise), w (sway), r (wisp size), t, a, n (columns), m (puffs per column), speed, from (start time), key, dir (angle; up = -PI/2)
+function thmSteam(x, y, o = {}) {
+  const n = o.n ?? 3, m = o.m ?? 6, h = o.h ?? 300, w = o.w ?? 46, t = o.t ?? 0.42, a = o.a ?? 0.5, sp = o.speed ?? 0.45, r0 = o.r ?? 26, from = o.from ?? -1e9, dir = o.dir ?? -Math.PI / 2;
+  const dx = Math.cos(dir), dy = Math.sin(dir);
+  for (let i = 0; i < n; i++) {
+    const R = RNG('thmsteam', o.key ?? 's', i), ph = R.f(), fx = R.r(0.7, 1.5), off = R.n(w * 0.45), p2 = R.r(0, TAU);
+    for (let j = 0; j < m; j++) {
+      const u = mod(TT * sp + ph + j / m, 1); if (TT - u / sp < from) continue;
+      const side = off * u + Math.sin(u * fx * TAU + p2 + TT * 1.3) * w * (0.2 + 0.8 * u), al = a * smooth(0, 0.14, u) * (1 - u) ** 1.2;
+      thmBlob(x + dx * u * h - dy * side, y + dy * u * h + dx * side, r0 * (0.7 + 1.7 * u), lerp(t, t - 0.08, u), { a: al });
+    }
+  }
+}
+// a moving body's fading trail: pos(time) -> [x, y]. o: r, t, amb, n, dt, a
+function thmTrail(pos, o = {}) {
+  const n = o.n ?? 10, dt = o.dt ?? 0.05, r = o.r ?? 30, t = o.t ?? 0.6, amb = o.amb ?? THM.amb;
+  for (let i = n; i >= 1; i--) { const p = pos(TT - i * dt); if (!p) continue; const u = i / (n + 1); thmBlob(p[0], p[1], r * (1 + 0.5 * u), lerp(t, amb, u ** 0.6), { a: (o.a ?? 0.8) * (1 - u), ry: (o.ry ?? r) * (1 + 0.5 * u) }); }
+}
+// a poured stream of hot liquid from (x0, y0) to (x1, y1). o: w, t, head (0..1: how far the front has fallen),
+// tail (0..1: how far the cut-off end has fallen), bend
+function thmPour(x0, y0, x1, y1, o = {}) {
+  const w = o.w ?? 16, t = o.t ?? 0.97, head = clamp(o.head ?? 1), tail = clamp(o.tail ?? 0), bend = o.bend ?? 0; if (head <= tail) return;
+  const at = (s) => { const q = 1 - s; return [q * q * x0 + 2 * q * s * (x0 + bend) + s * s * x1, q * q * y0 + 2 * q * s * lerp(y0, y1, 0.35) + s * s * y1]; };
+  const n = 28, P = []; for (let i = 0; i <= n; i++) { const s = lerp(tail, head, i / n); P.push([...at(s), s]); }
+  ctx.save(); ctx.lineCap = 'round';
+  ctx.globalCompositeOperation = 'lighten'; ctx.strokeStyle = thmC(t - 0.3); ctx.globalAlpha = 0.22;
+  for (let k = 0; k < 3; k++) { ctx.lineWidth = w * (4.5 - k * 1.2); ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.stroke(); }
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; ctx.strokeStyle = thmC(t);
+  for (let i = 0; i < n; i++) { ctx.lineWidth = w * (1 + 0.2 * Math.sin(P[i][2] * 14 - TT * 16)) * lerp(1.15, 0.8, P[i][2]); ctx.beginPath(); ctx.moveTo(P[i][0], P[i][1]); ctx.lineTo(P[i + 1][0], P[i + 1][1]); ctx.stroke(); }
+  ctx.restore();
+}
+// cold spreading as dark: an irregular patch that grows from (x, y). o: t, grow (0..1), n (lobes), key, a, sy (squash)
+function thmFrost(x, y, r, o = {}) {
+  const g = clamp(o.grow ?? 1), R = RNG('thmfrost', o.key ?? 'f'), n = o.n ?? 7, t = o.t ?? 0.08, sy = o.sy ?? 1; if (g <= 0) return;
+  thmBlob(x, y, r * 0.6 * (0.3 + 0.7 * g), t, { cold: true, a: o.a ?? 0.9, ry: r * 0.6 * (0.3 + 0.7 * g) * sy });
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.4), d = r * g * R.r(0.3, 0.75), rr = r * g * R.r(0.3, 0.55); thmBlob(x + Math.cos(a) * d, y + Math.sin(a) * d * sy, rr, t + 0.03, { cold: true, a: (o.a ?? 0.9) * 0.7, ry: rr * sy }); }
+}
+// the room: fills everything at temperature t, with a slow unevenness (no wall is one temperature). o: key, to (bottom temperature), amt
+function thmAmbient(t, o = {}) {
+  ctx.save();
+  if (o.to != null) { const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, thmC(t)); g.addColorStop(1, thmC(o.to)); ctx.fillStyle = g; } else ctx.fillStyle = thmC(t);
+  ctx.fillRect(-W, -H, W * 3, H * 3); ctx.restore();
+  const R = RNG('thmamb', o.key ?? 'room'), amt = o.amt ?? 0.035;
+  for (let i = 0; i < 7; i++) { const up = i % 2 === 0, r = R.r(320, 620); thmBlob(R.r(0, W), R.r(0, H), r, t + (up ? amt : -amt), { a: 0.7, cold: !up, ry: r * R.r(0.6, 1.2) }); }
+}
+// a surface seen from above (table, floor): everything below y, at t near the camera and t + far at the horizon
+function thmPlane(y, t, o = {}) {
+  ctx.save(); const g = ctx.createLinearGradient(0, y, 0, y + (o.depth ?? 500));
+  g.addColorStop(0, thmC(t + (o.far ?? 0.03))); g.addColorStop(1, thmC(t)); ctx.fillStyle = g; ctx.fillRect(-W, y, W * 3, H * 2); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  ready-made subjects, readable by their heat pattern
+// ---------------------------------------------------------------------
+// a mug: thmMugPts is its body (a bridge shape). o: level (0..1 liquid), heat (0..1: how far the wall above the liquid
+// has warmed), hot (liquid temperature), cold (empty temperature), handle (false = none)
+function thmMugPts(x, y, w, h) {
+  const a = w / 2, b = h / 2, P = [[-a, -b], [0, -b - 6], [a, -b], [a * 0.99, 0], [a * 0.93, b * 0.72]];
+  for (const q of arcPts(a * 0.93 - 34, b - 34, 34, 0, Math.PI / 2, 5)) P.push(q);
+  P.push([0, b + 3]);
+  for (const q of arcPts(-a * 0.93 + 34, b - 34, 34, Math.PI / 2, Math.PI, 5)) P.push(q);
+  P.push([-a * 0.93, b * 0.72], [-a * 0.99, 0]);
+  return P.map(([px, py]) => [x + px, y + py]);
+}
+function thmMug(x, y, w, h, o = {}) {
+  const lv = clamp(o.level ?? 0), ht = clamp(o.heat ?? lv), hot = o.hot ?? 0.86, cold = o.cold ?? 0.27, P = thmMugPts(x, y, w, h);
+  const y0 = y - h / 2, y1 = y + h / 2, yl = lerp(y1 - 8, y0 + 34, lv), wall = lerp(cold, hot - 0.06, lv > 0 ? 1 : 0);
+  // the handle: a ring that warms from where it joins the wall
+  if (o.handle !== false) { const hp = arcPts(x + w / 2 - 6, y - h * 0.02, h * 0.25, -Math.PI * 0.42, Math.PI * 0.42, 14).map(([px, py]) => [x + w / 2 - 6 + (px - (x + w / 2 - 6)) * 0.86, py]); thmConduct(hp, { w: w * 0.11, t0: lerp(cold, hot - 0.3, ht), t1: lerp(cold, hot - 0.42, ht), bloom: 10 }); }
+  thmBody(P, { t: cold, edge: cold - 0.05, soft: w * 0.16, bloom: lerp(12, 46, ht), halo: lerp(0.12, 0.24, ht) });
+  thmClip(P, () => {
+    if (lv > 0) {   // the liquid shows through the wall; above it the wall warms by conduction
+      const reach = 30 + 150 * ht, g = ctx.createLinearGradient(0, yl - reach, 0, yl + 26);
+      g.addColorStop(0, thmA(wall, 0)); g.addColorStop(0.55, thmA(wall - 0.2, 0.7)); g.addColorStop(1, thmA(wall, 1));
+      ctx.fillStyle = g; ctx.fillRect(x - w, yl - reach, w * 2, y1 - yl + reach + 20);
+      thmBlob(x, lerp(yl, y1, 0.5), w * 0.42, hot - 0.01, { ry: Math.max(20, (y1 - yl) * 0.6), a: 0.9 });
+    }
+    // a cylinder's sides face away from the camera and read cooler
+    for (const s of [-1, 1]) thmBlob(x + s * w * 0.56, y, w * 0.2, cold - 0.02, { ry: h * 0.7, cold: true, a: lerp(0.5, 0.75, lv) });
+  });
+  // the opening: what is inside the mug
+  const ry = 24 + w * 0.02, top = lv > 0.02 ? lerp(0.6, hot + 0.1, clamp(lv * 2.2)) : cold - 0.05;
+  thmBody(ellipsePts(x, y0 + ry * 0.55, w * 0.455, ry, 0, 40), { t: top, edge: lerp(cold, top, 0.55), soft: 12, bloom: lv > 0.02 ? 22 : 0 });
+  return { rim: [x, y0 + ry * 0.55], level: yl };
+}
+// the hero: a sitting cat, front view. r = half its height. Its heat anatomy: the face is the hottest skin, the eyes
+// are white-hot, the nose and ear tips are cold, the fur insulates (the body reads cooler than the face), the tail
+// cools to its tip. o: blink, ear (0..1: the left ear folds), tail (swish, -1..1), look (-1..1: the head turns), fur
+function thmCatUnit(ear = 0) {
+  const side = (s, e) => [[0.1 * s, -0.8], [0.17 * s, -0.86], [(0.27 + 0.05 * e) * s, -0.985 + 0.1 * e], [(0.31 + 0.07 * e) * s, -1.02 + 0.13 * e], [(0.335 + 0.06 * e) * s, -0.96 + 0.1 * e], [0.37 * s, -0.74], [0.385 * s, -0.56], [0.34 * s, -0.39], [0.25 * s, -0.27], [0.3 * s, -0.1], [0.4 * s, 0.25], [0.47 * s, 0.6], [0.46 * s, 0.86], [0.36 * s, 1.0], [0.14 * s, 1.01]];
+  return [[0, -0.8], ...side(1, 0), ...side(-1, ear).reverse()];
+}
+const thmCatPts = (x, y, r, ear = 0) => thmCatUnit(ear).map(([px, py]) => [x + px * r, y + py * r]);
+function thmCat(x, y, r, o = {}) {
+  const fur = o.fur ?? 0.6, key = o.key ?? 'cat', U = (px, py) => [x + px * r, y + py * r], hx = (o.look ?? 0) * 0.035, sw = o.tail ?? Math.sin(TT * 2.2);
+  const breath = 0.012 * Math.sin(TT * TAU * 0.55);
+  SPARK_AT = toScreen(x, y);
+  thmBlob(x, y + r, r * 0.8, fur - 0.2, { ry: r * 0.1, a: 0.8 });                                              // the floor it warms
+  thmConduct([U(0.3, 0.9), U(0.54, 1.0), U(0.74, 0.94), U(0.8, 0.72), U(0.75 + 0.06 * sw, 0.52), U(0.66 + 0.11 * sw, 0.4)], { w: r * 0.15, taper: 0.55, t0: fur - 0.02, t1: fur - 0.2, bloom: r * 0.1 });   // the tail cools to its tip
+  thmBody(thmCatPts(x, y, r, o.ear ?? 0), { t: fur + breath, edge: fur - 0.17, soft: r * 0.17, bloom: r * 0.13 });
+  thmBlob(...U(0, 0.08), r * 0.27, fur + 0.13 + breath, { ry: r * 0.4, a: 0.9 });                             // the chest
+  for (const s of [-1, 1]) {
+    thmBlob(...U(0.3 * s, 0.7), r * 0.17, fur + 0.05, { ry: r * 0.24, a: 0.7 });                              // haunches
+    thmBlob(...U(0.15 * s, 0.96), r * 0.12, fur - 0.13, { ry: r * 0.06, set: true, a: 0.9 });                 // paws: cool
+  }
+  thmBlob(...U(0, 0.72), r * 0.03, fur - 0.16, { ry: r * 0.3, cold: true, a: 0.8 });                          // the gap between the front legs
+  thmBlob(...U(hx, -0.53), r * 0.36, fur + 0.22, { ry: r * 0.29, hard: 0.3, a: 0.95 });                       // the face
+  for (const s of [-1, 1]) {
+    const e = s < 0 ? (o.ear ?? 0) : 0;
+    thmBlob(...U((0.25 + 0.04 * e) * s + hx * 0.5, -0.83 + 0.07 * e), r * 0.085, fur + 0.2, { ry: r * 0.1, a: 0.85 });   // inside the ear: thin skin
+    thmBlob(...U((0.31 + 0.07 * e) * s, -1.0 + 0.13 * e), r * 0.07, fur - 0.2, { cold: true, a: 0.75 });      // ear tips: cold
+    if (!o.blink) thmBlob(...U(0.135 * s + hx * 1.6, -0.56), r * 0.058, o.eye ?? 0.97, { hard: 0.4, ry: r * 0.046 });     // eyes: the hottest point
+  }
+  thmBlob(...U(hx * 1.8, -0.41), r * 0.1, fur + 0.12, { ry: r * 0.075, set: true, a: 0.55 });                  // the muzzle: fur again
+  thmBlob(...U(hx * 2, -0.445), r * 0.042, fur - 0.24, { set: true, hard: 0.3, ry: r * 0.034 });               // a cold wet nose
+}
+
+// ---------------------------------------------------------------------
+//  the camera HUD: thin white, drawn after the colour map (STYLE.post), at screen size
+// ---------------------------------------------------------------------
+let THM_Q = [], THM_SPOTS = [];   // this frame's HUD draws and extra measuring spots; emptied by STYLE.post every frame
+const thmSafe = () => (H > W * 1.2 ? { x0: 60, y0: 250, x1: 940, y1: 1500 } : { x0: 48, y0: 48, x1: W - 48, y1: H - 48 });
+const thmHudOpt = (k, d = true) => (typeof THM_HUD !== 'undefined' && THM_HUD[k] != null ? THM_HUD[k] : d);
+// a thin white path with a dark under-stroke: path() adds to the current path
+function thmHudStroke(path, w = 2.5, al = 1) {
+  ctx.save(); ctx.lineCap = 'butt'; ctx.lineJoin = 'miter'; ctx.globalAlpha = al; ctx.beginPath(); path();
+  ctx.strokeStyle = THM.hudD; ctx.lineWidth = w + 2.5; ctx.stroke(); ctx.strokeStyle = THM.hud; ctx.lineWidth = w; ctx.stroke(); ctx.restore();
+}
+function thmHudFont(size, weight = 400) { ctx.font = `${weight} ${size}px ${THM_FONT}`; }
+function thmHudW(str, size, weight) { ctx.save(); thmHudFont(size, weight); const w = ctx.measureText(str).width; ctx.restore(); return w; }
+// HUD text. o: align, al, weight, n (type-on: characters shown), c
+function thmHudText(str, x, y, size, o = {}) {
+  const s = o.n != null ? String(str).slice(0, Math.max(0, Math.floor(o.n))) : String(str); if (!s.trim()) return 0;
+  ctx.save(); thmHudFont(size, o.weight); ctx.textAlign = o.align ?? 'left'; ctx.textBaseline = 'alphabetic'; ctx.globalAlpha = o.al ?? 1; ctx.lineJoin = 'round';
+  ctx.strokeStyle = THM.hudD; ctx.lineWidth = Math.max(3, size * 0.14); ctx.strokeText(s, x, y);
+  ctx.fillStyle = o.c ?? THM.hud; ctx.fillText(s, x, y);
+  const w = ctx.measureText(s).width; ctx.restore(); return w;
+}
+const thmFmt = (deg, unit = thmHudOpt('unit', '°C')) => deg.toFixed(1) + unit;
+// the scale: the ramp as a vertical bar, the frame's max above it and min below, carets where they sit in the span
+function thmScaleBar(x, y, w, h, o = {}) {
+  ctx.save();
+  const g = ctx.createLinearGradient(0, y + h, 0, y); THM.stops.forEach(([t, c]) => g.addColorStop(t, c));
+  ctx.fillStyle = THM.hudD; ctx.fillRect(x - 3, y - 3, w + 6, h + 6); ctx.fillStyle = g; ctx.fillRect(x, y, w, h); ctx.restore();
+  thmHudStroke(() => { ctx.rect(x - 1, y - 1, w + 2, h + 2); for (let i = 1; i < 8; i++) { const ty = y + h * i / 8; ctx.moveTo(x - (i % 2 ? 6 : 12), ty); ctx.lineTo(x - 1, ty); } }, 1.5);
+  for (const t of [o.tmax, o.tmin]) if (t != null) { const ty = y + h * (1 - clamp(t)); ctx.save(); ctx.fillStyle = THM.hud; ctx.strokeStyle = THM.hudD; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x - 16, ty); ctx.lineTo(x - 30, ty - 8); ctx.lineTo(x - 30, ty + 8); ctx.closePath(); ctx.stroke(); ctx.fill(); ctx.restore(); }
+  if (o.max != null) thmHudText(o.max, x + w + 2, y - 18, o.size ?? 30, { align: 'right' });
+  if (o.min != null) thmHudText(o.min, x + w + 2, y + h + 42, o.size ?? 30, { align: 'right' });
+}
+// the centre crosshair with its spot reading
+function thmCross(x, y, reading, o = {}) {
+  const g = o.gap ?? 12, l = o.len ?? 26;
+  thmHudStroke(() => { for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { ctx.moveTo(x + dx * g, y + dy * g); ctx.lineTo(x + dx * (g + l), y + dy * (g + l)); } ctx.rect(x - 1.5, y - 1.5, 3, 3); }, 3);
+  if (reading != null) thmHudText(reading, x + g + l - 2, y - g - 8, o.size ?? 40);
+}
+// the hottest-point marker (up = true) or coldest (up = false): a small open box with a triangle on it. No text: its value is the scale's max / min.
+function thmMark(x, y, up = true, s = 15) {
+  const d = up ? -1 : 1;
+  thmHudStroke(() => { for (const [sx, sy] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) { ctx.moveTo(x + sx * s, y + sy * s * 0.4); ctx.lineTo(x + sx * s, y + sy * s); ctx.lineTo(x + sx * s * 0.4, y + sy * s); } ctx.moveTo(x - 8, y + d * (s + 18)); ctx.lineTo(x + 8, y + d * (s + 18)); ctx.lineTo(x, y + d * (s + 5)); ctx.closePath(); }, 2.5);
+}
+function thmBrackets(S = thmSafe(), l = 44) {
+  thmHudStroke(() => { for (const [cx, cy, sx, sy] of [[S.x0 + 4, S.y0 + 4, 1, 1], [S.x1 - 4, S.y0 + 4, -1, 1], [S.x0 + 4, S.y1 - 4, 1, -1], [S.x1 - 4, S.y1 - 4, -1, -1]]) { ctx.moveTo(cx + sx * l, cy); ctx.lineTo(cx, cy); ctx.lineTo(cx, cy + sy * l); } }, 2.5, 0.95);
+}
+// an extra measuring spot at a world point: a small box with a label; its reading is measured from the frame in post.
+// o: label, dx, dy (where the text sits from the box), align, size
+function thmSpot(x, y, o = {}) {
+  const k = thmBridgeK(); if (k < 0.5) return;
+  const [sx, sy] = toScreen(x, y); THM_SPOTS.push({ x: sx, y: sy, label: o.label ?? 'Sp', dx: o.dx ?? 22, dy: o.dy ?? -18, size: o.size ?? 28, al: o.al ?? 1, align: o.align ?? ((o.dx ?? 22) < 0 ? 'right' : 'left') });
+}
+// captions are HUD text, typed on: 'POUR THE *HEAT*' (the starred word sits in an inverse box). Through DEFER, drawn in post.
+// o: x, y (baseline), size, at (seconds after the era starts), cps
+function thmCaption(str, o = {}) {
+  const f = () => {
+    const at = E0 + (o.at ?? 0.5), k = thmBridgeK(); if (k <= 0 || TT < at - 1e-6) return;
+    const size = o.size ?? 50, y = o.y ?? 1424, cx = o.x ?? (typeof CX !== 'undefined' ? CX : W / 2);
+    const toks = String(str).toUpperCase().split('*').map((s, i) => ({ s, hi: i % 2 === 1 })).filter((t) => t.s), n0 = Math.floor((TT - at) * (o.cps ?? 30)) + 1;
+    THM_Q.push(() => {
+      ctx.save(); thmHudFont(size, 500); const cw = ctx.measureText('M').width; ctx.restore();
+      const total = toks.reduce((a, t) => a + t.s.length, 0); let x = cx - total * cw / 2, n = n0;
+      for (const t of toks) {
+        const m = Math.min(t.s.length, n); n -= m;
+        if (m > 0 && t.hi) {
+          const tr = t.s.trim(), lead = t.s.length - t.s.trimStart().length, shown = clamp(m - lead, 0, tr.length), bx = x + lead * cw - cw * 0.28;
+          if (shown > 0) { ctx.save(); ctx.globalAlpha = k; ctx.fillStyle = THM.hudD; ctx.fillRect(bx - 3, y - size * 0.9 - 3, shown * cw + cw * 0.56 + 6, size * 1.2 + 6); ctx.fillStyle = THM.hud; ctx.fillRect(bx, y - size * 0.9, shown * cw + cw * 0.56, size * 1.2); thmHudFont(size, 700); ctx.fillStyle = THM.hudInk; ctx.textBaseline = 'alphabetic'; ctx.fillText(tr.slice(0, shown), x + lead * cw, y); ctx.restore(); }
+        } else if (m > 0) thmHudText(t.s, x, y, size, { n: m, al: k, weight: 500 });
+        x += t.s.length * cw;
+      }
+      if (n0 <= total && Math.floor(TT * 6) % 2 === 0) { ctx.save(); ctx.globalAlpha = k; ctx.fillStyle = THM.hud; ctx.fillRect(cx - total * cw / 2 + Math.min(n0, total) * cw + 4, y - size * 0.78, cw * 0.55, size * 0.95); ctx.restore(); }
+    });
+  };
+  if (DEFER) DEFER.push(f); else f();
+}
+// the era's label, under the camera's mode line (top left)
+function thmTag(str, o = {}) {
+  const f = () => { const at = E0 + (o.at ?? 0.2), k = thmBridgeK(); if (k <= 0 || TT < at - 1e-6) return; const S = thmSafe(), n = Math.floor((TT - at) * 30) + 1; THM_Q.push(() => thmHudText(String(str).toUpperCase(), o.x ?? S.x0 + 24, o.y ?? S.y0 + 98, o.size ?? 34, { n, al: k, weight: 500 })); };
+  if (DEFER) DEFER.push(f); else f();
+}
+// any other HUD text or drawing at a world point: fn(sx, sy) runs in post, in screen space
+function thmHud(x, y, fn) { const k = thmBridgeK(); if (k < 0.5) return; const [sx, sy] = toScreen(x, y); THM_Q.push(() => fn(sx, sy)); }
+
+// ---------------------------------------------------------------------
+//  the sensor: shrink, measure, colour-map with noise, scale back up
+// ---------------------------------------------------------------------
+const THM_CV = {};
+function thmCv(name, w, h, read) { let c = THM_CV[name]; if (!c || c.width !== w || c.height !== h) { c = document.createElement('canvas'); c.width = w; c.height = h; c.g = c.getContext('2d', read ? { willReadFrequently: true } : undefined); THM_CV[name] = c; } return c; }
+const THM_OFF = {};   // the fixed pattern (per pixel, row and column) and the vignette, in grey levels; a new pattern after every NUC
+function thmOffsets(lw, lh, seed) {
+  const k = lw + 'x' + lh + ':' + seed; if (THM_OFF[k]) return THM_OFF[k];
+  const o = new Float32Array(lw * lh), R = RNG('thmfpn', seed), row = new Float32Array(lh), col = new Float32Array(lw);
+  for (let y = 0; y < lh; y++) row[y] = R.n(THM.band) + 0.6 * Math.sin(y * 0.11 + seed);
+  for (let x = 0; x < lw; x++) col[x] = R.n(THM.band * 0.6);
+  for (let y = 0; y < lh; y++) for (let x = 0; x < lw; x++) { const dx = (x / lw - 0.5) * 2, dy = (y / lh - 0.5) * 2, v = (dx * dx + dy * dy) / 2; o[y * lw + x] = R.n(THM.fpn) + row[y] + col[x] - THM.vig * v * v * 2; }
+  return (THM_OFF[k] = o);
+}
+// the shutter (NUC): for two frames the sensor sees its own shutter, so the picture goes nearly flat; then a fresh fixed pattern
+function thmNucAt() {
+  const N = typeof THM_NUC !== 'undefined' ? THM_NUC : []; let count = 0, flat = 1, since = 1e9;
+  for (const t of N) { const f = Math.round(t * FPS); if (F >= f) { count++; since = Math.min(since, F - f); if (F === f) flat = 0.22; else if (F === f + 1) flat = 0.55; } }
+  return { count, flat, since };
+}
+function thmSense() {
+  const cv = ctx.canvas, lw = Math.ceil(W / THM.res), lh = Math.ceil(H / THM.res);
+  const half = thmCv('half', Math.ceil(W / 2), Math.ceil(H / 2)), low = thmCv('low', lw, lh, true);
+  half.g.imageSmoothingEnabled = true; half.g.drawImage(cv, 0, 0, half.width, half.height);
+  low.g.imageSmoothingEnabled = true; low.g.drawImage(half, 0, 0, lw, lh);
+  const img = low.g.getImageData(0, 0, lw, lh), d = img.data, N = lw * lh, S = thmSafe(), kx = lw / W, ky = lh / H;
+  // measure the clean field inside the frame brackets: max, min, where the hottest and coldest points are
+  const x0 = Math.floor(S.x0 * kx) + 2, x1 = Math.ceil(S.x1 * kx) - 2, y0 = Math.floor(S.y0 * ky) + 2, y1 = Math.ceil(S.y1 * ky) - 2;
+  let mx = -1, mn = 256, mxi = 0, mni = 0, sum = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0, i = y * lw + x0; x < x1; x++, i++) { const g = d[i * 4]; sum += g; if (g > mx) { mx = g; mxi = i; } if (g < mn) { mn = g; mni = i; } }
+  const centre = (idx, sign, ref) => {   // the middle of the plateau round an extreme, so the marker does not sit on its corner
+    const px = idx % lw, py = Math.floor(idx / lw); let sx = 0, sy = 0, n = 0;
+    for (let y = Math.max(y0, py - 14); y < Math.min(y1, py + 15); y++) for (let x = Math.max(x0, px - 14); x < Math.min(x1, px + 15); x++) if (sign * (d[(y * lw + x) * 4] - ref) >= -3) { sx += x; sy += y; n++; }
+    return [(sx / n + 0.5) / kx, (sy / n + 0.5) / ky];
+  };
+  const at = (sx, sy) => { const px = clamp(Math.round(sx * kx), 1, lw - 2), py = clamp(Math.round(sy * ky), 1, lh - 2); let s = 0; for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) s += d[((py + j) * lw + px + i) * 4]; return s / 9 / 255; };
+  const M = { max: mx / 255, min: mn / 255, hot: centre(mxi, 1, mx), cold: centre(mni, -1, mn), at, mean: sum / Math.max(1, (x1 - x0) * (y1 - y0)) / 255 };
+  M.spots = THM_SPOTS.map((s) => ({ ...s, t: at(s.x, s.y) }));
+  M.cx = (S.x0 + S.x1) / 2; M.cy = (S.y0 + S.y1) / 2; M.spot = at(M.cx, M.cy);
+  // colour-map through the ramp with the sensor's noise: fixed pattern, row / column banding, a slow rolling band, a vignette
+  const nuc = thmNucAt(), off = thmOffsets(lw, lh, nuc.count), L = THM_LUT, flat = nuc.flat, mean = M.mean * 255 + (1 - flat) * 26;
+  const roll = mod(TT * 70, lh + 80) - 40; let s = (Math.imul(F + 1, 2654435761) ^ 0x9e3779b9) >>> 0;
+  for (let y = 0, i = 0; y < lh; y++) {
+    const rb = 1.3 * Math.exp(-(((y - roll) / 12) ** 2));
+    for (let x = 0; x < lw; x++, i++) {
+      s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0;
+      let g = d[i * 4]; if (flat < 1) g = mean + (g - mean) * flat;
+      let v = ((g + off[i] + rb + ((s & 1023) / 1023 - 0.5) * 2 * THM.noise) * 4.012 + ((s >>> 12) & 3)) | 0;
+      v = (v < 0 ? 0 : v > 1023 ? 1023 : v) * 3;
+      d[i * 4] = L[v]; d[i * 4 + 1] = L[v + 1]; d[i * 4 + 2] = L[v + 2]; d[i * 4 + 3] = 255;
+    }
+  }
+  low.g.putImageData(img, 0, 0);
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(low, 0, 0, cv.width, cv.height); ctx.restore();
+  M.nuc = nuc;
+  return M;
+}
+// the camera's own HUD, from the measurement M
+function thmAutoHud(M) {
+  const S = thmSafe(), span = thmSpanAt(), deg = (t) => thmFmt(thmDeg(t, span)), small = Math.round(26 * Math.min(1, (S.x1 - S.x0) / 880));
+  if (thmHudOpt('brackets')) thmBrackets(S);
+  if (thmHudOpt('bar')) { const bh = Math.min(700, (S.y1 - S.y0) * 0.56); thmScaleBar(S.x1 - 58, S.y0 + 196, 20, bh, { max: deg(M.max), min: deg(M.min), tmax: M.max, tmin: M.min }); }
+  if (thmHudOpt('hot') && M.max - M.mean > 0.06) thmMark(M.hot[0], M.hot[1], true);
+  if (thmHudOpt('cold', false) && M.mean - M.min > 0.06) thmMark(M.cold[0], M.cold[1], false);
+  if (thmHudOpt('cross')) thmCross(M.cx, M.cy, deg(M.spot));
+  for (const s of M.spots) {
+    thmHudStroke(() => ctx.rect(s.x - 13, s.y - 13, 26, 26), 2.5, s.al);
+    thmHudText(`${s.label} ${deg(s.t)}`, s.x + s.dx, s.y + s.dy, s.size, { al: s.al, align: s.align });
+  }
+  if (thmHudOpt('mode')) thmHudText(`IR  IRON  ε${THM.emis.toFixed(2)}`, S.x0 + 24, S.y0 + 52, small);
+  if (thmHudOpt('clock')) {
+    const sec = Math.floor(F / FPS), fr = F % FPS, p2 = (n) => String(n).padStart(2, '0');
+    thmHudText(`${p2(Math.floor(sec / 60))}:${p2(sec % 60)}:${p2(fr)}  ${Math.round(span[0])}–${Math.round(span[1])}${thmHudOpt('unit', '°C')}`, S.x0 + 24, S.y1 - 18, small - 2);
+    if (M.nuc.since < FPS * 0.4) thmHudText('NUC', S.x1 - 24, S.y1 - 18, small - 2, { align: 'right', weight: 700 });
+  }
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks. Colours arrive as temperature greys ('#rrggbb' or 'rgb()' mid-morph): thmTemp reads both.
+// =====================================================================
+const STYLE = {
+  name: 'thermal',
+  paper: thmC(THM.amb),                                                  // an empty room at room temperature
+  backdrop(c) { ctx.save(); screen(); thmAmbient(thmTemp(c), { key: 'paper' }); ctx.restore(); },   // the backdrop is a temperature
+  window(P, key, src) {                                                 // the old / new world through the object's outline; the edge is feathered, because heat has no hard edges
+    const c = thmCen(P), bb = bbox(P), dim = Math.max(bb.x1 - bb.x0, bb.y1 - bb.y0), far = dim > Math.max(W, H) * 2.2;
+    for (const [px, al] of far ? [[0, 1]] : [[34, 0.3], [22, 0.45], [11, 0.6], [0, 1]]) {
+      const k = 1 + px * 2 / dim;
+      ctx.save(); ctx.globalAlpha = al; trace(P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]), true); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    }
+  },
+  blob(P, c, key, u = 0) {                                               // a heat body whose temperature (not hue) changes; it flares a little mid-morph
+    const t = thmTemp(c), k = Math.sin(Math.PI * clamp(u));
+    thmBody(P, { t: t + 0.05 * k, edge: t - 0.16, soft: 46, bloom: 44 + 26 * k, halo: 0.22 });
+  },
+  hero(x, y, r, o = {}) { thmCat(x, y, r * 0.95, { key: o.key }); },    // r = half the hero's size
+  heroColor: thmC(0.6),
+  heroPts(x, y, r) { return thmCatPts(x, y, r * 0.95); },
+  post() { const M = thmSense(); thmAutoHud(M); for (const f of THM_Q) f(); THM_Q = []; THM_SPOTS = []; },
+  ones: true,                                                            // heat moves smoothly: on 1s
+};
+// =====================================================================
+//  SCENES — thermal demo. World coordinates 1080x1920; time TT on 1s. Scenes draw TEMPERATURE (0..1) in greyscale;
+//  the kit's post pass maps it through the ramp and draws the HUD. Content inside x 60-940, y 250-1500.
+// =====================================================================
+const cu = TIMELINE.cues;
+const THM_SPAN = [[0, 90], [8, 40]];        // each era's span in degrees C (temperature 0 and 1)
+const THM_NUC = [cu.nuc];                   // the shutter recalibrates at the bridge
+// the bridge objects: nothing else may overlap them at the bridge, or it shows in the morph window
+const MUG = { x: 500, y: 960, w: 290, h: 380 }, CAT = { x: 500, y: 955, r: 235 };
+const K = { wall: 0.2, table: 0.165, tea: 0.88, ice: 0.04 }, HL = { wall: 0.3, floor: 0.25 };
+// things seen lying on a table or floor are squashed: draw fn round (x, y) with the y axis shortened
+const onFloor = (x, y, fn, sq = 0.58) => { ctx.save(); ctx.translate(x, y); ctx.scale(1, sq); fn(); ctx.restore(); };
+const PAWS = (() => { const out = []; for (let i = 0; i < 6; i++) { const u = i / 5, x = lerp(905, 655, u), y = lerp(1345, 1248, u) - 26 * Math.sin(u * Math.PI); out.push([x + (i % 2 ? 20 : -20), y + (i % 2 ? 16 : -16)]); } return out; })();
+const mouseAt = (t) => (t < cu.mouse ? null : [lerp(74, 318, EZ.o2(seg(t, cu.mouse, cu.mouse + 0.7))), 1118 - 5 * Math.abs(Math.sin(t * 26)) * (t < cu.mouse + 0.7 ? 1 : 0)]);
+
+// ---- era 1: a cold kitchen counter; the kettle pours
+function sceneKitchen() {
+  const lv = EZ.io(seg(TT, cu.fill, cu.stop)), heat = thmWarm(cu.fill, 0, 1, 0.9);
+  thmAmbient(K.wall, { key: 'kitchen', to: K.wall - 0.015 });
+  thmPlane(1070, K.table, { far: 0.025 });
+  // the glass of ice: a dark hole; cold pools round it on the table
+  onFloor(222, 1158, () => thmFrost(0, 0, 215, { grow: 0.45 + 0.55 * thmIn(cu.frost, 2.6), t: 0.075, key: 'ice', n: 8 }), 0.34);
+  thmBody([[146, 916], [222, 912], [298, 916], [286, 1146], [222, 1152], [158, 1146]], { t: K.ice, edge: 0.095, soft: 20, bloom: 34, cold: true, halo: 0.3 });
+  [[196, 1010, 0.3], [250, 1056, -0.2], [205, 1100, 0.1]].forEach(([x, y, a], i) => thmBlob(x, y + 3 * Math.sin(TT * 1.6 + i * 2), 30, 0.0, { cold: true, hard: 0.5, rot: a, ry: 24 }));   // the cubes bob
+  thmSpot(222, 1010, { label: 'Sp1', dx: -136, dy: -124, align: 'left' });
+  // a hand rested here a moment ago: its print cools into the table
+  onFloor(752, 1300, () => thmPrint(thmHandPts(0, 0, 112, 0.5), { t: 0.62, amb: K.table, age: seg(TT, -0.4, 3.4) }), 0.74);
+  // the table warms under the mug
+  onFloor(MUG.x, MUG.y + MUG.h / 2 + 4, () => thmBlob(0, 0, 150 + 130 * heat, lerp(K.table, 0.46, heat), { a: 0.9 }), 0.3);
+  // the kettle's spout (already hot) and the mug
+  thmBody(rrectPts(742, -160, 520, 470, 110), { t: 0.78, edge: 0.6, soft: 70, bloom: 50 });
+  thmBody([[706, 214], [760, 262], [800, 318], [700, 440], [592, 566], [556, 580], [526, 574], [520, 552], [560, 470], [640, 330]], { t: 0.92, edge: 0.78, soft: 26, bloom: 40 });
+  // a spoon stands in the mug: bare metal reads cold, then heat creeps up it
+  thmConduct([[592, 800], [640, 742], [716, 652]], { w: 15, t0: 0.8, t1: 0.52, base: 0.13, frac: seg(TT, cu.spoon, cu.spoon + 1.7), bloom: 18 });
+  thmBlob(722, 645, 15, 0.13, { cold: true, hard: 0.5, a: 0.9 * (1 - seg(TT, cu.spoon + 1.2, cu.spoon + 1.9)) });
+  const m = thmMug(MUG.x, MUG.y, MUG.w, MUG.h, { level: lv, heat, hot: K.tea, cold: 0.27 });
+  // the stream: its front falls, it runs while the mug fills, its cut end falls
+  thmPour(533, 566, m.rim[0] + 6, m.rim[1] + 4, { w: 17, t: 0.98, bend: -14, head: seg(TT, cu.pour, cu.pour + 0.25), tail: seg(TT, cu.stop, cu.stop + 0.22) });
+  if (TT > cu.fill && TT < cu.stop + 0.2) thmBlob(m.rim[0] + 6, m.rim[1] + 4, 34 + 6 * Math.sin(TT * 30), 1, { ry: 14, a: 0.9 });   // where it lands
+  // steam off the tea
+  thmSteam(MUG.x, m.rim[1] - 6, { h: 320, w: 70, r: 32, t: 0.56, a: 0.8 * clamp(lv * 1.5), from: cu.steam, n: 3, m: 6, key: 'tea' });
+  thmTag('kitchen');
+  thmCaption('Pour the *heat*', { at: 0.5 });
+}
+
+// ---- era 2: a hallway at night; the warm one
+function sceneHall() {
+  thmAmbient(HL.wall, { key: 'hall', to: HL.wall - 0.02 });
+  thmPlane(1096, HL.floor, { far: 0.03 });
+  ctx.fillStyle = thmC(HL.wall - 0.035); ctx.fillRect(-W, 1070, W * 3, 26);                                   // the skirting board
+  // a cold window, and the draught that falls from it
+  thmFrost(214, 800, 250, { grow: thmIn(cu.draught, 2.3), t: 0.12, key: 'draught', sy: 1.25, a: 0.85 });
+  thmBody(rrectPts(96, 400, 236, 304, 8), { t: 0.19, edge: 0.22, soft: 12, bloom: 44, cold: true, halo: 0.26 });
+  for (const [x, y] of [[112, 416], [220, 416], [112, 558], [220, 558]]) thmBody(rrectPts(x, y, 96, 130, 4), { t: 0.035, edge: 0.07, soft: 16, bloom: 0 });
+  // the radiator: the pipe heats, then each fin from the bottom up, one after another
+  const rh = thmIn(cu.rad, 2.0);
+  thmConduct([[1010, 1058], [724, 1058]], { w: 16, t0: 1, t1: 0.9, base: 0.32, frac: seg(TT, cu.rad - 0.2, cu.rad + 0.8), bloom: 18 });
+  for (let i = 0; i < 5; i++) { const x = 846 - i * 27; thmConduct([[x, 1044], [x, 730]], { w: 21, t0: 0.99, t1: 0.74, base: 0.33, frac: seg(TT, cu.rad + i * 0.14, cu.rad + 1.1 + i * 0.14), bloom: 26 }); }
+  thmSteam(792, 724, { h: 250, w: 60, r: 44, t: 0.44, a: 0.4 * rh, n: 2, m: 5, speed: 0.3, from: cu.rad + 0.5, key: 'rad' });
+  thmSpot(792, 776, { label: 'Sp1', dx: -104, dy: -82, align: 'left' });
+  // it walked in: paw prints cool behind it, the oldest first
+  PAWS.forEach(([x, y], i) => onFloor(x, y, () => thmPrint(thmPawPts(0, 0, 40, -1.05), { t: 0.64, amb: HL.floor, age: seg(TT, 2.4 + i * 0.4, 5.6 + i * 0.4) })));
+  // a mouse runs along the wall and stops; its trail fades
+  const mp = mouseAt(TT);
+  if (mp) { thmTrail(mouseAt, { r: 26, ry: 16, t: 0.6, amb: HL.wall, n: 9, dt: 0.045 }); thmBlob(mp[0], mp[1], 27, 0.86, { ry: 17, hard: 0.3 }); thmBlob(mp[0] + 20, mp[1] - 4, 13, 0.95, { hard: 0.3 }); thmConduct([[mp[0] - 22, mp[1] + 4], [mp[0] - 58, mp[1] + 9 + 4 * Math.sin(TT * 9)]], { w: 5, t0: 0.6, t1: 0.42, bloom: 0 }); }
+  // the cat: the tail swishes, an ear turns to the mouse, the head follows, a slow blink
+  const look = -(thmIn(cu.ear, 0.3) - thmIn(5.75, 0.25));
+  thmCat(CAT.x, CAT.y, CAT.r, { tail: Math.sin(TT * 2.6), ear: Math.sin(Math.PI * seg(TT, cu.ear - 0.2, cu.ear + 0.1)), look, blink: TT >= cu.blink && TT < cu.blink + 0.13 });
+  thmTag('hallway');
+  thmCaption('Find the *cat*', { at: 0.75 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — thermal demo (read by kit/morph.js). No camera moves: a handheld camera, held still.
+//  Colours given to the renderer are temperatures: thmC(t) is the grey for t, and the kit reads the blend back.
+// =====================================================================
+const ERA_BG = [thmC(K.wall), thmC(HL.wall)];
+const BRIDGES = [
+  // the hot mug -> the warm cat: similar height and width; the blob cools from tea to fur as it changes shape
+  { tc: 3.0, d: 0.5, A: () => ({ P: thmMugPts(MUG.x, MUG.y, MUG.w, MUG.h), c: thmC(0.8) }), B: () => ({ P: thmCatPts(CAT.x, CAT.y, CAT.r), c: thmC(0.64) }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — thermal demo (inside buildScore(); see kit/score-head.js). An instrument, not a room: a cool
+  // electronic pulse in D minor that warms to F major, a sine that rises as the mug heats, soft sensor ticks for the
+  // readings, a two-part shutter click at the recalibration, metal ticks as the radiator's fins expand.
+  const T = TIMELINE, q = T.cues;
+  const tick = (t, vel, pan = 0, f = 5200) => noiseHit(t, 0.012, 'highpass', f, 1, vel, pan);                              // a reading updates
+  const click = (t, vel) => { noiseHit(t, 0.022, 'bandpass', 2300, 3, vel, 0, 0.05); blip(t, 180, 90, 0.04, vel * 0.8); };  // the shutter
+  const ping = (t, n, vel, pan = 0) => pluck(t, nz(n), vel, pan, 0.2, 5200, 0.35);                                         // metal expanding
+  to = 'm';
+  pad(0.0, 3.1, ['D2', 'A2', 'F3'], 0.05, { type: 'triangle', cut: 700, att: 0.4, rel: 0.3, send: 0.45 });
+  pad(3.0, 6.05, ['F2', 'C3', 'A3', 'E4'], 0.06, { type: 'triangle', cut: 1300, att: 0.2, rel: 0.4, send: 0.5 });
+  const pA = ['D4', 'A3', 'D4', 'F4', 'D4', 'A3', 'E4', 'D4'], pB = ['F4', 'C4', 'A4', 'C5', 'F4', 'C4', 'G4', 'A4'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; blip(t, nz((t < 3 ? pA : pB)[i % 8]), nz((t < 3 ? pA : pB)[i % 8]), 0.09, t < 3 ? 0.03 : 0.036, i % 2 ? 0.3 : -0.3); }   // the pulse
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; bass(t, nz(t < 3 ? (i % 4 < 2 ? 'D2' : 'A1') : (i % 4 < 2 ? 'F2' : 'C2')), t < 3 ? 0.07 : 0.085); }
+  for (let i = 0; i < 12; i++) tick(i * BEAT + E8, 0.012, i % 2 ? 0.4 : -0.4, 7000);
+  // the tone rises as the mug heats: purple to white is a fifth, then an octave
+  blip(q.fill, nz('D4'), nz('A5'), q.stop - q.fill, 0.03, 0);
+  blip(q.fill, nz('D3'), nz('D4'), q.stop - q.fill, 0.03, 0);
+  chime(q.stop, [nz('A5'), nz('D6')], 0.03, 0);
+  ['F4', 'A4', 'C5'].forEach((n, i) => pluck(3.0 + 1 / 6, nz(n), 0.085, -0.2 + i * 0.2, 0.5, 2600, 0.4));                  // the payoff: the cat
+  drone(3.4, 6.0, 55, 0.05, { att: 0.5, rel: 0.4 }); drone(3.4, 6.0, 82.4, 0.02, { att: 0.5, rel: 0.4 });                // a purr under it
+  to = 's';
+  sweep(q.pour, q.stop + 0.2, 0.02, 900, 2600, 0.05);                                                                       // the pour
+  noiseHit(q.pour + 0.25, 0.3, 'bandpass', 700, 1.2, 0.03, 0.05, 0.1, 1500);                                                // it lands
+  for (let i = 0; i < 7; i++) tick(q.fill + i * 0.18, 0.02, 0.1, 4200 + i * 500);                                           // the spot reading climbs
+  sweep(q.steam, 2.5, 0.008, 3000, 5200, -0.1);                                                                             // steam
+  sweep(2.5, 3.0, 0.014, 500, 1800, 0);                                                                                     // the room closes onto the mug
+  click(q.nuc, 0.11); click(q.nuc + 2 / 24, 0.08);                                                                          // NUC: shutter in, shutter out
+  for (let i = 0; i < 5; i++) ping(q.rad + 0.35 + i * 0.14, ['C6', 'F6', 'A6', 'C7', 'F7'][i], 0.02, 0.45);           // the fins heat one by one
+  sweep(q.draught, 5.6, 0.007, 1400, 500, -0.6);                                                                            // the draught
+  for (let i = 0; i < 5; i++) blip(q.mouse + i * 0.13, 3400 + (i % 2) * 500, 3000, 0.03, 0.012, -0.6 + i * 0.05);           // the mouse
+  blip(q.ear, 700, 1000, 0.05, 0.02, 0);                                                                                    // the ear turns
+  tick(q.blink, 0.02, 0, 3000);                                                                                             // a blink
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

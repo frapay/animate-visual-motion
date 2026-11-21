@@ -1,0 +1,1645 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Art Deco demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04050a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  ART DECO DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A theatre card draws itself on a black-navy ground: the frame closes
+//  in from its corners, stepped towers rise tier by tier, a full moon's rim draws on and fills, a sunburst fan opens
+//  behind it, and Bangau, the gold crane asleep under it, lifts its head to look. At 3.0s the moon becomes a round
+//  lantern hanging in an arch on an emerald ground: its rays go out one after another, the side lanterns light, the
+//  fountains start, and the crane opens its tail like a fan. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/art-deco/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // what matters stays in x 140–940 (mirrored about 540), y 250–1500
+const CX = 540;                                               // the centre line: everything is mirrored about it
+
+const ERA_LIST = [[0, 3, () => sceneMalam()], [3, 6, () => sceneCahaya()]];
+const SHOTS = [
+  ['malam',  0, 0.0, 3.0, 'the frame closes in, towers rise, the full moon fills and its sunburst opens; the crane wakes and looks up'],
+  ['cahaya', 1, 3.0, 6.0, 'the moon becomes a lantern in an arch; rays, side lanterns and fountains start; the crane opens its tail'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.25, ring: 0.75, moon: 1.0, fan: 1.5, look: 1.75, lit: 2.0, rays: 3.5, side: 3.75, jet: 4.0, tail: 4.5, ripple: 5.0, bow: 5.5 },
+  acts: [
+    { name: '1 Malam',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Cahaya', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the full moon shines', sound: 'a soft pad, harp plucks, a tick for every tier, a shimmer as the fan opens', next: 'the moon becomes a lantern' },
+    { t: 5.2, title: 'the lantern lights up', sound: 'a warmer pad, a rising harp, chimes for the lanterns, water', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/art-deco/kit.js — ART DECO: a 1920s–30s poster / theatre card. A deep lacquered ground (black-navy,
+//  emerald, oxblood) with a soft vertical sheen and fine grain carries metallic gold linework: sets of parallel
+//  hairlines beside one heavier line, sunburst fans, stepped towers, scallop repeats, chevrons, nested octagons and
+//  diamonds, slender arches, fountains, palm and lotus leaves, a moon disc, a round lantern. Everything is mirrored
+//  about the vertical centre line (decMirror); the hero, a gold crane in profile, is the one thing that is not.
+//  Gold is never flat: every gold stroke and fill is painted with a cached metallic band pattern (bronze -> gold ->
+//  champagne -> gold, tilted a little), and a narrow glint sweeps across it every few seconds (DEC_GLINT).
+//  Solid shapes are few: dark silhouettes edged in gold. Lines keep their weight whatever the camera does.
+//  Built on kit/core.js. Motion on 1s, eased in and out, never bouncing. Helpers are prefixed dec…; the palette is
+//  DEC. Needs from the piece head: CX (the centre line / caption centre; W / 2 when absent).
+// =====================================================================
+const DEC = {
+  paper: '#07080e',                                        // the black lacquer a morph happens on
+  night: '#0a1024', emerald: '#0a3a30', oxblood: '#3b0e18',  // grounds: black-navy, emerald, oxblood
+  ink: '#04050a', plaque: '#05060b',                       // silhouettes (towers, basins, leaves); the caption plaque
+  gold: '#d4a94a', goldD: '#8a6426', goldL: '#fff1c4',     // the linework: metallic gold (painted as a band pattern)
+  amber: '#f6b63c',                                        // WARM BRIGHT AMBER: reserved for the hero
+  moon: '#ead9a0',                                         // the pale champagne of a moon / sun disc
+  cream: '#f4ead2',                                        // ivory: tags, the highlighted word, lit windows, water
+  teal: '#3fbcae', emer: '#2fa07a',                        // the one jewel tone (teal on green / navy, emerald on oxblood)
+};
+const DEC_W = { hair: 2.2, mid: 3.6, heavy: 6 };           // the three line weights (px at 1080 wide, constant under the camera)
+const DEC_GLINT = { every: 3, at: 1.2, dur: 1.3, w: 80, al: 0.9, tilt: 0.36 };   // the glint: every N seconds, from `at`, taking `dur`; every: 0 turns it off
+const DEC_SERIF = '"Didot", "Bodoni 72", "Playfair Display", "Bodoni MT", "Didot LT STD", Georgia, "Times New Roman", serif';       // tall display caps
+const DEC_SANS = '"Copperplate", "Optima", "Gill Sans", "Century Gothic", "Gill Sans MT", "Trebuchet MS", "DejaVu Sans", sans-serif';  // small spaced caps
+const DEC_METALS = {
+  gold: ['#8a6426', '#d4a94a', '#fff1c4', '#dcb354', '#b58a35', '#e2bd62', '#f6e3a4', '#c79a3e', '#8a6426'],
+  amber: ['#c27a1c', '#f6b63c', '#fff0b8', '#f9c04c', '#e39a25', '#fbc955', '#ffe9a0', '#eea52c', '#c27a1c'],
+  pale: ['#c9b06a', '#ead9a0', '#fffbe6', '#efe0ae', '#d8c282', '#f3e6b8', '#fff7da', '#e2cf94', '#c9b06a'],
+};
+
+// ---------------------------------------------------------------------
+//  small things: the centre line, the zoom, a cache for static things, colour maths (hex or rgb() in, rgb() out)
+// ---------------------------------------------------------------------
+const decAX = () => (typeof CX !== 'undefined' ? CX : W / 2);
+const decZoom = () => { const m = ctx.getTransform(); return Math.hypot(m.a, m.b) || 1; };
+const DEC_CACHE = new Map();
+function decMemo(key, make) { let v = DEC_CACHE.get(key); if (v === undefined) { v = make(); DEC_CACHE.set(key, v); } return v; }
+function decRGB(c) {
+  if (c[0] === '#') { const h = c.length === 4 ? c.replace(/[0-9a-f]/gi, '$&$&') : c; return [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); }
+  return c.match(/[\d.]+/g).slice(0, 3).map(Number);
+}
+const decMix = (a, b, u) => { const x = decRGB(a), y = decRGB(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], clamp(u)))).join(',')})`; };
+const decTone = (c, k) => (k < 0 ? decMix(c, '#000000', -k) : decMix(c, '#ffffff', k));
+const decA = (c, al) => `rgba(${decRGB(c).join(',')},${al})`;
+const decCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+// draw fn twice: as given and mirrored about the centre line (fn(1), then fn(-1) under a flipped transform)
+function decMirror(fn, ax = decAX()) { fn(1); ctx.save(); ctx.translate(2 * ax, 0); ctx.scale(-1, 1); fn(-1); ctx.restore(); }
+
+// ---------------------------------------------------------------------
+//  metal: the gold is a cached band pattern, never a flat fill; the glint is a narrow light band in screen space,
+//  re-expressed in the current transform so it can be stroked / filled straight over a gold path
+// ---------------------------------------------------------------------
+function decMetal(k = 'gold') {
+  return decMemo('metal:' + k, () => {
+    const cv = document.createElement('canvas'); cv.width = 8; cv.height = 520;
+    const g = cv.getContext('2d'), lg = g.createLinearGradient(0, 0, 0, 520), S = DEC_METALS[k];
+    S.forEach((c, i) => lg.addColorStop(i / (S.length - 1), c)); g.fillStyle = lg; g.fillRect(0, 0, 8, 520);
+    const p = g.createPattern(cv, 'repeat'); p.setTransform(new DOMMatrix().rotate(-16)); return p;
+  });
+}
+const decIsMetal = (c) => c == null || c === 'gold' || c === 'amber' || c === 'pale';
+const decInk = (c) => (decIsMetal(c) ? decMetal(c || 'gold') : DEC[c] || c);   // 'gold' | 'amber' | 'pale' | a DEC key | any css colour
+function decGlint() {
+  const G = DEC_GLINT; if (!G.every) return null;
+  const ph = mod(TT - G.at, G.every) / G.dur; if (ph >= 1) return null;
+  const reach = H * Math.tan(G.tilt) / 2 + G.w, gx = lerp(-reach, W + reach, ph), dx = Math.cos(G.tilt) * G.w, dy = -Math.sin(G.tilt) * G.w;
+  const inv = ctx.getTransform().inverse(), a = inv.transformPoint(new DOMPoint(gx - dx, H / 2 - dy)), b = inv.transformPoint(new DOMPoint(gx + dx, H / 2 + dy));
+  const g = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+  g.addColorStop(0, 'rgba(255,250,228,0)'); g.addColorStop(0.5, `rgba(255,250,228,${G.al})`); g.addColorStop(1, 'rgba(255,250,228,0)');
+  return g;
+}
+// stroke / fill the CURRENT path in colour c (metal gets the glint). o: al, cap, join, glint (false = none)
+function decStrokeNow(c, w = DEC_W.hair, o = {}) {
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1; ctx.lineWidth = w / decZoom(); ctx.lineCap = o.cap || 'butt'; ctx.lineJoin = o.join || 'miter'; ctx.miterLimit = 6;
+  ctx.strokeStyle = decInk(c); ctx.stroke();
+  if (decIsMetal(c) && o.glint !== false) { const g = decGlint(); if (g) { ctx.strokeStyle = g; ctx.stroke(); } }
+  ctx.restore();
+}
+function decFillNow(c, o = {}) {
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1; ctx.fillStyle = decInk(c); ctx.fill();
+  if (decIsMetal(c) && o.glint !== false) { const g = decGlint(); if (g) { ctx.fillStyle = g; ctx.fill(); } }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  geometry: straight polylines (Deco corners are sharp), parts of a path, parallel offsets, the basic outlines
+// ---------------------------------------------------------------------
+function decPoly(P, closed) { ctx.beginPath(); for (let i = 0; i < P.length; i++) { if (i) ctx.lineTo(P[i][0], P[i][1]); else ctx.moveTo(P[i][0], P[i][1]); } if (closed) ctx.closePath(); }
+function decSub(P, a, b) {   // the part of polyline P between length fractions a and b
+  a = clamp(a); b = clamp(b); if (b <= a || P.length < 2) return [];
+  const L = pathLen(P), la = a * L, lb = b * L, out = []; let s = 0;
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]), s1 = s + d;
+    if (d > 0 && s1 >= la && s <= lb) {
+      const u0 = clamp((la - s) / d), u1 = clamp((lb - s) / d);
+      if (!out.length) out.push([lerp(P[i - 1][0], P[i][0], u0), lerp(P[i - 1][1], P[i][1], u0)]);
+      out.push([lerp(P[i - 1][0], P[i][0], u1), lerp(P[i - 1][1], P[i][1], u1)]);
+    }
+    s = s1;
+  }
+  return out;
+}
+function decOffset(P, d, closed) {   // a parallel copy of P, d px to the left of its direction (mitred corners)
+  const n = P.length, out = [], nrm = (a, b) => { const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy); return l > 1e-6 ? [dy / l, -dx / l] : null; };
+  for (let i = 0; i < n; i++) {
+    const a = P[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = P[i], c = P[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    let n1 = nrm(a, b), n2 = nrm(b, c); n1 = n1 || n2 || [0, -1]; n2 = n2 || n1;
+    let mx = n1[0] + n2[0], my = n1[1] + n2[1]; const l = Math.hypot(mx, my) || 1; mx /= l; my /= l;
+    const k = d / Math.max(0.3, mx * n1[0] + my * n1[1]);
+    out.push([b[0] + mx * k, b[1] + my * k]);
+  }
+  return out;
+}
+const decArea = (P) => { let s = 0; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a[0] * b[1] - b[0] * a[1]; } return s / 2; };
+function decInset(P, d) { const Q = decOffset(P, d, true); return Math.abs(decArea(Q)) < Math.abs(decArea(P)) === d > 0 ? Q : decOffset(P, -d, true); }   // d > 0 shrinks
+// a circle that starts at the bottom, so a draw-on 'from the middle' opens at the top and runs down both sides
+function decCirclePts(x, y, r, n = 72) { const P = []; for (let i = 0; i < n; i++) { const a = Math.PI / 2 + i / n * TAU; P.push([x + Math.cos(a) * r, y + Math.sin(a) * r]); } return P; }
+function decNgon(x, y, rx, n = 8, rot = Math.PI / 8, ry = rx) { const P = []; for (let i = 0; i < n; i++) { const a = Math.PI / 2 + rot + i / n * TAU; P.push([x + Math.cos(a) * rx, y + Math.sin(a) * ry]); } return P; }
+function decChamfer(x, y, w, h, c) { c = Math.max(0, Math.min(c, w / 2, h / 2)); return [[x + c, y], [x + w - c, y], [x + w, y + c], [x + w, y + h - c], [x + w - c, y + h], [x + c, y + h], [x, y + h - c], [x, y + c]]; }
+// a pointed leaf / petal from its base (x, y), len long, wid wide, pointing along ang
+function decLeafPts(x, y, len, wid, ang = -Math.PI / 2, n = 10) {
+  const P = [], ca = Math.cos(ang), sa = Math.sin(ang);
+  for (let i = 0; i <= 2 * n; i++) { const u = i <= n ? i / n : 2 - i / n, s = i <= n ? 1 : -1, d = len * u, o = s * wid / 2 * Math.sin(Math.PI * u) ** 0.8; if (i === 2 * n) break; P.push([x + ca * d - sa * o, y + sa * d + ca * o]); }
+  return P;
+}
+// a stepped pyramid outline standing on y = base: n steps, the top one `top` (0..1) as wide as the bottom
+function decStepPts(x, base, w, h, n = 3, top = 0.4) {
+  const L = [], R = [];
+  for (let i = 0; i < n; i++) { const wi = w * lerp(1, top, n > 1 ? i / (n - 1) : 0) / 2, y0 = base - h * i / n, y1 = base - h * (i + 1) / n; L.push([x - wi, y0], [x - wi, y1]); R.unshift([x + wi, y1], [x + wi, y0]); }
+  return [...L, ...R];
+}
+// an arch as an open path: left foot -> apex -> right foot. kind: 'pointed' | 'round' | 'step'
+function decArchPts(x, base, w, h, kind = 'pointed', n = 20) {
+  const R = w / 2, L = [[x - R, base]];
+  if (kind === 'round') { const sy = base - h + R; for (let i = 0; i <= n; i++) { const a = Math.PI + Math.PI / 2 * i / n; L.push([x + Math.cos(a) * R, sy + Math.sin(a) * R]); } }
+  else if (kind === 'step') { const st = 3, sw = R / (st + 1), sh = sw * 0.8, sy = base - h + st * sh; L.push([x - R, sy]); for (let i = 1; i <= st; i++) L.push([x - R + sw * i, sy - sh * (i - 1)], [x - R + sw * i, sy - sh * i]); L.push([x, base - h]); }
+  else { const Rp = w * 0.92, cl = x - R + Rp, th = Math.acos((Rp - R) / Rp), sy = base - h + Rp * Math.sin(th); for (let i = 0; i <= n; i++) { const a = Math.PI + th * i / n; L.push([cl + Math.cos(a) * Rp, sy + Math.sin(a) * Rp]); } }
+  return [...L, ...L.slice(0, -1).reverse().map(([px, py]) => [2 * x - px, py])];
+}
+// a crescent: a disc of radius r with a second disc bitten out toward angle `to` (default the upper right)
+function decCrescentPts(x, y, r, o = {}) {
+  const to = o.to ?? -0.5, d = r * (o.bite ?? 0.42), r1 = r * (o.inner ?? 0.84), cx = x + Math.cos(to) * d, cy = y + Math.sin(to) * d;
+  const a = (r * r - r1 * r1 + d * d) / (2 * d), ha = Math.acos(clamp(a / r, -1, 1)), hb = Math.acos(clamp((a - d) / r1, -1, 1)), P = [], n = 40;
+  for (let i = 0; i <= n; i++) { const t = to + ha + (TAU - 2 * ha) * i / n; P.push([x + Math.cos(t) * r, y + Math.sin(t) * r]); }
+  for (let i = 1; i < n; i++) { const t = to - hb - (TAU - 2 * hb) * i / n; P.push([cx + Math.cos(t) * r1, cy + Math.sin(t) * r1]); }
+  return P;
+}
+
+// ---------------------------------------------------------------------
+//  the medium's primitives: a line that draws itself on, the set of parallel rules, a flat silhouette edged in gold
+// ---------------------------------------------------------------------
+// o: c ('gold'), w (hair), p (0..1 drawn), from ('start' | 'mid' | 'end'), closed, al, cap, join
+function decLine(P, o = {}) {
+  const p = clamp(o.p ?? 1); if (p <= 0 || P.length < 2) return;
+  if (p >= 1) decPoly(P, !!o.closed);
+  else {
+    const Q = o.closed ? [...P, P[0]] : P, S = o.from === 'mid' ? decSub(Q, 0.5 - p / 2, 0.5 + p / 2) : o.from === 'end' ? decSub(Q, 1 - p, 1) : decSub(Q, 0, p);
+    if (S.length < 2) return; decPoly(S, false);
+  }
+  decStrokeNow(o.c, o.w ?? DEC_W.hair, o);
+}
+// THE motif: one heavier line with n hairlines running beside it. o: n (2), gap (9), heavy (6), hair (2.2), side (1 | -1), + decLine's
+function decRules(P, o = {}) {
+  const n = o.n ?? 2, gap = o.gap ?? 9, hv = o.heavy ?? DEC_W.heavy, side = o.side ?? 1, p = o.p ?? 1;
+  decLine(P, { ...o, w: hv });
+  for (let k = 1; k <= n; k++) decLine(decOffset(P, side * (hv / 2 + gap * k), !!o.closed), { ...o, w: o.hair ?? DEC_W.hair, p: clamp(p * (1 + 0.12 * k) - 0.12 * k) });
+}
+// o: fill (a colour; 'gold' / 'amber' / 'pale' = metal), edge ('gold'; false = none), w (mid), inset ([px, …] hairlines inside), p (edge draw-on), al
+function decShape(P, o = {}) {
+  if (o.fill) { decPoly(P, true); decFillNow(o.fill, { al: o.al }); }
+  if (o.edge !== false) decLine(P, { closed: true, c: o.edge, w: o.w ?? DEC_W.mid, al: o.al, p: o.p, from: o.from });
+  for (const d of o.inset || []) decLine(decInset(P, d), { closed: true, c: o.edge || 'gold', w: DEC_W.hair, al: o.al, p: o.p, from: o.from });
+}
+
+// ---------------------------------------------------------------------
+//  the ground: lacquer in colour c with a soft vertical sheen (cached overlay); grain and vignette go on in STYLE.post
+// ---------------------------------------------------------------------
+function decSheen() {
+  return decMemo('sheen', () => {
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const g = cv.getContext('2d');
+    const band = (x, w, al) => { const lg = g.createLinearGradient(x - w, 0, x + w, 0); lg.addColorStop(0, 'rgba(255,255,255,0)'); lg.addColorStop(0.5, `rgba(255,255,255,${al})`); lg.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = lg; g.fillRect(x - w, 0, 2 * w, H); };
+    band(W * 0.5, W * 0.42, 0.085); band(W * 0.2, W * 0.08, 0.022); band(W * 0.8, W * 0.08, 0.022); band(W * 0.36, W * 0.035, 0.013); band(W * 0.64, W * 0.035, 0.013);
+    const vg = g.createLinearGradient(0, 0, 0, H); vg.addColorStop(0, 'rgba(0,0,0,0.34)'); vg.addColorStop(0.3, 'rgba(0,0,0,0)'); vg.addColorStop(0.7, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.4)');
+    g.fillStyle = vg; g.fillRect(0, 0, W, H); return cv;
+  });
+}
+function decLens() {
+  return decMemo('lens', () => {
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const g = cv.getContext('2d'), R = RNG('decgrain');
+    const rg = g.createRadialGradient(W / 2, H * 0.46, H * 0.3, W / 2, H * 0.5, H * 0.72); rg.addColorStop(0, 'rgba(0,0,0,0)'); rg.addColorStop(1, 'rgba(0,0,0,0.38)');
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+    g.fillStyle = 'rgba(255,238,200,0.075)'; g.beginPath(); for (let i = 0; i < 11000; i++) g.rect(R.r(0, W), R.r(0, H), 1.6, 1.6); g.fill();
+    g.fillStyle = 'rgba(0,0,0,0.16)'; g.beginPath(); for (let i = 0; i < 11000; i++) g.rect(R.r(0, W), R.r(0, H), 1.8, 1.8); g.fill();
+    return cv;
+  });
+}
+function decGround(c = DEC.night) { ctx.save(); ctx.fillStyle = c; ctx.fillRect(-80, -80, W + 160, H + 160); ctx.drawImage(decSheen(), 0, 0); ctx.restore(); }
+
+// ---------------------------------------------------------------------
+//  ornaments. Each is symmetric about its own x; mirror pairs with decMirror. Progress arguments are 0..1.
+// ---------------------------------------------------------------------
+// a sunburst fan about (x, y), opening like a hand fan from its middle ray. o: r0 (inner radius), n (13 rays, odd), mid (-90deg),
+//   span (half angle, 90deg; 180deg = a full burst), open, ext (rays extend in sequence from the middle), wedge (true = thin gold
+//   wedges, false = lines), alt (0.74: the short rays), fat (0.42), rim (arcs at the root), tips (dots on the long rays), c, w, al
+function decFan(x, y, r, o = {}) {
+  const n = o.n ?? 13, mid = o.mid ?? -Math.PI / 2, span = o.span ?? Math.PI / 2, r0 = o.r0 ?? r * 0.3, open = clamp(o.open ?? 1), ext = clamp(o.ext ?? 1);
+  if (open <= 0) return;
+  const full = span >= Math.PI - 1e-6, m = full ? n : n - 1, wedge = o.wedge !== false, alt = o.alt ?? 0.74, hw = span * open / Math.max(1, m) * (o.fat ?? 0.42), tips = [];
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const k = m ? i / m * 2 - 1 : 0, a = mid + k * span * open, e = EZ.io(clamp(ext * 2 - Math.abs(k))); if (e <= 0) continue;
+    const long = Math.round(Math.abs(k) * m / 2) % 2 === 0, r1 = lerp(r0, r * (long ? 1 : alt), e), ca = Math.cos(a), sa = Math.sin(a);
+    if (wedge) { ctx.moveTo(x + ca * r0, y + sa * r0); ctx.lineTo(x + Math.cos(a - hw) * r1, y + Math.sin(a - hw) * r1); ctx.lineTo(x + Math.cos(a + hw) * r1, y + Math.sin(a + hw) * r1); ctx.closePath(); }
+    else { ctx.moveTo(x + ca * r0, y + sa * r0); ctx.lineTo(x + ca * r1, y + sa * r1); }
+    if (long && e >= 1) tips.push([x + ca * (r1 + 12), y + sa * (r1 + 12)]);
+  }
+  if (wedge) decFillNow(o.c, { al: o.al }); else decStrokeNow(o.c, o.w ?? DEC_W.hair, { al: o.al });
+  if (o.rim) for (const [d, w] of [[10, DEC_W.hair], [22, DEC_W.mid]]) { ctx.beginPath(); ctx.arc(x, y, Math.max(1, r0 - d), mid - span * open, mid + span * open); decStrokeNow(o.c, w, { al: o.al }); }
+  if (o.tips) { ctx.beginPath(); for (const [tx, ty] of tips) { ctx.moveTo(tx + 4, ty); ctx.arc(tx, ty, 4, 0, TAU); } decFillNow(o.c, { al: o.al }); }
+}
+// a stepped tower (ziggurat / skyscraper) on y = base, rising tier by tier. o: tiers (4), rise, fill, lit (0..1: windows come on),
+//   spire (px), pitch (28: pilaster spacing), key
+function decZig(x, base, w, h, o = {}) {
+  const n = o.tiers ?? 4, rise = clamp(o.rise ?? 1), key = o.key ?? 'zig', lit = clamp(o.lit ?? 0);
+  const ws = []; let sum = 0; for (let i = 0; i < n; i++) { ws.push(n - 0.6 * i); sum += n - 0.6 * i; }
+  let yb = base;
+  for (let i = 0; i < n; i++) {
+    const ri = EZ.io(clamp(rise * n - i)); if (ri <= 0) break;
+    const wi = w * (1 - 0.72 * i / n), hi = h * ws[i] / sum * ri, x0 = x - wi / 2, y0 = yb - hi, m = Math.max(2, Math.round(wi / (o.pitch ?? 28)));
+    ctx.fillStyle = o.fill ?? DEC.ink; ctx.fillRect(x0, y0, wi, hi + 1);
+    ctx.beginPath(); for (let j = 1; j < m; j++) { const xx = x0 + wi * j / m; ctx.moveTo(xx, yb - 3); ctx.lineTo(xx, y0 + 6); } decStrokeNow(o.c, DEC_W.hair * 0.8, { al: 0.6 });
+    if (lit > 0 && ri >= 1) {
+      ctx.fillStyle = DEC.cream; const cw = wi / m, rows = Math.floor((hi - 22) / 30);
+      for (let q = 0; q < rows; q++) for (let j = 0; j < m; j++) if (RNG(key, 'win', i, Math.min(j, m - 1 - j), q).f() < lit * 0.55) ctx.fillRect(x0 + cw * (j + 0.5) - cw * 0.17, y0 + 16 + q * 30, cw * 0.34, 13);
+    }
+    decLine([[x0, yb], [x0, y0], [x0 + wi, y0], [x0 + wi, yb]], { c: o.c, w: DEC_W.mid });
+    decLine([[x0 - 6, y0], [x0 + wi + 6, y0]], { c: o.c, w: DEC_W.heavy - 1 });
+    yb = y0;
+  }
+  const sp = o.spire ?? 0, k = EZ.io(clamp(rise * n - n + 1));
+  if (sp && k >= 1) { decLine([[x, yb], [x, yb - sp]], { c: o.c, w: DEC_W.mid }); decShape(decNgon(x, yb - sp, 7, 4, 0, 11), { fill: o.c ?? 'gold', edge: false }); }
+}
+// a stepped plinth / pyramid. o: steps (3), top (0.4), fill, c, rise
+function decSteps(x, base, w, h, o = {}) {
+  const n = o.steps ?? 3, k = EZ.io(clamp(o.rise ?? 1)); if (k <= 0) return;
+  const P = decStepPts(x, base, w, h * k, n, o.top ?? 0.4);
+  decShape(P, { fill: o.fill ?? DEC.ink, edge: o.c ?? 'gold' });
+  for (let i = 1; i < n; i++) { const wi = w * lerp(1, o.top ?? 0.4, i / (n - 1)) / 2, y = base - h * k * i / n + 7; decLine([[x - wi + 6, y], [x + wi - 6, y]], { c: o.c, al: 0.7 }); }
+}
+// a scallop (shell / fish-scale) repeat filling a band; drawn once into a cached canvas. o: s (44: the shell's radius), rings (3), c, al, p (opens from the middle)
+function decScallops(x0, y0, w, h, o = {}) {
+  const s = o.s ?? 44, rings = o.rings ?? 3, c = o.c ?? 'gold', p = clamp(o.p ?? 1); if (p <= 0) return;
+  const cv = decMemo(`scal:${w}:${h}:${s}:${rings}:${c}`, () => {
+    const v = document.createElement('canvas'); v.width = Math.ceil(w); v.height = Math.ceil(h); const g = v.getContext('2d');
+    g.lineWidth = DEC_W.hair; g.strokeStyle = decInk(c);
+    for (let j = 0, y = s; y - s < h + s; j++, y += s) for (let x = j % 2 ? 0 : s; x - s < w; x += 2 * s) {
+      g.globalCompositeOperation = 'destination-out'; g.beginPath(); g.arc(x, y, s, 0, TAU); g.fill(); g.globalCompositeOperation = 'source-over';
+      for (let k = 0; k < rings; k++) { g.beginPath(); g.arc(x, y, s * (1 - k / (rings + 0.4)) - 1.2, Math.PI, TAU); g.stroke(); }
+    }
+    return v;
+  });
+  ctx.save(); ctx.globalAlpha *= o.al ?? 1; ctx.beginPath(); ctx.rect(x0 + w / 2 * (1 - p), y0, w * p, h); ctx.clip(); ctx.drawImage(cv, x0, y0); ctx.restore();
+}
+// a chevron band centred on x. o: s (28: half a chevron), h (20), n (2 nested rows), gap (9), up (true), p (draws from the middle out), c, w, al
+function decChevrons(x, y, w, o = {}) {
+  const cnt = 2 * Math.max(1, Math.round(w / (2 * (o.s ?? 28)))), s = w / cnt, hh = (o.h ?? 20) * (o.up === false ? -1 : 1), P = [];
+  for (let i = 0; i <= cnt; i++) P.push([x - w / 2 + i * s, y - (i % 2 ? hh : 0)]);
+  for (let k = 0; k < (o.n ?? 2); k++) decLine(P.map(([px, py]) => [px, py + k * (o.gap ?? 9)]), { c: o.c, w: o.w ?? DEC_W.hair, p: o.p, from: 'mid', al: o.al });
+}
+// nested octagons (or any n-gon: sides, rot, squash). o: n (3 rings), gap (10), sides (8), rot, sq (ry / rx), fill, p, c
+function decOct(x, y, r, o = {}) {
+  const n = o.n ?? 3, gap = o.gap ?? 10, sides = o.sides ?? 8, rot = o.rot ?? Math.PI / sides, sq = o.sq ?? 1;
+  for (let k = 0; k < n; k++) {
+    const rr = r - k * gap; if (rr <= 2) break;
+    const P = decNgon(x, y, rr, sides, rot, rr * sq);
+    if (k === 0 && o.fill) { decPoly(P, true); decFillNow(o.fill); }
+    decLine(P, { closed: true, c: o.c, w: k === 0 ? DEC_W.mid : DEC_W.hair, p: clamp((o.p ?? 1) * (1 + 0.15 * k) - 0.15 * k), from: 'mid', al: o.al });
+  }
+}
+// nested diamonds: decOct with four sides. o: as decOct, ry (the half height; default 1.5 r)
+const decDiamond = (x, y, r, o = {}) => decOct(x, y, r, { sides: 4, rot: 0, sq: (o.ry ?? r * 1.5) / r, ...o });
+// a small four-point diamond that twinkles. o: c ('gold'), key (its phase), rate (2.6), tw (0..1 to drive it by hand), flare (true)
+function decGem(x, y, s, o = {}) {
+  if (s <= 0.3) return;
+  const tw = o.tw ?? 0.5 + 0.5 * Math.sin(TT * (o.rate ?? 2.6) + RNG('gem', o.key ?? 'g').r(0, TAU)), k = s * (0.6 + 0.4 * tw), q = k * 0.2;
+  decPoly([[x, y - k], [x + q, y - q], [x + k * 0.66, y], [x + q, y + q], [x, y + k], [x - q, y + q], [x - k * 0.66, y], [x - q, y - q]], true); decFillNow(o.c ?? 'gold');
+  const f = clamp((tw - 0.7) / 0.3); if (f > 0 && o.flare !== false) { ctx.beginPath(); ctx.moveTo(x - k * 1.9 * f, y); ctx.lineTo(x + k * 1.9 * f, y); ctx.moveTo(x, y - k * 2.4 * f); ctx.lineTo(x, y + k * 2.4 * f); decStrokeNow(o.c ?? 'gold', 1.5, { al: 0.85 * f }); }
+}
+// a slender arch on y = base, drawn from both feet up to the apex. o: kind ('pointed' | 'round' | 'step'), n (2 inner hairlines),
+//   gap (10), p, fill (the opening), caps (true: little cornices where the feet stand), c
+function decArch(x, base, w, h, o = {}) {
+  const p = clamp(o.p ?? 1), n = o.n ?? 2, gap = o.gap ?? 10; if (p <= 0) return;
+  const P = decMemo(`arch:${x}:${base}:${w}:${h}:${o.kind}`, () => decArchPts(x, base, w, h, o.kind));
+  if (o.fill) { ctx.save(); ctx.globalAlpha *= p; decPoly(P, true); ctx.fillStyle = o.fill; ctx.fill(); ctx.restore(); }
+  for (let k = 0; k <= n; k++) {
+    const Q = k ? decMemo(`arch:${x}:${base}:${w - 2 * gap * k - DEC_W.heavy}:${h - gap * k - 3}:${o.kind}`, () => decArchPts(x, base, w - 2 * gap * k - DEC_W.heavy, h - gap * k - 3, o.kind)) : P;
+    const pk = clamp(p * (1 + 0.12 * k) - 0.12 * k), st = { c: o.c, w: k ? DEC_W.hair : DEC_W.heavy };
+    if (pk >= 1) decLine(Q, st); else { decLine(decSub(Q, 0, pk / 2), st); decLine(decSub(Q, 1 - pk / 2, 1), st); }
+  }
+  if (o.caps !== false) for (const s of [-1, 1]) decLine([[x + s * (w / 2 + 12), base], [x + s * (w / 2 - 12 - gap * n), base]], { c: o.c, w: DEC_W.heavy, p: clamp(p * 4) });
+}
+// a fountain on y = base: a stepped basin, a centre jet and two arcs a side whose water runs in a loop. s = scale (1: 200 wide).
+//   o: rise (0..1: the jets come up), jet ('cream'), t (TT), fill, c
+function decFountain(x, base, s = 1, o = {}) {
+  const rise = EZ.io(clamp(o.rise ?? 1)), t = o.t ?? TT, jc = o.jet ?? 'cream', y0 = base - 132 * s;
+  if (rise > 0) {
+    const arcs = [[46 * s, base - 106 * s, 54 * s], [92 * s, base - 46 * s, 96 * s]];
+    for (const dir of [-1, 1]) arcs.forEach(([d, yl, ap], j) => {
+      const P = []; for (let i = 0; i <= 20; i++) { const u = i / 20; P.push([x + dir * d * u, y0 + (yl - y0) * u - 4 * ap * rise * u * (1 - u)]); }
+      decLine(P, { c: jc, al: 0.4, p: rise });
+      if (rise >= 1) for (let k = 0; k < 3; k++) { const a = mod(t * 0.9 + k / 3 + j * 0.17, 1); decLine(decSub(P, a, a + 0.2), { c: jc, w: DEC_W.mid }); }
+      if (rise >= 1) { const ph = mod(t * 1.8 + j * 0.37, 1); ctx.beginPath(); ctx.ellipse(x + dir * d, yl - 2, 4 + 12 * ph, 2 + 3 * ph, 0, 0, TAU); decStrokeNow(jc, 1.6, { al: 0.9 * (1 - ph) }); }
+    });
+    const top = y0 - 120 * s * rise, bob = rise >= 1 ? 5 * Math.sin(t * 5) : 0;
+    decLine([[x, y0], [x, top + bob]], { c: jc, w: DEC_W.mid });
+    for (const a of [-0.5, 0, 0.5]) decLine([[x, top + bob], [x + Math.sin(a) * 26 * s * rise, top + bob - Math.cos(a) * 22 * s * rise]], { c: jc });
+  }
+  const fill = o.fill ?? DEC.ink;
+  decShape([[x - 7 * s, base - 46 * s], [x - 7 * s, base - 108 * s], [x + 7 * s, base - 108 * s], [x + 7 * s, base - 46 * s]], { fill, edge: o.c, w: DEC_W.hair });
+  decShape([[x - 46 * s, y0 + 6 * s], [x + 46 * s, y0 + 6 * s], [x + 26 * s, base - 106 * s], [x - 26 * s, base - 106 * s]], { fill, edge: o.c });
+  decShape([[x - 100 * s, base - 46 * s], [x + 100 * s, base - 46 * s], [x + 72 * s, base], [x - 72 * s, base]], { fill, edge: o.c });
+  decLine([[x - 108 * s, base - 46 * s], [x + 108 * s, base - 46 * s]], { c: o.c, w: DEC_W.heavy - 1 });
+  decLine([[x - 86 * s, base - 30 * s], [x + 86 * s, base - 30 * s]], { c: o.c, al: 0.8 }); decLine([[x - 78 * s, base - 17 * s], [x + 78 * s, base - 17 * s]], { c: o.c, al: 0.8 });
+}
+// a fan of pointed leaves from (x, y). o: n (5), mid (-90deg), span (half angle, 70deg), wid (0.24 of len), p (unfolds), fill, c, vein ('teal')
+function decLeaves(x, y, len, o = {}) {
+  const n = o.n ?? 5, mid = o.mid ?? -Math.PI / 2, span = o.span ?? 70 * DEG, p = EZ.io(clamp(o.p ?? 1)); if (p <= 0) return;
+  const order = [...Array(n).keys()].sort((a, b) => Math.abs(b - (n - 1) / 2) - Math.abs(a - (n - 1) / 2));   // the outer leaves first, the middle one on top
+  for (const i of order) {
+    const k = n > 1 ? i / (n - 1) * 2 - 1 : 0, a = mid + k * span * p, l = len * (1 - 0.14 * Math.abs(k)) * lerp(0.45, 1, p);
+    decShape(decLeafPts(x, y, l, l * (o.wid ?? 0.24), a), { fill: o.fill ?? DEC.ink, edge: o.c, w: DEC_W.hair + 0.6 });
+    if (o.vein !== false) decLine([[x + Math.cos(a) * l * 0.12, y + Math.sin(a) * l * 0.12], [x + Math.cos(a) * l * 0.8, y + Math.sin(a) * l * 0.8]], { c: o.vein ?? 'teal', w: DEC_W.hair });
+  }
+}
+// a stylised palm: a ringed trunk h tall and a crown of leaves. o: r (leaf length, 120), p, + decLeaves'
+function decPalm(x, base, h, o = {}) {
+  const p = clamp(o.p ?? 1), top = base - h * EZ.io(clamp(p * 2)); if (p <= 0) return;
+  decLine([[x - 6, base], [x - 4, top]], { c: o.c }); decLine([[x + 6, base], [x + 4, top]], { c: o.c });
+  ctx.beginPath(); for (let y = base - 22; y > top + 10; y -= 34) { ctx.moveTo(x - 6, y); ctx.lineTo(x, y - 8); ctx.lineTo(x + 6, y); } decStrokeNow(o.c, DEC_W.hair * 0.8, { al: 0.8 });
+  decLeaves(x, top, o.r ?? 120, { n: 7, span: 100 * DEG, wid: 0.2, ...o, p: clamp(p * 2 - 1) });
+  if (p > 0.5) { ctx.beginPath(); ctx.arc(x, top, 9, 0, TAU); decFillNow(o.c ?? 'gold'); }
+}
+// a lotus: decLeaves as broad petals on two hairline arcs. o: n (5), p (opens), fill, c
+function decLotus(x, y, s, o = {}) {
+  decLeaves(x, y, s, { n: 5, span: 62 * DEG, wid: 0.42, vein: false, ...o });
+  for (const [r, w] of [[s * 0.2, DEC_W.mid], [s * 0.34, DEC_W.hair]]) { ctx.beginPath(); ctx.arc(x, y - s * 0.02, r, 0.12, Math.PI - 0.12); decStrokeNow(o.c, w, { al: clamp((o.p ?? 1) * 2) }); }
+}
+// a moon / sun disc: its rim draws on from the top, then it fills from the middle. o: p (rim), fill (0..1), c ('pale'), ring (true: a
+//   hairline 12 px outside), bands (0: dark hairline stripes across the lower part), ground (the stripes' colour)
+function decDisc(x, y, r, o = {}) {
+  const p = clamp(o.p ?? 1), fill = EZ.io(clamp(o.fill ?? 1)), c = o.c ?? 'pale';
+  if (fill > 0) {
+    ctx.beginPath(); ctx.arc(x, y, r * fill, 0, TAU); decFillNow(c);
+    if (o.bands && fill >= 1) { ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip(); ctx.fillStyle = o.ground ?? DEC.night; for (let i = 0; i < o.bands; i++) ctx.fillRect(x - r, y + r * (0.42 + 0.19 * i), 2 * r, 3 + 2.5 * i); ctx.restore(); }
+  }
+  const P = decCirclePts(x, y, r); decLine(P, { closed: true, from: 'mid', p, c: 'gold', w: DEC_W.mid });
+  if (o.ring !== false) decLine(decCirclePts(x, y, r + 12), { closed: true, from: 'mid', p: clamp(p * 1.2 - 0.2), c: 'gold' });
+}
+// a crescent moon. o: to (the open side's angle, -0.5), bite, inner, c ('pale'), edge
+function decCrescent(x, y, r, o = {}) { decShape(decCrescentPts(x, y, r, o), { fill: o.c ?? 'pale', edge: o.edge ?? 'gold', w: DEC_W.hair, p: o.p }); }
+// a round lantern / medallion: a glowing ribbed globe between two gold bands, a stepped cap and finial, a chain and a tassel.
+//   o: lit (0..1), hang (the y its chain hangs from), ribs (3), tassel (true), glow (true), ring (true), key
+function decLantern(x, y, r, o = {}) {
+  const lit = clamp(o.lit ?? 1), ribs = o.ribs ?? 3, z = decZoom();
+  if (o.glow !== false && lit > 0) { const g = ctx.createRadialGradient(x, y, r * 0.8, x, y, r * 3); g.addColorStop(0, decA('#ffd98a', 0.34 * lit)); g.addColorStop(1, decA('#ffd98a', 0)); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r * 3, 0, TAU); ctx.fill(); }
+  if (o.hang != null) {
+    decLine([[x, o.hang], [x, y - r * 1.3]]);
+    for (let yy = y - r * 1.3 - 26; yy > o.hang + 16; yy -= 54) decShape(decNgon(x, yy, 5, 4, 0, 8), { fill: 'gold', edge: false });
+  }
+  for (const s of [-1, 1]) {   // the cap above, the finial below
+    decShape([[x - r * 0.36, y + s * r * 0.92], [x + r * 0.36, y + s * r * 0.92], [x + r * 0.24, y + s * r * 1.13], [x - r * 0.24, y + s * r * 1.13]], { fill: 'gold', edge: false });
+    decShape([[x - r * 0.13, y + s * r * 1.13], [x + r * 0.13, y + s * r * 1.13], [x + r * 0.08, y + s * r * 1.3], [x - r * 0.08, y + s * r * 1.3]], { fill: 'gold', edge: false });
+  }
+  if (o.tassel !== false) {
+    const y1 = y + r * 1.3, L = Math.max(28, r * 0.42);
+    ctx.beginPath(); for (const [dx, k] of [[-r * 0.06, 0.74], [0, 1], [r * 0.06, 0.74]]) { ctx.moveTo(x + dx, y1); ctx.lineTo(x + dx, y1 + L * k); } decStrokeNow('gold', DEC_W.hair * 0.9);
+    decGem(x, y1 + L + 12, Math.max(8, r * 0.1), { key: (o.key ?? 'lan') + 't', c: 'cream' });
+  }
+  const g2 = ctx.createRadialGradient(x, y, r * 0.05, x, y, r);
+  g2.addColorStop(0, decMix('#a8802f', '#fffbe8', lit)); g2.addColorStop(0.5, decMix('#84601f', '#f6cf6c', lit)); g2.addColorStop(1, decMix('#58400f', '#c9952f', lit));
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = g2; ctx.fill();
+  ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip();
+  ctx.strokeStyle = decA(DEC.ink, 0.62); ctx.lineWidth = DEC_W.hair / z; ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+  for (let k = 1; k <= ribs; k++) { const rx = r * Math.sin(k / (ribs + 1) * Math.PI / 2); ctx.moveTo(x + rx, y); ctx.ellipse(x, y, rx, r, 0, 0, TAU); }
+  ctx.stroke();
+  for (const s of [-1, 1]) { ctx.beginPath(); ctx.rect(x - r, y + s * r * 0.66 - r * 0.055, 2 * r, r * 0.11); decFillNow('gold'); ctx.strokeStyle = decA(DEC.ink, 0.7); ctx.stroke(); }
+  ctx.restore();
+  decGem(x, y, r * 0.22, { c: 'cream', tw: 0.6 + 0.4 * lit, flare: false });
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); decStrokeNow('gold', r > 70 ? DEC_W.heavy : DEC_W.mid);
+  if (o.ring !== false) { ctx.beginPath(); ctx.arc(x, y, r + 12, 0, TAU); decStrokeNow('gold', DEC_W.hair); }
+}
+// water under a horizon: rows of short dashes mirrored about x, re-dealt four times a second. o: w (half width), rows (3), gap (13), c, al, key
+function decShimmer(x, y, o = {}) {
+  const hw = o.w ?? 300, rows = o.rows ?? 3, gap = o.gap ?? 13, step = Math.floor(TT * 4 + 1e-6);
+  ctx.beginPath();
+  for (let j = 0; j < rows; j++) {
+    const R = RNG('shim', o.key ?? 's', j, step), yy = y + j * gap, n = 3 + j;
+    for (let i = 0; i < n; i++) { const d = R.r(0.04, 0.95) * hw, l = R.r(16, 60) * (1 - d / hw * 0.5); for (const s of [-1, 1]) { ctx.moveTo(x + s * d, yy); ctx.lineTo(x + s * Math.min(hw, d + l), yy); } }
+  }
+  decStrokeNow(o.c, DEC_W.hair * 0.8, { al: o.al ?? 0.55 });
+}
+// the ornate frame: a heavy line and two hairlines with stepped corners, closing in from the four corners, and quarter fans
+// inside the corners. o: x0, y0, x1, y1 (44, 150, W - 44, H - 150), notch (34), p, fans ('all' | 'top' | 'bottom' | false), fan (118: radius)
+function decFrame(o = {}) {
+  const x0 = o.x0 ?? 44, y0 = o.y0 ?? 150, x1 = o.x1 ?? W - 44, y1 = o.y1 ?? H - 150, nt = o.notch ?? 34, p = EZ.io(clamp(o.p ?? 1)); if (p <= 0) return;
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, fans = o.fans ?? 'all', fr = o.fan ?? 118;
+  const quad = (d) => [[cx, y0 + d], [x0 + 2 * nt + d, y0 + d], [x0 + 2 * nt + d, y0 + nt + d], [x0 + nt + d, y0 + nt + d], [x0 + nt + d, y0 + 2 * nt + d], [x0 + d, y0 + 2 * nt + d], [x0 + d, cy]];
+  for (const [sx, sy] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(sx, sy); ctx.translate(-cx, -cy);
+    [[0, DEC_W.heavy], [13, DEC_W.hair], [22, DEC_W.hair]].forEach(([d, w], k) => {
+      const P = quad(d), fc = (pathLen(P.slice(0, 4)) + 0) / pathLen(P), pk = clamp(p * (1 + 0.1 * k) - 0.1 * k);
+      decLine(pk >= 1 ? P : decSub(P, fc * (1 - pk), fc + (1 - fc) * pk), { w });
+    });
+    if (fans === 'all' || (fans === 'top' && sy === 1) || (fans === 'bottom' && sy === -1)) decFan(x0 + nt + 22, y0 + nt + 22, fr, { mid: Math.PI / 4, span: Math.PI / 4, n: 7, r0: 30, open: p, ext: p, wedge: false, rim: false, alt: 0.7, tips: true });
+    ctx.restore();
+  }
+}
+
+// ---------------------------------------------------------------------
+//  the hero: a gold crane / peacock in profile, built from a teardrop, an S-curve neck and a tail that opens like a fan.
+//  Faceless. (x, y) = the body's centre, r = half its standing height (it stands on y + r). Faces right; flip to face left.
+//   o: key, mood ('calm' | 'wow' | 'bow'), neck (-1 bowed .. 0 .. 1 stretched up), fan (0 a closed train .. 1 a full display),
+//      feathers (9), step (0..1: one foot lifted), tw (0..1: a ripple of light across the tail eyes), c ('amber'), flip
+// ---------------------------------------------------------------------
+function decBird(x, y, r, o = {}) {
+  const key = o.key ?? 'bird', dir = o.flip ? -1 : 1, mood = o.mood ?? 'calm', c = o.c ?? 'amber', idle = Math.sin(TT * 2.4 + 0.6);
+  const neck = clamp((o.neck ?? (mood === 'wow' ? 1 : mood === 'bow' ? -1 : 0)) + 0.05 * idle, -1, 1), fan = EZ.io(clamp(o.fan ?? (mood === 'wow' ? 1 : 0)));
+  const L = (u, v) => [x + dir * u * r, y + v * r], hw = Math.max(DEC_W.hair, r * 0.03);
+  SPARK_AT = toScreen(x, y);
+  // the tail: a closed train trailing behind, or the fan standing up behind the body
+  const nF = o.feathers ?? 9, tu = lerp(-0.46, -0.1, fan), tv = lerp(0.1, 0.05, fan), len = lerp(0.82, 1.4, fan), ang = (i) => lerp(163 + (i - (nF - 1) / 2) * 3.4, 192 + i * 156 / (nF - 1), fan) * DEG;
+  const at = (a, d) => L(tu + Math.cos(a) * d, tv + Math.sin(a) * d);
+  ctx.beginPath(); for (let i = 0; i < nF; i++) { const a = ang(i), p0 = at(a, 0.16), p1 = at(a, len); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p1[0], p1[1]); } decStrokeNow(c, hw);
+  if (fan > 0.25) for (const d of [0.56, 0.8]) { const P = []; for (let i = 0; i <= 30; i++) P.push(at(lerp(ang(0), ang(nF - 1), i / 30), len * d)); decLine(P, { c, w: DEC_W.hair * 0.9, al: clamp((fan - 0.25) * 3) }); }
+  for (let i = 0; i < nF; i++) {
+    const [ex, ey] = at(ang(i), len), e = r * 0.07 * lerp(0.42, 1, fan), rip = o.tw != null ? clamp(1 - Math.abs(o.tw * (nF + 3) - 2 - i) / 1.6) : 0;
+    ctx.beginPath(); ctx.arc(ex, ey, e * (1 + 0.5 * rip), 0, TAU); decFillNow(c);
+    ctx.beginPath(); ctx.arc(ex, ey, e * 0.52, 0, TAU); ctx.fillStyle = rip > 0.3 ? DEC.cream : DEC.teal; ctx.fill();
+  }
+  // legs
+  const lift = clamp(o.step ?? 0);
+  for (let k = 0; k < 2; k++) { const up = k === 1 ? lift * 0.22 : 0, f = L(-0.03 + 0.17 * k, 1 - up); decLine([L(-0.04 + 0.16 * k, 0.2), L(-0.11 + 0.16 * k, 0.6 - up * 0.6), f, [f[0] + dir * r * 0.17, f[1]]], { c, w: hw, join: 'round' }); }
+  // the body: a teardrop, its point toward the tail
+  const body = []; for (let i = 0; i < 40; i++) { const th = i / 40 * TAU, ct = Math.cos(th), bx = ct * 0.44 - 0.22 * Math.max(0, -ct) ** 3, by = Math.sin(th) * 0.3 * (0.5 + 0.5 * (ct + 1) / 2), cr = Math.cos(-0.3), sr = Math.sin(-0.3); body.push(L(bx * cr - by * sr, bx * sr + by * cr)); }
+  // the neck: an S-curve whose head goes up (neck 1) or forward and down (neck -1)
+  const N0 = [[0.24, -0.12], [0.62, -0.3], [0.2, -0.62], [0.5, -0.92]], N1 = neck >= 0 ? [[0.24, -0.12], [0.6, -0.42], [0.28, -0.8], [0.4, -1.12]] : [[0.24, -0.12], [0.58, -0.56], [0.84, -0.74], [0.88, -0.28]];
+  const q = Math.abs(neck), Nk = N0.map((p, i) => [lerp(p[0], N1[i][0], q), lerp(p[1], N1[i][1], q)]), sideA = [], sideB = [];
+  const bez = (t) => { const m = 1 - t; return [0, 1].map((j) => m * m * m * Nk[0][j] + 3 * m * m * t * Nk[1][j] + 3 * m * t * t * Nk[2][j] + t * t * t * Nk[3][j]); };
+  for (let i = 0; i <= 22; i++) { const t = i / 22, a = bez(Math.max(0, t - 0.02)), b = bez(Math.min(1, t + 0.02)), p = bez(t), l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, w = lerp(0.105, 0.042, t), nx = -(b[1] - a[1]) / l * w, ny = (b[0] - a[0]) / l * w; sideA.push(L(p[0] + nx, p[1] + ny)); sideB.unshift(L(p[0] - nx, p[1] - ny)); }
+  decPoly([...sideA, ...sideB], true); decFillNow(c);
+  decPoly(body, true); decFillNow(c); decPoly(body, true); decStrokeNow(DEC.ink, 1.6, { al: 0.55 });
+  // the wing: three nested arcs cut into the gold
+  for (const [rr, a0, a1] of [[0.15, 0.3, 2.5], [0.23, 0.35, 2.4], [0.31, 0.45, 2.25]]) decLine(arcPts(0, 0, rr, a0, a1, 14).map(([u, v]) => L(u - 0.02, v * 0.72 - 0.08)), { c: DEC.ink, w: DEC_W.hair * 0.9, al: 0.75 });
+  // the head, the beak and a crest of three
+  const hd = Nk[3], bd = neck >= 0 ? [lerp(0.95, 0.82, q), lerp(0.3, -0.57, q)] : [lerp(0.95, 0.5, q), lerp(0.3, 0.87, q)], bl = Math.hypot(bd[0], bd[1]), ux = bd[0] / bl, uy = bd[1] / bl, H0 = L(hd[0], hd[1]);
+  decPoly([L(hd[0] - uy * 0.055, hd[1] + ux * 0.055), L(hd[0] + ux * 0.4, hd[1] + uy * 0.4), L(hd[0] + uy * 0.055, hd[1] - ux * 0.055)], true); ctx.fillStyle = DEC.cream; ctx.fill();
+  ctx.beginPath(); ctx.arc(H0[0], H0[1], r * 0.088, 0, TAU); decFillNow(c);
+  for (let i = 0; i < 3; i++) {
+    const a = Math.atan2(-uy, -ux) + (0.55 + i * 0.42) * 1 + 0.06 * idle, tip = L(hd[0] + Math.cos(a) * 0.26, hd[1] + Math.sin(a) * 0.26);
+    decLine([L(hd[0] + Math.cos(a) * 0.07, hd[1] + Math.sin(a) * 0.07), tip], { c, w: DEC_W.hair * 0.9 }); ctx.beginPath(); ctx.arc(tip[0], tip[1], r * 0.03, 0, TAU); ctx.fillStyle = DEC.cream; ctx.fill();
+  }
+}
+const decBirdPts = (x, y, r, n = 96) => ellipsePts(x, y, r * 0.8, r, 0, n);
+
+// ---------------------------------------------------------------------
+//  type: tall serif caps (DEC_SERIF) or small engraved caps (DEC_SANS), always tracked wide, set letter by letter so a
+//  line can appear from its middle outward. Gold letters carry the metal pattern and the glint.
+//   o: font ('serif' | 'sans'), weight (700), track (0.14 em), align ('center' | 'left' | 'right'), reveal (0..1), caps (true)
+// ---------------------------------------------------------------------
+const decFont = (size, o = {}) => `${o.weight ?? 700} ${size}px ${o.font === 'sans' ? DEC_SANS : DEC_SERIF}`;
+const decCase = (s, o) => (o.caps === false ? s : s.toUpperCase());
+function decRunW(segs, size, o = {}) {
+  ctx.save(); ctx.font = decFont(size, o); let w = 0, n = 0;
+  for (const sg of segs) for (const ch of decCase(sg.s, o)) { w += ctx.measureText(ch).width; n++; }
+  ctx.restore(); return w + size * (o.track ?? 0.14) * Math.max(0, n - 1);
+}
+function decRun(segs, x, y, size, o = {}) {   // segs = [{ s, c }, …]: one line in several colours
+  ctx.save(); ctx.font = decFont(size, o); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  const tr = size * (o.track ?? 0.14), chars = [];
+  for (const sg of segs) for (const ch of decCase(sg.s, o)) chars.push({ ch, c: sg.c, w: ctx.measureText(ch).width });
+  const n = chars.length, total = chars.reduce((a, q) => a + q.w, 0) + tr * Math.max(0, n - 1), rev = clamp(o.reveal ?? 1), half = (n - 1) / 2 || 1, g = decGlint(), al0 = ctx.globalAlpha;
+  let xx = x - (o.align === 'left' ? 0 : o.align === 'right' ? total : total / 2);
+  chars.forEach((q, i) => {
+    const k = clamp((rev * 1.6 - Math.abs(i - (n - 1) / 2) / half) / 0.6);
+    if (k > 0 && q.ch !== ' ') {
+      const yy = y + (1 - EZ.o2(k)) * size * 0.18;
+      ctx.globalAlpha = al0 * k; ctx.fillStyle = decInk(q.c); ctx.fillText(q.ch, xx, yy);
+      if (g && decIsMetal(q.c)) { ctx.fillStyle = g; ctx.fillText(q.ch, xx, yy); }
+    }
+    xx += q.w + tr;
+  });
+  ctx.restore(); return total;
+}
+const decTextW = (str, size, o = {}) => decRunW([{ s: str }], size, o);
+const decText = (str, x, y, size, c, o = {}) => decRun([{ s: str, c }], x, y, size, o);
+
+// ---------------------------------------------------------------------
+//  captions and tags (through DEFER: after the camera, at screen size). The caption is an opaque dark plaque with a
+//  double gold rule that opens from its middle; one *word* is set in cream or teal. The tag is small spaced caps
+//  between two hairlines. Both close as a bridge starts and open again when the next era is in.
+// ---------------------------------------------------------------------
+function decBridgeK() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) {
+    const d = r.d ?? 0.6;
+    if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.io(seg(TT, r.tc - d, r.tc - d + 0.25));
+    if (TT >= r.tc && TT < r.tc + d + 0.25) return EZ.io(seg(TT, r.tc + d - 0.1, r.tc + d + 0.25));
+  }
+  return 1;
+}
+//   o: y (the plaque's centre, 1392), x (the centre line), size (54; shrinks to fit maxW), maxW (660), at (seconds into the era, 0.5),
+//      c ('gold'), hi ('cream' | 'teal'), plaque (its fill), + decRun's font options
+function decCaptionNow(str, o = {}) {
+  const bk = decBridgeK(), at = E0 + (o.at ?? 0.5), k = EZ.io(ev(at, 0.4)) * bk; if (k <= 0.02) return;
+  const cx = o.x ?? decAX(), cy = o.y ?? 1392, maxW = o.maxW ?? 660, segs = str.split('*').map((s, i) => ({ s, c: i % 2 ? o.hi ?? 'cream' : o.c ?? 'gold' })).filter((q) => q.s);
+  let size = o.size ?? 54; while (size > 40 && decRunW(segs, size, o) > maxW) size -= 2;
+  const tw = decRunW(segs, size, o), w = (tw + size * 2.7) * k, h = size * 2.3, ch = Math.min(h * 0.2, w / 2 - 1); if (w < 24) return;
+  decShape(decChamfer(cx - w / 2, cy - h / 2, w, h, ch), { fill: o.plaque ?? DEC.plaque, edge: 'gold', w: DEC_W.heavy - 1 });
+  if (w > 60) decLine(decChamfer(cx - w / 2 + 11, cy - h / 2 + 11, w - 22, h - 22, Math.max(0, ch - 5)), { closed: true });
+  if (k > 0.95) for (const s of [-1, 1]) decGem(cx + s * (w / 2 - size * 0.62), cy, size * 0.15, { key: 'cap' + s, c: 'gold', tw: 0.5 + 0.5 * Math.sin(TT * 3), flare: false });
+  ctx.save(); ctx.beginPath(); ctx.rect(cx - w / 2 + 14, cy - h / 2, Math.max(0, w - 28), h); ctx.clip();   // the words never show outside the plaque
+  decRun(segs, cx, cy + size * 0.35, size, { ...o, align: 'center', reveal: ev(at + 0.3, 0.5) * bk });
+  ctx.restore();
+}
+//   o: x (the centre line), y (300), size (40), at (0.2), c ('cream'), half (the hairlines' half length; default from the word)
+function decTagNow(str, o = {}) {
+  const bk = decBridgeK(), at = E0 + (o.at ?? 0.2), k = EZ.io(ev(at, 0.5)) * bk; if (k <= 0.02) return;
+  const size = o.size ?? 40, cx = o.x ?? decAX(), cy = o.y ?? 300, fo = { font: 'sans', track: 0.36, ...o }, half = (o.half ?? decRunW([{ s: str }], size, fo) / 2 + 66) * k, dy = size * 0.86;
+  for (const s of [-1, 1]) { decLine([[cx - half, cy + s * dy], [cx + half, cy + s * dy]]); }
+  if (k > 0.6) for (const s of [-1, 1]) decShape(decNgon(cx + s * (half + 14), cy, 6, 4, 0, 9), { fill: 'gold', edge: false });
+  ctx.save(); ctx.beginPath(); ctx.rect(cx - half, cy - dy, 2 * half, 2 * dy); ctx.clip();
+  decRun([{ s: str, c: o.c ?? 'cream' }], cx, cy + size * 0.34, size, { ...fo, align: 'center', reveal: ev(at + 0.2, 0.45) * bk });
+  ctx.restore();
+}
+const decCaption = (str, o = {}) => { const f = () => decCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+const decTag = (str, o = {}) => { const f = () => decTagNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// =====================================================================
+//  STYLE — the renderer's hooks (see styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'art-deco',
+  paper: DEC.paper,
+  // bare lacquer in colour c (hex, or rgb() mid-morph) with the sheen
+  backdrop(c) { ctx.save(); screen(); ctx.fillStyle = c; ctx.fillRect(0, 0, W, H); ctx.drawImage(decSheen(), 0, 0); ctx.restore(); },
+  // the era seen through a gold-rimmed opening: a heavy line that thins onto the object, a hairline outside it, and a ring of short rays
+  window(P, key, src, o = {}) {
+    ctx.save(); decPoly(P, true); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    const u = o.u ?? 0, k = o.phase === 'grow' ? Math.min(1, u * 4) : Math.min(1, (1 - u) * 4), ce = decCentroid(P), R = P.reduce((a, p) => a + Math.hypot(p[0] - ce[0], p[1] - ce[1]) / P.length, 0);
+    if (R < 2 || R > 2600) return;
+    decPoly(P, true); decStrokeNow('gold', 2 + 5 * k);
+    decPoly(P.map(([x, y]) => [ce[0] + (x - ce[0]) * (R + 12) / R, ce[1] + (y - ce[1]) * (R + 12) / R]), true); decStrokeNow('gold', DEC_W.hair);
+    ctx.beginPath(); for (let i = 0; i < 32; i++) { const a = i / 32 * TAU - Math.PI / 2, r0 = R + 26, r1 = r0 + (i % 2 ? 18 : 34) * k; ctx.moveTo(ce[0] + Math.cos(a) * r0, ce[1] + Math.sin(a) * r0); ctx.lineTo(ce[0] + Math.cos(a) * r1, ce[1] + Math.sin(a) * r1); }
+    if (k > 0.02) decStrokeNow('gold', DEC_W.hair, { al: k });
+  },
+  // the morphing shape: a flat medallion in colour c with a metal sheen, the same double rim, and a sunburst that flares at the midpoint
+  blob(P, c, key, u = 0) {
+    const ce = decCentroid(P), bb = bbox(P), R = P.reduce((a, p) => a + Math.hypot(p[0] - ce[0], p[1] - ce[1]) / P.length, 0), q = Math.sin(Math.PI * clamp(u));
+    if (R < 2) return;
+    ctx.beginPath(); for (let i = 0; i < 32; i++) { const a = i / 32 * TAU - Math.PI / 2 + u * TAU / 32, r0 = R + 26, r1 = r0 + (i % 2 ? 60 : 130) * q; ctx.moveTo(ce[0] + Math.cos(a) * r0, ce[1] + Math.sin(a) * r0); ctx.lineTo(ce[0] + Math.cos(a) * r1, ce[1] + Math.sin(a) * r1); }
+    if (q > 0.02) decStrokeNow('gold', DEC_W.hair, { al: Math.min(1, q * 3) });
+    decPoly(P, true); ctx.fillStyle = c; ctx.fill();
+    const g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1); g.addColorStop(0, 'rgba(255,250,225,0.38)'); g.addColorStop(0.42, 'rgba(255,250,225,0)'); g.addColorStop(0.6, 'rgba(70,40,5,0)'); g.addColorStop(1, 'rgba(70,40,5,0.34)');
+    ctx.fillStyle = g; ctx.fill(); const gl = decGlint(); if (gl) { ctx.fillStyle = gl; ctx.fill(); }
+    decPoly(P, true); decStrokeNow('gold', 2 + 4 * q);
+    decPoly(P.map(([x, y]) => [ce[0] + (x - ce[0]) * (R + 12) / R, ce[1] + (y - ce[1]) * (R + 12) / R]), true); decStrokeNow('gold', DEC_W.hair);
+  },
+  hero(x, y, r, o = {}) { decBird(x, y, r, { key: o.key, mood: o.mood }); },
+  heroColor: DEC.amber,
+  heroPts(x, y, r) { return decBirdPts(x, y, r); },
+  // the print: fine static grain and a vignette over everything
+  post() { ctx.save(); screen(); ctx.drawImage(decLens(), 0, 0); ctx.restore(); },
+  ones: true,
+};
+// =====================================================================
+//  SCENES — art deco demo. World coordinates 1080x1920; time TT on 1s. Everything is mirrored about x = 540; what
+//  matters sits inside x 140-940, y 250-1500. Both eras share the frame, the horizon rules (y = 1240) and the dado.
+//  Era 1: black-navy. Era 2: emerald.
+// =====================================================================
+const cu = TIMELINE.cues;
+const HZN = 1240;
+// the bridge objects: nothing else may overlap them at the bridge, or it shows in the morph window
+const MOON = { x: 540, y: 800, r: 118 };
+const LAMP = { x: 540, y: 700, r: 118 };
+const BIRD_R = 120;
+const moonY = () => MOON.y + 36 * (1 - EZ.io(seg(TT, cu.ring, cu.fan)));
+const moonPts = () => decCirclePts(MOON.x, moonY(), MOON.r);
+const lampPts = () => decCirclePts(LAMP.x, LAMP.y, LAMP.r);
+
+// the shared furniture: the frame, the horizon (one heavy rule and three hairlines, drawn from the middle out), the dado
+function furniture(p, water) {
+  decRules([[82, 1508], [998, 1508]], { from: 'mid', p, n: 1, side: -1 });
+  decChevrons(540, 1556, 880, { s: 22, h: 18, n: 2, p, al: 0.85 });
+  decScallops(96, 1586, 888, 118, { s: 37, al: 0.42, p });
+  decFrame({ p: 0.3 + 0.7 * p, fans: 'top', fan: 104 });
+  decRules([[74, HZN], [1006, HZN]], { from: 'mid', p, n: 3, gap: 10, side: -1 });
+  if (p >= 1) decShimmer(540, HZN + 52, { w: 400, rows: 3, key: water });
+}
+
+// ---- era 1: the full moon shines
+const STARS = [[150, 430, 13], [262, 392, 9], [112, 610, 10], [214, 540, 15], [330, 420, 8], [96, 780, 9], [300, 640, 9]];
+function sceneMalam() {
+  decGround(DEC.night);
+  furniture(EZ.io(ev(-0.2, 0.95)), 'w1');
+  STARS.forEach(([sx, sy, s], i) => { const k = EZ.io(ev(cu.moon + i * 0.125, 0.3)); if (k > 0) decMirror(() => decGem(sx, sy, s * k, { key: 'st' + i, c: i % 3 === 1 ? 'cream' : 'gold', rate: 3 + (i % 3) })); });
+  // the moon: its rim draws on from the top, it fills from the middle, and the sunburst opens behind it like a hand fan
+  const my = moonY();
+  decFan(MOON.x, my, 400, { r0: 154, n: 21, span: 80 * DEG, open: EZ.io(ev(cu.fan, 0.6)), ext: ev(cu.fan + 0.1, 0.8), rim: true });
+  decDisc(MOON.x, my, MOON.r, { p: EZ.io(ev(cu.ring, 0.5)), fill: ev(cu.moon, 0.45), bands: 3 });
+  // the skyline: stepped towers rising tier by tier (a tier every 8th), then their windows come on
+  const lit = ev(cu.lit, 0.9);
+  decMirror(() => {
+    decZig(198, HZN, 170, 430, { tiers: 4, rise: seg(TT, cu.rise, cu.rise + 1.0), lit, spire: 56, key: 'tw1' });
+    decZig(322, HZN, 86, 232, { tiers: 3, rise: seg(TT, cu.rise + 0.25, cu.rise + 1.0), lit, spire: 30, key: 'tw2' });
+  });
+  // the crane sleeps with its head down, wakes when the fan opens and looks up at the moon
+  const neck = lerp(-1, 1, EZ.io(ev(cu.look, 0.5))) - 0.35 * EZ.io(ev(cu.look + 0.6, 0.4));
+  decBird(540, HZN - BIRD_R, BIRD_R, { key: 'bangau', neck, fan: 0.1 * Math.sin(Math.PI * ev(cu.look + 0.25, 0.5)), step: Math.sin(Math.PI * ev(cu.look + 0.5, 0.4)) });
+  decTag('Malam', { at: 0.2 });
+  decCaption('Purnama *bersinar*', { at: 0.5, hi: 'cream' });
+}
+
+// ---- era 2: the lantern lights up
+const GEMS = [[150, 440, 12], [330, 404, 8], [104, 700, 9], [150, 900, 8], [316, 520, 7]];
+function sceneCahaya() {
+  decGround(DEC.emerald);
+  furniture(1, 'w2');
+  GEMS.forEach(([sx, sy, s], i) => decMirror(() => decGem(sx, sy, s, { key: 'gm' + i, c: i % 2 ? 'cream' : 'gold', rate: 3 + (i % 3) })));
+  // the lantern's light: fine rays going out one after another, then breathing
+  const breath = 1 + 0.035 * Math.sin((TT - 3) * TAU);
+  decFan(LAMP.x, LAMP.y, 300 * breath, { r0: 156, n: 27, span: 130 * DEG, wedge: false, w: DEC_W.hair, ext: ev(cu.rays, 0.75), alt: 0.72, tips: true });
+  decArch(540, HZN, 420, 812, { kind: 'pointed', n: 1, p: EZ.io(ev(3.1, 0.65)) });
+  decLantern(LAMP.x, LAMP.y, LAMP.r, { hang: 432, lit: lerp(0.72, 1, ev(3.2, 0.5)) - 0.06 * (0.5 + 0.5 * Math.sin((TT - 3) * TAU * 2)), key: 'lampu' });
+  // two small lanterns on long chains light on the beat; under them the fountains start and their water loops
+  decMirror(() => {
+    decLantern(232, 640, 44, { hang: 174, ribs: 1, lit: 0.12 + 0.88 * EZ.io(ev(cu.side, 0.35)), key: 'kecil' });
+    decLeaves(174, HZN, 72, { n: 3, mid: -118 * DEG, span: 26 * DEG, p: ev(3.4, 0.6) });
+    decLeaves(290, HZN, 54, { n: 3, mid: -70 * DEG, span: 20 * DEG, p: ev(3.5, 0.6) });
+    decFountain(232, HZN, 0.72, { rise: ev(cu.jet, 0.5) });
+  });
+  // the crane looks up at the lantern, then opens its tail like a fan; light ripples across the tail, and it bows
+  const fan = ev(cu.tail, 0.6), bow = Math.sin(Math.PI * ev(cu.bow, 0.5));
+  decBird(540, HZN - BIRD_R, BIRD_R, { key: 'bangau', neck: lerp(0.75, 0.15, EZ.io(fan)) - 0.7 * bow, fan, tw: TT >= cu.ripple ? mod((TT - cu.ripple) / 0.5, 1) : null });
+  decTag('Cahaya', { at: 0.55 });
+  decCaption('Lentera pun *menyala*', { at: 0.7, hi: 'teal' });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — art deco demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [DEC.night, DEC.emerald];
+function pieceCam(era, t) {   // a very slow push, nothing else
+  if (era === 0) return push(t, 0.5, 2.9, { z: 1.035, p: [540, 880], to: [540, 880] });
+  return push(t, 3.3, 6.0, { z: 1.04, p: [540, 880], to: [540, 880] });
+}
+const BRIDGES = [
+  // the full moon (a round disc) -> the round lantern: the same proportions; champagne -> lit gold
+  { tc: 3.0, A: () => ({ P: moonPts(), c: DEC.moon }), B: () => ({ P: lampPts(), c: '#f0cc74' }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — art deco demo (inside buildScore(); see kit/score-head.js). A slow, elegant waltz-less 4/4: a soft pad,
+  // harp-like plucks rising in arpeggios, a small bass; a glassy tick for every tier, a shimmer as the fan opens,
+  // chimes for the lanterns, soft water for the fountains.
+  const T = TIMELINE, q = T.cues;
+  const tick = (t, f, vel, pan = 0) => { blip(t, f, f * 0.98, 0.05, vel, pan); noiseHit(t, 0.02, 'highpass', 7000, 0.7, vel * 0.4, pan); };   // a tier lands
+  const twinkle = (t, f, vel, pan = 0) => blip(t, f, f * 1.02, 0.12, vel, pan);
+  to = 'm';
+  pad(0.0, 3.1, ['A2', 'E3', 'C4', 'B4'], 0.05, { type: 'triangle', cut: 1100, att: 0.4, rel: 0.3, send: 0.5 });
+  pad(3.0, 6.05, ['F2', 'C3', 'A3', 'E4', 'G4'], 0.075, { type: 'triangle', cut: 1800, att: 0.15, rel: 0.4, send: 0.5 });
+  const hA = ['A3', 'E4', 'A4', 'B4', 'C5', 'B4', 'A4', 'E4'], hB = ['F3', 'C4', 'F4', 'A4', 'C5', 'E5', 'G5', 'E5'];
+  for (let i = 0; i < 24; i++) { const t = i * E8; pluck(t, nz((t < 3 ? hA : hB)[i % 8]), t < 3 ? 0.05 : 0.065, i % 2 ? 0.3 : -0.3, 0.5, t < 3 ? 2400 : 3400, 0.4); }
+  for (let i = 0; i < 12; i++) { const t = i * BEAT; bass(t, nz(t < 3 ? (i % 4 < 2 ? 'A2' : 'E2') : (i % 4 < 2 ? 'F2' : 'C3')), t < 3 ? 0.07 : 0.09); }
+  ['F4', 'A4', 'C5', 'E5'].forEach((n, i) => pluck(3.0 + i * 0.03, nz(n), 0.1, -0.3 + i * 0.2, 0.7, 3600, 0.45));        // the payoff: the lantern
+  sub(3.0, 0.08);
+  chime(3.0, [nz('F5'), nz('A5'), nz('C6')], 0.06, 0);
+  to = 's';
+  for (let i = 0; i < 4; i++) tick(q.rise + i * 0.25, 880 * 2 ** (i * 2 / 12), 0.035, i % 2 ? 0.35 : -0.35);                // towers: a tier every 8th
+  sweep(q.ring, q.ring + 0.5, 0.01, 1800, 4200, 0);                                                                       // the moon's rim draws on
+  chime(q.moon, [nz('E5'), nz('B5')], 0.035, 0);                                                                          // the moon fills
+  [0, 1, 2, 3, 4, 5].forEach((i) => twinkle(q.fan + i * 0.07, nz(['A5', 'C6', 'E6', 'A6', 'C7', 'E7'][i]), 0.02, -0.5 + i * 0.2));   // the fan opens
+  sweep(q.fan, q.fan + 0.6, 0.012, 2400, 7000, 0);
+  blip(q.look, 520, 780, 0.16, 0.03, 0);                                                                                  // the crane wakes
+  [0, 0.25, 0.5].forEach((d, i) => twinkle(q.lit + d, 2100 + i * 300, 0.014, i % 2 ? 0.4 : -0.4));                         // windows come on
+  sweep(2.4, 3.0, 0.014, 500, 3000, 0);                                                                                   // into the morph
+  [0, 1, 2, 3, 4, 5, 6].forEach((i) => twinkle(q.rays + i * 0.09, 1400 + i * 180, 0.014, i % 2 ? 0.3 : -0.3));             // rays go out one after another
+  chime(q.side, [nz('C6'), nz('G6')], 0.04, 0);                                                                           // the side lanterns light
+  sweep(q.jet, q.jet + 0.5, 0.012, 900, 5200, 0);                                                                         // the fountains come up
+  for (let i = 0; i < 14; i++) noiseHit(q.jet + 0.5 + i * 0.105, 0.05, 'bandpass', 4200 + (i % 3) * 900, 1.2, 0.012, i % 2 ? 0.55 : -0.55, 0.2);   // water
+  sweep(q.tail, q.tail + 0.6, 0.014, 1600, 6000, 0);                                                                      // the tail opens
+  [0, 1, 2, 3, 4].forEach((i) => twinkle(q.tail + i * 0.11, nz(['C5', 'E5', 'G5', 'C6', 'E6'][i]), 0.026, -0.3 + i * 0.15));
+  [0, 1, 2, 3, 4, 5].forEach((i) => twinkle(q.ripple + i * 0.05, 2600 + i * 220, 0.014, -0.4 + i * 0.16));                 // light ripples across the tail
+  blip(q.bow, 700, 480, 0.2, 0.028, 0);                                                                                   // the bow
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

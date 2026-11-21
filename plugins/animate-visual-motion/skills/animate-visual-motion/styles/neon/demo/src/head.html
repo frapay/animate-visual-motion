@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07061a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  NEON DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A night street over a synthwave grid: a hung sign stutters on —
+//  a pink heart, then "BUKA" letter by letter in single-stroke tube capitals — while Volt the tube robot wakes up and hops. At 3.0s the heart
+//  morphs into a spinning vinyl record on the music era: an equalizer pumps on every beat, notes float up,
+//  Volt bobs to the beat. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/neon/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneStreet()], [3, 6, () => sceneMusic()]];
+const SHOTS = [
+  ['street', 0, 0.0, 3.0, 'a hung sign stutters on: a heart, then BUKA; the robot wakes and hops'],
+  ['music',  1, 3.0, 6.0, 'the heart becomes a spinning record; the equalizer pumps; notes float'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s); letters and notes step in 16ths / 8ths
+  cues: { heart: 0.25, hero: 0.5, word: 0.75, hop: 1.5, label: 2.0, rec: 3.25, eq: 3.5, notes: 3.75, hero2: 3.25 },
+  acts: [
+    { name: '1 Kota',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Musik', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the sign is lit', sound: 'buzz-zaps, a synth pad', next: 'the heart becomes a record' },
+    { t: 5.2, title: 'the music plays', sound: 'kick, bass arp, snare', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

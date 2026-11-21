@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Low poly demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d2a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LOW POLY DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Dawn: under a faceted sky a mountain assembles facet by facet while
+//  the sun climbs out from behind the ridges; pines pop up, birds cross, the lake twinkles and a fox sits watching.
+//  At 3.0s the sun (a cut gem) re-triangulates into the moon and the same world opens at night: stars pop in,
+//  crystals shoot up, fireflies drift, the fox lifts its head. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/low-poly/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneDawn()], [3, 6, () => sceneNight()]];
+const SHOTS = [
+  ['pagi',  0, 0.0, 3.0, 'a mountain assembles facet by facet; the sun rises; pines pop up; birds cross; a fox watches'],
+  ['malam', 1, 3.0, 6.0, 'the sun becomes the moon; the same world at night: stars, crystals, fireflies; the fox looks up'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 16th grid (0.125s = 3 frames at 24fps, 120 BPM); the big ones on beats
+  cues: { peak: 0.0, tree: 0.25, sun: 0.5, birds: 1.0, cap: 1.0, stars: 3.5, crystal: 3.75, look: 4.5, twitch: 5.0 },
+  acts: [
+    { name: '1 Pagi',  role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Malam', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the sun is up over the finished mountain', sound: 'a warm pad, a pluck per facet row, a chime for the sun', next: 'the sun becomes the moon' },
+    { t: 5.2, title: 'night: moon, stars, crystals, the fox looking up', sound: 'the payoff stab + sub at 3.0, then a soft night groove', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/low-poly/kit.js — low-poly faceted 3D illustration.
+//  Every form is a mesh of flat-shaded triangles: one flat colour per facet, taken from a base colour and a fixed
+//  light (top-left), so neighbours differ in brightness. No outlines, no gradients inside a facet; each facet is
+//  stroked a hairline in its own fill so anti-aliasing never shows a crack. Meshes are seeded and static (cached by
+//  key); life comes from a light shimmer sweeping over the facets, facets flipping in one by one, parallax between
+//  depth layers, drifting faceted clouds, twinkling water and stars. Two palettes: dawn and night. A faceted fox hero.
+//  Built on kit/core.js (RNG, EZ, SPRING / springEase, bbox, resample, trace, toScreen, TT / ev / DEFER / E0 / SPARK_AT).
+//  Needs from the piece head: W, H, FPS, CX (caption centre x).
+// =====================================================================
+
+// ---- palette (6-digit hex). Each era palette carries its light (`lit`), its shadow (`shd`) and its haze.
+const LP = {
+  dawn: {
+    bg: '#f3ab8c', sky: ['#4f629c', '#a985ad', '#f09a86', '#ffc89a', '#ffe6c0'],   // sky stops, zenith -> horizon
+    lit: '#fff0d4', shd: '#27456f', haze: '#ffd0b0',     // warm light, blue-teal shadow, peach distance
+    peak: '#e9686e', snow: '#fff4e8', ridge: '#cf6f88', water: '#3d9aa0', ground: '#1c4c57', tree: '#27797a',
+    rock: '#7a6f95', cloud: '#fff0e0', ink: '#11323b', text: '#fff6e8', hi: '#ffd36b', hiText: '#11323b', star: '#fff6e8',
+  },
+  night: {
+    bg: '#1a1f4c', sky: ['#0b0d2a', '#141945', '#1f2862', '#2a4379', '#356a8a'],
+    lit: '#a4ecd4', shd: '#070919', haze: '#2a3d76',     // mint moonlight, near-black shadow, blue distance
+    peak: '#35438a', snow: '#d6eef0', ridge: '#2c3a7c', water: '#18386a', ground: '#0e1436', tree: '#135a64',
+    rock: '#2b3168', cloud: '#34407f', ink: '#090b22', text: '#f3ecd2', hi: '#8fe3c8', hiText: '#0e1436', star: '#f3ecd2',
+    crystal: '#4fd6bd',
+  },
+  sunPal: { lit: '#fffbe2', shd: '#f0843f' }, moonPal: { lit: '#ffffff', shd: '#8691c0' },   // the gems carry their own light
+  dusk: { lit: '#ffe0cc', shd: '#2a2352' },                                                 // the sheet a morph happens on
+  sun: '#ffd36b', moon: '#f3ecd2',
+  fox: '#ff8a2e', foxW: '#fff4e4', foxK: '#2b1c30',     // THE accent: amber-orange is the hero's and nothing else's
+  paper: '#6f6396',
+};
+let lpPal = LP.dawn;                                                   // the palette in use; a scene sets it first thing
+const lpUse = (p) => (lpPal = typeof p === 'string' ? LP[p] : p);
+const LP_SANS = 'Futura, "Century Gothic", "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, "Liberation Sans", "DejaVu Sans", sans-serif';
+const LP_L = (() => { const v = [-0.55, -0.65, 0.52], n = Math.hypot(v[0], v[1], v[2]); return v.map((x) => x / n); })();   // the light: top-left, toward the viewer
+const LP_SWEEP = { every: 3.0, at: 1.5, len: 1.2 };                    // the shimmer: one sweep per `every` s, starting `at`, lasting `len`
+
+// ---------------------------------------------------------------------
+//  colour (accept '#rrggbb' or 'rgb(r,g,b)')
+// ---------------------------------------------------------------------
+const LP_RGBS = {};
+function lpRGB(c) { if (c[0] === '#') return LP_RGBS[c] || (LP_RGBS[c] = [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16))); return c.match(/[\d.]+/g).slice(0, 3).map(Number); }
+const lpHex = (v) => '#' + v.map((x) => Math.round(clamp(x, 0, 255)).toString(16).padStart(2, '0')).join('');
+const lpMix = (a, b, u) => { const x = lpRGB(a), y = lpRGB(b); return lpHex(x.map((v, i) => lerp(v, y[i], u))); };
+// a facet's colour: base c pushed toward the light (s > 0) or the shadow (s < 0), s in -1..1
+function lpTone(c, s, pal = lpPal) {
+  const v = lpRGB(c), w = lpRGB(s >= 0 ? pal.lit : pal.shd), k = s >= 0 ? Math.min(1, s) * 0.5 : Math.min(1, -s) * 0.55;
+  return `rgb(${Math.round(v[0] + (w[0] - v[0]) * k)},${Math.round(v[1] + (w[1] - v[1]) * k)},${Math.round(v[2] + (w[2] - v[2]) * k)})`;
+}
+const lpHaze = (c, far, pal = lpPal) => lpMix(c, pal.haze, clamp(far) * 0.75);   // atmospheric perspective: far = 0 near .. 1 horizon
+const lpGrad = (stops, u) => { const x = clamp(u) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)); return lpMix(stops[i], stops[i + 1], x - i); };
+
+// ---------------------------------------------------------------------
+//  geometry and the light
+// ---------------------------------------------------------------------
+const lpZoom = () => ctx.getTransform().a || 1;
+const lpCentroid = (P) => P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+function lpInside(P, x, y) {
+  let c = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const a = P[i], b = P[j]; if ((a[1] > y) !== (b[1] > y) && x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0]) c = !c; }
+  return c;
+}
+// Lambert for a triangle of [x, y, z] points (z toward the viewer), mapped so a flat facet = 0, lit > 0, shaded < 0
+function lpLambert(A, B, C) {
+  const ux = B[0] - A[0], uy = B[1] - A[1], uz = B[2] - A[2], vx = C[0] - A[0], vy = C[1] - A[1], vz = C[2] - A[2];
+  let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+  if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+  const d = (nx * LP_L[0] + ny * LP_L[1] + nz * LP_L[2]) / (Math.hypot(nx, ny, nz) || 1);
+  return clamp(d >= LP_L[2] ? (d - LP_L[2]) / (1 - LP_L[2]) * 1.3 : (d - LP_L[2]) / LP_L[2] * 0.9, -1, 1);
+}
+// where the shimmer band is now, in screen units along the axis (0.8, 0.6); far away between sweeps
+function lpBand() { const u = (mod(TT, LP_SWEEP.every) - LP_SWEEP.at) / LP_SWEEP.len; return u < 0 || u > 1 ? -9999 : -300 + u * 2700; }
+function lpPath(P) { ctx.beginPath(); ctx.moveTo(P[0][0], P[0][1]); for (let i = 1; i < P.length; i++) ctx.lineTo(P[i][0], P[i][1]); ctx.closePath(); }   // straight edges only
+// one flat facet: polygon P in colour c at tone s, stroked a hairline in its own fill (no seams)
+function lpFacet(P, c, s = 0, pal = lpPal) {
+  lpPath(P); ctx.fillStyle = ctx.strokeStyle = lpTone(c, s, pal); ctx.lineWidth = 1.2 / lpZoom(); ctx.lineJoin = 'round'; ctx.fill(); ctx.stroke();
+}
+
+// Delaunay (Bowyer-Watson) over points V -> index triples
+function lpDelaunay(V) {
+  const n = V.length, bb = bbox(V), d = Math.max(bb.x1 - bb.x0, bb.y1 - bb.y0) * 20 + 10, mx = (bb.x0 + bb.x1) / 2, my = (bb.y0 + bb.y1) / 2;
+  const Q = V.map(([x, y], i) => [x + ((i * 37) % 11 - 5) * 0.003, y + ((i * 53) % 13 - 6) * 0.003]).concat([[mx - d, my - d], [mx + d, my - d], [mx, my + d]]);   // a hair of fixed jitter against collinear edges
+  const tri = (a, b, c) => {
+    const [ax, ay] = Q[a], [bx, by] = Q[b], [cx, cy] = Q[c], D = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)) || 1e-9;
+    const a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+    const x = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / D, y = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / D;
+    return { v: [a, b, c], x, y, r: (ax - x) ** 2 + (ay - y) ** 2 };
+  };
+  let T = [tri(n, n + 1, n + 2)];
+  for (let i = 0; i < n; i++) {
+    const [x, y] = Q[i], E = [], keep = [];
+    for (const t of T) { if ((x - t.x) ** 2 + (y - t.y) ** 2 < t.r) E.push([t.v[0], t.v[1]], [t.v[1], t.v[2]], [t.v[2], t.v[0]]); else keep.push(t); }
+    for (let a = 0; a < E.length; a++) {
+      let dup = false;
+      for (let b = 0; b < E.length && !dup; b++) dup = a !== b && ((E[a][0] === E[b][0] && E[a][1] === E[b][1]) || (E[a][0] === E[b][1] && E[a][1] === E[b][0]));
+      if (!dup) keep.push(tri(E[a][0], E[a][1], i));
+    }
+    T = keep;
+  }
+  return T.filter((t) => t.v.every((k) => k < n)).map((t) => t.v);
+}
+
+// ---------------------------------------------------------------------
+//  THE mesh: make any polygon outline low-poly. Seeded interior points on a jittered grid + Delaunay, triangles
+//  outside the outline dropped; each vertex gets a height (a dome by default, or o.z(x, y, R, isEdge)), each facet a
+//  fixed Lambert tone, a seeded jitter, a twinkle phase and a rank (the order it flips in). Cached by key: the
+//  outline for one key must never change (move a mesh with ctx.translate / scale, not by rebuilding it).
+//  o: { cell (facet size), n (about how many interior points, if no cell), z, bulge, from: 'bottom'|'top'|'left'|'center' }
+// ---------------------------------------------------------------------
+const LP_MESH = {};
+function lpMesh(key, P, o = {}) {
+  if (LP_MESH[key]) return LP_MESH[key];
+  const bb = bbox(P), w = bb.x1 - bb.x0, h = bb.y1 - bb.y0, cell = o.cell ?? Math.max(16, Math.sqrt(w * h / (o.n ?? 12)));
+  const R = RNG('lpmesh', key), E = resample(P, true, cell * 1.15), V = E.map((p) => [p[0], p[1], 0]), nb = V.length;
+  let row = 0;
+  for (let gy = bb.y0 + cell * 0.5; gy < bb.y1; gy += cell * 0.87, row++) for (let gx = bb.x0 + cell * (row % 2 ? 0.25 : 0.75); gx < bb.x1; gx += cell) {
+    const x = gx + R.n(cell * 0.3), y = gy + R.n(cell * 0.3);
+    if (lpInside(P, x, y) && !E.some((q) => Math.hypot(q[0] - x, q[1] - y) < cell * 0.5)) V.push([x, y, 0]);
+  }
+  if (V.length === nb) { const c = lpCentroid(P); V.push([c[0], c[1], 0]); }
+  V.forEach((v, i) => {
+    if (o.z) v[2] = o.z(v[0], v[1], R, i < nb);
+    else if (i >= nb) v[2] = Math.min(...E.map((q) => Math.hypot(q[0] - v[0], q[1] - v[1]))) * (o.bulge ?? 0.7) + R.n(cell * 0.12);
+  });
+  const c0 = lpCentroid(P), T = [];
+  for (const [a, b, c] of lpDelaunay(V)) {
+    const A = V[a], B = V[b], C = V[c], cx = (A[0] + B[0] + C[0]) / 3, cy = (A[1] + B[1] + C[1]) / 3;
+    if (Math.abs((B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0])) < 1 || !lpInside(P, cx, cy)) continue;
+    const from = o.from ?? 'bottom';
+    const rank = (from === 'top' ? (cy - bb.y0) / h : from === 'left' ? (cx - bb.x0) / w : from === 'center' ? Math.hypot(cx - c0[0], cy - c0[1]) / (Math.hypot(w, h) / 2) : (bb.y1 - cy) / h) + R.n(0.1);
+    T.push({ a, b, c, cx, cy, s: lpLambert(A, B, C), rank, jit: R.n(1), ph: R.r(0, TAU) });
+  }
+  const r0 = Math.min(...T.map((t) => t.rank)), r1 = Math.max(...T.map((t) => t.rank));
+  T.forEach((t) => { t.rank = (t.rank - r0) / (r1 - r0 || 1); });
+  let convex = true;   // a concave outline is clipped when drawn, so no facet ever bridges a notch
+  for (let i = 0, sg = 0; i < P.length && convex; i++) {
+    const a = P[i], b = P[(i + 1) % P.length], c = P[(i + 2) % P.length], cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    if (Math.abs(cr) > 1e-6) { if (sg && Math.sign(cr) !== sg) convex = false; sg = Math.sign(cr); }
+  }
+  return (LP_MESH[key] = { P, V, T, convex, bb });
+}
+// draw a mesh in base colour c. o: { pal, k (shading contrast, 1), jit (per-facet tone jitter, 0.12), shim (shimmer
+//   strength, 0.3; 0 = none), tw / twf (twinkle amount / speed), t0 + dur or grow 0..1 (facets flip in by rank),
+//   tone(t) -> extra tone for facet t, col(t, rgbString) -> a replacement colour }
+function lpDraw(M, c, o = {}) {
+  const g = o.t0 != null ? clamp((TT - o.t0) / (o.dur ?? 0.8)) : clamp(o.grow ?? 1);
+  if (g <= 0) return;
+  const pal = o.pal ?? lpPal, k = o.k ?? 1, jit = o.jit ?? 0.12, sh = o.shim ?? 0.3, band = sh ? lpBand() : -9999, m = ctx.getTransform(), V = M.V;
+  ctx.save(); ctx.lineJoin = 'round'; ctx.lineWidth = 1.2 / (m.a || 1);
+  if (!M.convex) { lpPath(M.P); ctx.clip(); }
+  if (g >= 1) { lpPath(M.P); ctx.fillStyle = lpTone(c, 0, pal); ctx.fill(); }
+  for (const t of M.T) {
+    let q = 1;
+    if (g < 1) { q = clamp((g * 1.25 - t.rank) / 0.25); if (q <= 0) continue; }
+    let s = t.s * k + t.jit * jit;
+    if (band > -9000) s += sh * Math.max(0, 1 - Math.abs((m.a * t.cx + m.e) * 0.8 + (m.d * t.cy + m.f) * 0.6 - band) / 190);
+    if (o.tw) s += o.tw * Math.sin(TT * (o.twf ?? 3) + t.ph);
+    if (o.tone) s += o.tone(t);
+    if (q < 1) s += (1 - q) * 0.9;                                   // a facet flashes as it flips in
+    let col = lpTone(c, s, pal); if (o.col) col = o.col(t, col) || col;
+    const A = V[t.a], B = V[t.b], C = V[t.c], e = q < 1 ? EZ.back(q) : 1, fx = (x) => t.cx + (x - t.cx) * e;
+    ctx.beginPath(); ctx.moveTo(fx(A[0]), A[1]); ctx.lineTo(fx(B[0]), B[1]); ctx.lineTo(fx(C[0]), C[1]); ctx.closePath();
+    ctx.fillStyle = ctx.strokeStyle = col; ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+const lpPoly = (key, P, c, o = {}) => lpDraw(lpMesh(key, P, o), c, o);   // triangulate + shade any outline
+
+// ---------------------------------------------------------------------
+//  depth: a layer that follows the camera only `depth` of the way (0 = pinned to the screen, 1 = the camera itself)
+// ---------------------------------------------------------------------
+function lpParT(depth, z, tx, ty) { const zz = 1 + (z - 1) * depth, px = W / 2 + ((W / 2 - tx) / z - W / 2) * depth, py = H / 2 + ((H / 2 - ty) / z - H / 2) * depth; return [zz, W / 2 - zz * px, H / 2 - zz * py]; }
+function lpPar(depth, draw) { const m = ctx.getTransform(), [zz, ex, ey] = lpParT(depth, m.a, m.e, m.f); ctx.save(); ctx.setTransform(zz, 0, 0, zz, ex, ey); draw(); ctx.restore(); }
+// world points that the full camera `cam` puts where a layer at `depth` shows P (for bridge outlines of far objects)
+function lpParPts(P, depth, cam) { const c = cam || { z: 1, tx: 0, ty: 0 }, [zz, ex, ey] = lpParT(depth, c.z, c.tx, c.ty); return P.map(([x, y]) => [(zz * x + ex - c.tx) / c.z, (zz * y + ey - c.ty) / c.z]); }
+
+// ---------------------------------------------------------------------
+//  the sky: a triangulated gradient of large soft facets, pinned to the screen. lpSheet = the same sheet in one colour
+// ---------------------------------------------------------------------
+function lpSkyMesh() {
+  if (LP_MESH.lpsky) return LP_MESH.lpsky;
+  const R = RNG('lpsky'), nx = 4, ny = 8, G = [], T = [];
+  for (let j = 0; j <= ny; j++) for (let i = 0; i <= nx; i++) G.push([-40 + i * (W + 80) / nx + (i && i < nx ? R.n(W / nx * 0.3) : 0), -40 + j * (H + 80) / ny + (j && j < ny ? R.n(H / ny * 0.3) : 0)]);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const a = j * (nx + 1) + i, b = a + 1, c = a + nx + 1, d = c + 1;
+    for (const tr of R.f() < 0.5 ? [[a, b, c], [b, d, c]] : [[a, b, d], [a, d, c]]) T.push({ P: tr.map((q) => G[q]), cy: (G[tr[0]][1] + G[tr[1]][1] + G[tr[2]][1]) / 3, jit: R.n(1), ph: R.r(0, TAU) });
+  }
+  return (LP_MESH.lpsky = T);
+}
+// o: { horizon: the y where the gradient ends (1250) }
+function lpSky(pal = lpPal, o = {}) {
+  const hz = o.horizon ?? 1250, g = ctx.createLinearGradient(0, 0, 0, hz);
+  ctx.save(); screen();
+  pal.sky.forEach((c, i) => g.addColorStop(i / (pal.sky.length - 1), c)); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);   // an undercoat only: it shows nowhere but keeps the seams closed
+  for (const t of lpSkyMesh()) lpFacet(t.P, lpGrad(pal.sky, t.cy / hz), t.jit * 0.1 + Math.sin(TT * 0.9 + t.ph) * 0.05, pal);
+  ctx.restore();
+}
+function lpSheet(c, pal = LP.dusk) { fillAll(c); ctx.save(); screen(); for (const t of lpSkyMesh()) lpFacet(t.P, c, t.jit * 0.16 + Math.sin(TT * 0.9 + t.ph) * 0.04, pal); ctx.restore(); }
+
+// ---------------------------------------------------------------------
+//  land: ridges (a seeded skyline strip), a peak with a snow cap, rocks, trees (stacked faceted cones)
+// ---------------------------------------------------------------------
+function lpRidgePts(key, y, amp, o = {}) {
+  const R = RNG('lpridge', key), n = o.n ?? 6, x0 = -240, x1 = W + 240, P = [];
+  for (let i = 0; i <= n * 2; i++) P.push([lerp(x0, x1, i / (n * 2)) + (i && i < n * 2 ? R.n((x1 - x0) / (n * 2) * 0.28) : 0), y - amp * (i % 2 ? R.r(0.55, 1) : R.r(0, 0.22))]);
+  return P.concat([[x1, o.bot ?? y + 280], [x0, o.bot ?? y + 280]]);
+}
+// a ridge across the frame: tops near y - amp, valleys near y. Slopes that face the light are lit, the others shaded.
+function lpRidge(key, y, amp, c, o = {}) {
+  const P = lpRidgePts(key, y, amp, o), top = P.slice(0, -2);
+  const prof = (x) => { for (let i = 1; i < top.length; i++) if (x <= top[i][0]) return lerp(top[i - 1][1], top[i][1], clamp((x - top[i - 1][0]) / (top[i][0] - top[i - 1][0]))); return top[top.length - 1][1]; };
+  lpPoly('rd' + key, P, c, { cell: amp * 0.95, z: (x, yy, R) => -prof(x) * 0.8 + (yy - y) * 0.15 + R.n(amp * 0.1), ...o });
+}
+function lpPeakPts(x, y, w, h) {   // apex (x, y), base width w at y + h; { P: outline, cap: the snow cap's outline }
+  const ap = [x, y], l2 = [x - w * 0.17, y + h * 0.38], r1 = [x + w * 0.14, y + h * 0.34];
+  const P = [[x - w * 0.5, y + h], [x - w * 0.33, y + h * 0.72], l2, ap, r1, [x + w * 0.31, y + h * 0.63], [x + w * 0.5, y + h]];
+  const cl = [lerp(x, l2[0], 0.8), lerp(y, l2[1], 0.8)], cr = [lerp(x, r1[0], 0.86), lerp(y, r1[1], 0.86)], zz = (u, dy) => [lerp(cl[0], cr[0], u), lerp(cl[1], cr[1], u) + dy * h];
+  return { P, cap: [ap, cr, zz(0.74, 0.085), zz(0.52, 0.0), zz(0.27, 0.1), cl] };
+}
+// THE mountain: a ridge line runs down from the apex; the left faces catch the light, the right faces fall in shadow
+// o: { t0, dur (assemble facet by facet), capT0, snow, pal, shim }
+function lpPeak(key, x, y, w, h, c, o = {}) {
+  const pal = o.pal ?? lpPal, { P, cap } = lpPeakPts(x, y, w, h), z = (px, py, R) => -Math.abs(px - (x + (py - y) * 0.1)) * 0.85 + R.n(w * 0.022);
+  lpPoly('pk' + key, P, c, { cell: w / 7.5, z, ...o });
+  lpPoly('pkc' + key, cap, o.snow ?? pal.snow, { cell: w / 11, z, k: 0.55, pal, shim: o.shim, t0: o.capT0 ?? (o.t0 != null ? o.t0 + (o.dur ?? 0.8) * 0.85 : null), dur: 0.4, from: 'top' });
+}
+function lpRock(key, x, y, r, c, o = {}) {
+  const R = RNG('lprock', key), P = [[-r, 0], [-r * R.r(0.8, 1), -r * R.r(0.4, 0.6)], [-r * R.r(0.2, 0.45), -r * R.r(0.8, 1)], [r * R.r(0.3, 0.5), -r * R.r(0.7, 0.9)], [r * R.r(0.85, 1), -r * R.r(0.3, 0.5)], [r, 0]];
+  ctx.save(); ctx.translate(x, y); lpPoly('rk' + key + Math.round(r), P, c ?? (o.pal ?? lpPal).rock, { cell: r * 1.3, bulge: 1, ...o }); ctx.restore();
+}
+// a pine: three stacked faceted cones (a lit left facet, a shaded right facet each) on a trunk. (x, y) = foot, h = height
+// o: { c, pal, t0 (the tiers pop up one after another), key }
+function lpTree(x, y, h, o = {}) {
+  const pal = o.pal ?? lpPal, c = o.c ?? pal.tree, g = o.t0 != null ? (TT - o.t0) / 0.5 : 1; if (g <= 0) return;
+  const sway = Math.sin(TT * 1.4 + x * 0.013) * h * 0.012, tw = h * 0.035;
+  lpFacet([[x - tw, y], [x - tw, y - h * 0.2], [x, y - h * 0.2], [x, y]], pal.ink, 0.25, pal); lpFacet([[x, y], [x, y - h * 0.2], [x + tw, y - h * 0.2], [x + tw, y]], pal.ink, -0.3, pal);
+  for (let i = 0; i < 3; i++) {
+    const q = clamp(g * 3 - i); if (q <= 0) continue;
+    const e = EZ.back(q), by = y - h * (0.13 + i * 0.25), hw = h * (0.3 - i * 0.065) * e, ax = x + sway * (i + 1), ay = by - h * (0.4 - i * 0.02) * e, mx = x + hw * 0.16;
+    lpFacet([[ax, ay], [x - hw, by], [mx, by + hw * 0.16]], c, 0.5 - i * 0.05 + (1 - q), pal);
+    lpFacet([[ax, ay], [mx, by + hw * 0.16], [x + hw, by]], c, -0.6, pal);
+  }
+}
+
+// ---------------------------------------------------------------------
+//  sky things: the gem (a faceted sun / moon / jewel, also the morph's shape), stars, clouds, birds
+// ---------------------------------------------------------------------
+const lpGemWob = () => 0.07 * Math.sin(TT * 1.7);   // a gem's inner ring rocks a little, so its facets keep catching the light
+// n points on a circle from angle -PI (the renderer resamples outlines from there); spike pulls every other vertex in
+function lpGemPts(x, y, r, n = 12, spike = 0) { const P = []; for (let i = 0; i < n; i++) { const a = -Math.PI + i / n * TAU, k = r * (i % 2 ? 1 - spike : 1); P.push([x + Math.cos(a) * k, y + Math.sin(a) * k]); } return P; }
+// a cut gem on an outer ring O (even count): a girdle of facets, an inner ring turned by o.turn (in steps), a table fan
+function lpGemDraw(O, c, o = {}) {
+  const pal = o.pal ?? lpPal, n = O.length, m = n / 2, ce = lpCentroid(O), turn = (o.turn ?? 0) * TAU / m, band = lpBand(), tm = ctx.getTransform();
+  const rA = O.reduce((a, p) => a + Math.hypot(p[0] - ce[0], p[1] - ce[1]), 0) / n || 1, I = [];
+  for (let j = 0; j < m; j++) { const b = O[2 * j + 1], a = Math.atan2(b[1] - ce[1], b[0] - ce[0]) + turn, r = Math.hypot(b[0] - ce[0], b[1] - ce[1]) * (o.inner ?? 0.52); I.push([ce[0] + Math.cos(a) * r, ce[1] + Math.sin(a) * r]); }
+  const face = (A, B, C, slope) => {
+    const gx = (A[0] + B[0] + C[0]) / 3, gy = (A[1] + B[1] + C[1]) / 3, nx = (gx - ce[0]) / rA * slope, ny = (gy - ce[1]) / rA * slope, d = (nx * LP_L[0] + ny * LP_L[1] + LP_L[2]) / Math.hypot(nx, ny, 1);
+    let s = clamp((d - LP_L[2]) / (d >= LP_L[2] ? 1 - LP_L[2] : LP_L[2]), -1, 1) * (o.k ?? 1);
+    if (band > -9000) s += 0.3 * Math.max(0, 1 - Math.abs((tm.a * gx + tm.e) * 0.8 + (tm.d * gy + tm.f) * 0.6 - band) / 190);
+    lpFacet([A, B, C], c, s, pal);
+  };
+  lpFacet(O, c, 0, pal);
+  for (let j = 0; j < m; j++) {
+    const a = O[2 * j], b = O[2 * j + 1], d = O[(2 * j + 2) % n], i0 = I[j], i1 = I[(j + 1) % m];
+    face(a, b, i0, 1.5); face(b, d, i0, 1.5); face(d, i0, i1, 1.1); face(i0, i1, ce, 0.55);
+  }
+}
+const lpGem = (x, y, r, c, o = {}) => lpGemDraw(lpGemPts(x, y, r, o.n ?? 12, o.spike ?? 0), c, { turn: lpGemWob(), ...o });
+// a small two-facet diamond (stars, fireflies, sparks)
+function lpSpark(x, y, r, c, pal = lpPal) { lpFacet([[x, y - r], [x - r * 0.62, y], [x, y + r]], c, 0.35, pal); lpFacet([[x, y - r], [x, y + r], [x + r * 0.62, y]], c, -0.35, pal); }
+// n seeded stars in box [x0, y0, x1, y1], popping in a stagger from o.t0, twinkling. o.avoid(x, y) -> true = no star there
+function lpStars(key, n, box, o = {}) {
+  const R = RNG('lpstars', key), pal = o.pal ?? lpPal;
+  for (let i = 0, made = 0; made < n && i < n * 6; i++) {
+    const x = R.r(box[0], box[2]), y = R.r(box[1], box[3]), r = R.r(7, 15), ph = R.r(0, TAU), f = R.r(2, 4.5);
+    if (o.avoid && o.avoid(x, y)) continue;
+    const s = o.t0 != null ? clamp(springEase(TT - o.t0 - made * 0.035, 260, 14), 0, 1.4) : 1; made++;
+    if (s > 0.01) lpSpark(x, y, r * s * (0.75 + 0.3 * Math.sin(TT * f + ph)), o.c ?? pal.star, pal);
+  }
+}
+// drifting motes (fireflies, pollen, snow): seeded, floating on slow sines, blinking
+function lpMotes(key, n, box, c, o = {}) {
+  const R = RNG('lpmotes', key), pal = o.pal ?? lpPal;
+  for (let i = 0; i < n; i++) {
+    const x = R.r(box[0], box[2]), y = R.r(box[1], box[3]), ph = R.r(0, TAU), f = R.r(0.35, 0.8), r = R.r(7, 12);
+    const s = (o.t0 != null ? clamp(ev(o.t0 + i * 0.08, 0.3)) : 1) * (0.55 + 0.45 * Math.sin(TT * 3.1 + ph * 3));
+    if (s > 0.05) lpSpark(x + Math.sin(TT * f + ph) * 26, y + Math.cos(TT * f * 1.3 + ph) * 18, r * s, c, pal);
+  }
+}
+// a faceted cloud, w wide, flat-bottomed, sitting on (x, y). o.drift (px/s) carries it across and wraps it round
+function lpCloud(key, x, y, w, c, o = {}) {
+  const R = RNG('lpcloud', key), h = w * 0.34, P = [[0, 0], [-w * 0.04, -h * 0.3], [w * 0.1, -h * R.r(0.5, 0.65)], [w * 0.24, -h * 0.5], [w * R.r(0.36, 0.44), -h], [w * 0.6, -h * R.r(0.78, 0.9)], [w * 0.7, -h * 0.5], [w * 0.86, -h * R.r(0.52, 0.66)], [w * 1.02, -h * 0.26], [w, 0]];
+  const xx = o.drift ? mod(x + o.drift * TT + w * 1.2, W + w * 2.4) - w * 1.2 : x;
+  ctx.save(); ctx.translate(xx, y + Math.sin(TT * 0.7 + w) * 4); lpPoly('cl' + key + Math.round(w), P, c ?? (o.pal ?? lpPal).cloud, { cell: w * 0.2, bulge: 0.9, k: 0.6, ...o }); ctx.restore();
+}
+// a bird: two wing facets beating around a body point, s = wingspan
+function lpBird(x, y, s, c, o = {}) {
+  const fl = Math.sin(TT * (o.f ?? 9) + (o.ph ?? 0)), wy = -fl * s * 0.26, pal = o.pal ?? lpPal;
+  lpFacet([[x, y], [x - s * 0.5, y + wy], [x - s * 0.14, y + s * 0.1]], c, 0.3, pal); lpFacet([[x, y], [x + s * 0.5, y + wy], [x + s * 0.16, y + s * 0.1]], c, -0.4, pal);
+  lpFacet([[x - s * 0.14, y + s * 0.1], [x + s * 0.24, y + s * 0.02], [x + s * 0.16, y + s * 0.1], [x, y + s * 0.16]], c, -0.1, pal);
+}
+
+// ---------------------------------------------------------------------
+//  water and crystals
+// ---------------------------------------------------------------------
+// a band of water: rows of long flat facets that twinkle; o.glint = { x, w, c } lays a light's reflection down it
+function lpWater(key, x0, y0, w, h, c, o = {}) {
+  const pal = o.pal ?? lpPal;
+  let M = LP_MESH['wt' + key];
+  if (!M) {
+    const R = RNG('lpwater', key), rows = o.rows ?? 4, cell = o.cell ?? 150, nc = Math.ceil(w / cell) + 1, G = [];
+    M = LP_MESH['wt' + key] = [];
+    for (let r = 0; r <= rows; r++) { const y = y0 + h * (r / rows) ** 1.5, row = []; for (let i = 0; i <= nc; i++) row.push([x0 + (i - (r % 2 ? 0.5 : 0)) * cell + (r && r < rows ? R.n(cell * 0.22) : 0), y]); G.push(row); }
+    for (let r = 0; r < rows; r++) for (let i = 0; i < nc; i++) {
+      const a = G[r][i], b = G[r][i + 1], d = G[r + 1][i], e = G[r + 1][i + 1];
+      for (const P of r % 2 ? [[a, b, d], [b, e, d]] : [[a, b, e], [a, e, d]]) M.push({ P, cx: (P[0][0] + P[1][0] + P[2][0]) / 3, v: (r + 0.5) / rows, jit: R.n(1), ph: R.r(0, TAU), id: M.length });
+    }
+  }
+  const step = Math.floor(TT * 6);
+  ctx.fillStyle = lpTone(c, 0, pal); ctx.fillRect(x0, y0, w, h);   // undercoat
+  for (const t of M) {
+    let s = t.jit * 0.22 + Math.sin(TT * 2.4 + t.ph) * 0.2 + (hash('lpglit', key, t.id, step) % 23 === 0 ? 0.9 : 0), col = c;   // now and then a facet flashes
+    if (o.glint) { const d = Math.abs(t.cx - o.glint.x) / (o.glint.w * (0.45 + 0.55 * t.v)); if (d < 1) { col = lpMix(c, o.glint.c, (1 - d) * (0.5 + 0.3 * Math.sin(TT * 5 + t.ph))); s *= 0.4; } }
+    lpFacet(t.P, col, s, pal);
+  }
+}
+// a crystal growing out of the ground at (x, y), h tall, leaning o.lean (rad). o: { t0 (it shoots up on a spring), pal, glow }
+function lpCrystal(x, y, h, c, o = {}) {
+  const pal = o.pal ?? lpPal, g = o.t0 != null ? Math.max(0, springEase(TT - o.t0, 260, 15)) : 1; if (g <= 0.01) return;
+  const w = h * 0.2, pu = 0.12 * Math.sin(TT * 2.6 + x * 0.05) * (o.glow ?? 1);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(o.lean ?? 0); ctx.scale(1, g);
+  lpFacet([[-w, 0], [-w, -h * 0.72], [0, -h * 0.62], [0, 0]], c, 0.75 + pu, pal); lpFacet([[0, 0], [0, -h * 0.62], [w, -h * 0.72], [w, 0]], c, -0.45 + pu, pal);
+  lpFacet([[-w, -h * 0.72], [0, -h], [0, -h * 0.62]], c, 1 + pu, pal); lpFacet([[0, -h * 0.62], [0, -h], [w, -h * 0.72]], c, 0.1 + pu, pal);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  type: clean geometric bold sans, flat colour; plates are faceted too
+// ---------------------------------------------------------------------
+function lpFont(size, weight = 700) { ctx.font = `${weight} ${size}px ${LP_SANS}`; }
+// o: { align, base, weight, al, maxW: the widest the string may be (the size shrinks to fit) }. Returns the drawn width.
+function lpText(str, x, y, size, color, o = {}) {
+  ctx.save(); lpFont(size, o.weight); ctx.fillStyle = color; ctx.textAlign = o.align ?? 'left'; ctx.textBaseline = o.base ?? 'alphabetic';
+  let w = ctx.measureText(str).width;
+  if (o.maxW && w > o.maxW) { lpFont(size * o.maxW / w, o.weight); w = ctx.measureText(str).width; }
+  ctx.globalAlpha *= o.al ?? 1; ctx.fillText(str, x, y); ctx.restore(); return w;
+}
+const lpTextW = (str, size, weight) => { ctx.save(); lpFont(size, weight); const w = ctx.measureText(str).width; ctx.restore(); return w; };
+// a faceted plate (a chamfered slab of a few low-contrast facets) to set type on. o: { grow | t0 + dur, pal, k }
+function lpPlate(key, x, y, w, h, c, o = {}) {
+  const ch = Math.min(h * 0.32, w * 0.2), P = [[ch, 0], [w - ch * 0.5, 0], [w, h * 0.4], [w - ch * 0.8, h], [ch * 0.6, h], [0, h * 0.58]];
+  ctx.save(); ctx.translate(x, y); lpPoly('pl' + key + Math.round(w) + 'x' + Math.round(h), P, c, { cell: Math.max(h * 0.85, w / 5), k: 0.3, jit: 0.1, shim: 0.12, from: 'left', bulge: 0.5, ...o }); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  the hero: a low-poly fox sitting, seen from the front (about 40 facets): big ears, white cheeks and chest, a
+//  white-tipped tail. Idle: it breathes, blinks, an ear twitches now and then, the tail sways. (x, y) = between its
+//  front paws on the ground, s = its height. o: { key, pal, flip (tail on the left), tilt (head, rad),
+//  twitch: time | [times] (extra ear twitches), pop: the time it springs up out of the ground, shadow: false }
+// ---------------------------------------------------------------------
+function lpFox(x, y, s, o = {}) {
+  if (o.pop != null) {
+    const k = TT < o.pop ? 0 : Math.max(0, springEase(TT - o.pop, 260, 14)); if (k <= 0.001) return;
+    ctx.save(); ctx.translate(x, y); ctx.scale(k, k); ctx.translate(-x, -y); lpFox(x, y, s, { ...o, pop: null }); ctx.restore(); SPARK_AT = toScreen(x, y - s * 0.6); return;
+  }
+  const key = o.key ?? 'fox', pal = o.pal ?? lpPal, f = o.flip ? -1 : 1, ph = hash('lpfox', key) % 628 / 100;
+  const br = Math.sin(TT * TAU * 0.45 + ph) * 0.012, blink = mod(F + hash('lpblink', key) % 71, 71) < 3;
+  let twitch = 0; { const u = mod(TT + ph, 2.3); if (u < 0.3) twitch = Math.sin(u / 0.3 * Math.PI); }
+  for (const t of [].concat(o.twitch ?? [])) { const u = TT - t; if (u > 0 && u < 0.5) twitch = Math.max(twitch, Math.abs(Math.sin(u / 0.25 * Math.PI)) * (1 - u)); }
+  const O = LP.fox, Wt = LP.foxW, K = LP.foxK;
+  const fc = (P, c, sh) => lpFacet(P.map(([px, py]) => [x + px * s, y + py * s]), c, sh, pal);
+  if (o.shadow !== false) fc([[-0.36, 0.005], [-0.2, -0.022], [0.2, -0.022], [0.36, 0.005], [0.2, 0.035], [-0.2, 0.035]], pal.ground, -0.75);
+  // the tail: a leaf curling up beside the body, white-tipped, swaying about its root
+  const sw = Math.sin(TT * TAU * 0.4 + ph) * 0.13, cs = Math.cos(sw), sn = Math.sin(sw), lt = f < 0 ? 0.25 : -0.15;
+  const tp = (px, py) => { const dx = px - 0.18, dy = py + 0.06; return [f * (0.18 + dx * cs - dy * sn), -0.06 + dx * sn + dy * cs]; };
+  const tA = tp(0.14, -0.02), tC = tp(0.48, -0.03), tD = tp(0.62, -0.3), tE = tp(0.5, -0.6), tB = tp(0.31, -0.35), tA2 = tp(0.2, -0.2), tM = tp(0.42, -0.22);
+  const mid = (p, q, u) => [lerp(p[0], q[0], u), lerp(p[1], q[1], u)], tBw = mid(tB, tE, 0.48), tDw = mid(tD, tE, 0.48), tMw = mid(tBw, tDw, 0.5);
+  fc([tA, tC, tM], O, -0.55 + lt); fc([tC, tD, tM], O, -0.25 + lt); fc([tA, tM, tA2], O, 0.05 + lt); fc([tA2, tM, tB], O, 0.3 + lt); fc([tM, tD, tDw], O, -0.1 + lt); fc([tM, tDw, tBw], O, 0.1 + lt); fc([tM, tBw, tB], O, 0.25 + lt);
+  fc([tBw, tMw, tE], Wt, 0.1 + lt); fc([tMw, tDw, tE], Wt, -0.4 + lt);
+  // the body: shoulders, flanks, haunches, a white chest
+  const N = [0, -0.5 - br], Cc = [0, -0.17], Bt = [0, -0.015];
+  for (const d of [-1, 1]) {
+    const S = [d * 0.17, -0.45 - br], Hp = [d * 0.235, -0.02], Ck = [d * 0.085, -0.21];
+    fc([N, S, Ck], O, -d * 0.3 + 0.05); fc([S, Hp, Ck], O, -d * 0.45 - 0.1); fc([Ck, Hp, Bt], O, -d * 0.3 - 0.3);
+    fc([N, Ck, Cc], Wt, -d * 0.25); fc([Ck, Bt, Cc], Wt, -d * 0.25 - 0.2);
+  }
+  for (const d of [-1, 1]) fc([[d * 0.025, 0], [d * 0.125, 0], [d * 0.07, -0.1]], K, -d * 0.2);
+  // the head: tilts about the neck; one ear tip flicks
+  const tl = (o.tilt ?? 0) + Math.sin(TT * TAU * 0.22 + ph) * 0.025, hc = Math.cos(tl), hs = Math.sin(tl), hy = -0.66 - br * 1.5;
+  const hp = (px, py) => [px * hc - (py - 0.14) * hs, hy + 0.14 + px * hs + (py - 0.14) * hc];   // about the neck, 0.14 below the head's centre
+  const top = hp(0, -0.13), brow = hp(0, 0.01), nose = hp(0, 0.225);
+  for (const d of [-1, 1]) {
+    const tk = d === (f < 0 ? 1 : -1) ? twitch : 0;
+    const tip = hp(d * (0.235 + tk * 0.05), -0.37 + tk * 0.07), out = hp(d * 0.275, -0.1), inn = hp(d * 0.07, -0.15), cheek = hp(d * 0.33, 0.05), jaw = hp(d * 0.13, 0.17);
+    const ec = [(tip[0] + out[0] + inn[0]) / 3, (tip[1] + out[1] + inn[1]) / 3], ins = (p) => [lerp(p[0], ec[0], 0.42), lerp(p[1], ec[1], 0.42)];
+    fc([tip, out, inn], O, -d * 0.3 - 0.15); fc([ins(tip), ins(out), ins(inn)], K, -d * 0.2);
+    fc([inn, top, brow], O, -d * 0.3 + 0.3); fc([out, inn, brow], O, -d * 0.35 + 0.1); fc([out, cheek, brow], O, -d * 0.4 - 0.1);
+    fc([cheek, jaw, brow], Wt, -d * 0.3 + 0.05); fc([brow, jaw, nose], Wt, -d * 0.3 - 0.15);
+    const e = hp(d * 0.135, 0.0), eh = blink ? 0.006 : 0.032;
+    fc([[e[0] - 0.036, e[1]], [e[0], e[1] - eh], [e[0] + 0.036, e[1]], [e[0], e[1] + eh]], K, 0);
+  }
+  fc([hp(-0.036, 0.183), hp(0.036, 0.183), nose], K, 0);
+  SPARK_AT = toScreen(x, y - s * 0.6);
+}
+// the fox's silhouette for bridges: centred on (x, y), r = half its height
+function lpFoxPts(x, y, r) { const s = r * 2; return [[-0.235, -1.03], [-0.07, -0.81], [0.07, -0.81], [0.235, -1.03], [0.275, -0.76], [0.33, -0.61], [0.17, -0.45], [0.235, -0.02], [-0.235, -0.02], [-0.17, -0.45], [-0.33, -0.61], [-0.275, -0.76]].map(([px, py]) => [x + px * s, y + r + py * s]); }
+
+// ---------------------------------------------------------------------
+//  captions and tags (DEFER: after the camera, at screen size) on faceted plates that assemble facet by facet
+// ---------------------------------------------------------------------
+function lpLeaving() {   // 1 normally; falls to 0 over the first 0.3s of a bridge's shrink
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc) return 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.3)); }
+  return 1;
+}
+function lpArrive() {    // after a bridge an era's overlays wait until the growing window has passed them
+  if (typeof BRIDGES === 'undefined') return E0;
+  for (const r of BRIDGES) if (Math.abs(r.tc - E0) < 0.05) return r.tc + (r.d ?? 0.6) * 0.75;
+  return E0;
+}
+// a tag, top left: a small plate with a number chip and a label
+function lpTagNow(num, label, pal) {
+  const t0 = Math.max(E0 + 0.15, lpArrive()), al = lpLeaving(); if (TT < t0 || al <= 0.001) return;
+  const x = 70, y = 262, h = 76, size = 36, w = h + 22 + lpTextW(label, size) + 40, g = Math.min(ev(t0, 0.35), al);
+  lpPlate('tag' + label, x, y, w, h, pal.ink, { grow: g, pal });
+  lpPlate('tagn' + num, x + 12, y + 11, h - 14, h - 22, pal.hi, { grow: Math.min(ev(t0 + 0.2, 0.25), al), pal, k: 0.5 });
+  const a = al * ev(t0 + 0.25, 0.2);
+  lpText(num, x + 12 + (h - 14) / 2, y + h / 2 + 2, 28, pal.hiText, { align: 'center', base: 'middle', al: a });
+  lpText(label, x + h + 16, y + h / 2 + 2, size, pal.text, { base: 'middle', al: a });
+}
+// a caption: bold, centred at CX on a faceted plate; words rise in one after another. '\n' breaks lines;
+// *a phrase* sits on its own bright chip in dark type. o: { y: last baseline, size, at, pal, x }
+function lpCaptionNow(str, o, pal) {
+  const al = lpLeaving(); if (al <= 0.001) return;
+  const size = o.size ?? 72, lh = size * 1.24, t0 = Math.max(E0 + (o.at ?? 0.7), lpArrive()), yLast = o.y ?? 1450, cx = o.x ?? CX; if (TT < t0) return;
+  ctx.save(); lpFont(size);
+  const sp = ctx.measureText(' ').width, pad = size * 0.2;
+  const lines = str.split('\n').map((line) => { const ws = line.split(/(\*[^*]+\*)/).filter((g) => g.trim()).flatMap((g) => (g[0] === '*' ? [{ w: g.slice(1, -1), hi: true }] : g.trim().split(/\s+/).map((w) => ({ w, hi: false })))); ws.forEach((d) => { d.W = ctx.measureText(d.w).width + (d.hi ? pad * 2 : 0); }); return { ws, W: ws.reduce((a, d) => a + d.W, 0) + sp * (ws.length - 1) }; });
+  ctx.restore();
+  const pw = Math.max(...lines.map((l) => l.W)) + size * 1.3, top = yLast - (lines.length - 1) * lh - size * 1.32, ph = yLast + size * 0.6 - top;
+  lpPlate('cap' + str, cx - pw / 2, top, pw, ph, pal.ink, { grow: Math.min(ev(t0, 0.4), al), pal });
+  let k = 0;
+  lines.forEach((line, li) => {
+    let xx = cx - line.W / 2; const yy = yLast - (lines.length - 1 - li) * lh;
+    line.ws.forEach((d) => {
+      const tw = t0 + 0.22 + k * 0.08, s = springEase(TT - tw, SPRING.playful.k, SPRING.playful.d); k++;
+      if (TT >= tw && s > 0.001) {
+        const dy = (1 - s) * size * 0.4, a = al * clamp(s * 1.6);
+        if (d.hi) { lpPlate('hi' + d.w, xx, yy - size * 0.9 + dy, d.W, size * 1.2, pal.hi, { grow: Math.min(ev(tw + 0.05, 0.25), al), pal, k: 0.45, shim: 0.3 }); lpText(d.w, xx + pad, yy + dy, size, pal.hiText, { al: a }); }
+        else lpText(d.w, xx, yy + dy, size, pal.text, { al: a });
+      }
+      xx += d.W + sp;
+    });
+  });
+}
+const lpTag = (num, label, o = {}) => { const pal = o.pal ?? lpPal, f = () => lpTagNow(num, label, pal); if (DEFER) DEFER.push(f); else f(); };
+const lpCaption = (str, o = {}) => { const pal = o.pal ?? lpPal, f = () => lpCaptionNow(str, o, pal); if (DEFER) DEFER.push(f); else f(); };
+
+// =====================================================================
+//  STYLE — the renderer's hooks (styles/README.md)
+// =====================================================================
+const STYLE = {
+  name: 'low-poly',
+  paper: LP.paper,
+  backdrop(c) { lpSheet(c); },                                           // a sheet of large soft facets in colour c (hex or rgb())
+  // the era seen through outline P, framed by a girdle of facets in the bridge shape's colour
+  window(P, key, src, o = {}) {
+    const ce = lpCentroid(P), rA = P.reduce((a, p) => a + Math.hypot(p[0] - ce[0], p[1] - ce[1]), 0) / P.length || 1, k = 1 + 34 / rA, c = o.c ?? LP.sun;
+    const pal = o.phase === 'grow' ? LP.moonPal : LP.sunPal, Q = P.map(([x, y]) => [ce[0] + (x - ce[0]) * k, ce[1] + (y - ce[1]) * k]);
+    ctx.save(); lpPath(P); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore();
+    for (let i = 0; i < P.length; i++) { const j = (i + 1) % P.length; lpFacet([P[i], P[j], Q[i]], c, i % 2 ? 0.5 : -0.2, pal); lpFacet([P[j], Q[j], Q[i]], c, i % 2 ? -0.5 : 0.15, pal); }
+  },
+  // the morphing shape: a cut gem whose inner ring turns one step while its girdle changes shape, so it re-triangulates
+  blob(P, c, key, u = 0) {
+    const n = P.length, O = []; for (let i = 0; i < 12; i++) O.push(P[Math.round(i * n / 12) % n]);
+    const mx = (a, b) => lpMix(a, b, clamp(u));
+    lpGemDraw(O, c, { turn: u + lpGemWob(), pal: { lit: mx(LP.sunPal.lit, LP.moonPal.lit), shd: mx(LP.sunPal.shd, LP.moonPal.shd) } });
+  },
+  hero(x, y, r, o = {}) { if (r > 1) lpFox(x, y + r, r * 2, { key: o.key, pal: LP.night, shadow: false }); },
+  heroColor: LP.fox,
+  heroPts(x, y, r) { return lpFoxPts(x, y, r); },
+  post() {},
+  ones: true,
+};
+// =====================================================================
+//  SCENES — low-poly demo. World units = px at zoom 1; time TT on 1s. One world, drawn twice: at dawn and at night.
+//  Depth layers (lpPar): sky 0 (pinned), sun / moon 0.12, far ridge 0.3, mid ridge 0.5, the peak 0.75, lake 0.9,
+//  foreground 1. Content kept inside x 60-940, y 250-1500.
+// =====================================================================
+const cu = TIMELINE.cues;
+const D_SKY = 0.12, D_FAR = 0.3, D_MID = 0.5, D_PEAK = 0.75, D_LAKE = 0.9;
+const SUN = { x: 770, y: 560, r: 105, spike: 0.14 };
+const MOON = { x: 270, y: 505, r: 100 };
+const PEAK = { x: 455, y: 600, w: 800, h: 570 };
+const FOX = { x: 770, y: 1236, s: 230 };
+const FORE = [[-260, 1274], [60, 1220], [270, 1240], [480, 1268], [690, 1238], [900, 1222], [1340, 1260], [1340, 2300], [-260, 2300]];
+const TREES = [[132, 1230, 250], [232, 1238, 185], [962, 1228, 225]];
+
+// the land both eras share. o: { pal, peakT0 (assemble the peak), treeT0, glint }
+function world(o) {
+  const pal = o.pal;
+  lpPar(D_FAR, () => lpRidge('far', 950, 100, lpHaze(pal.ridge, 0.85), { bot: 1260, shim: 0.12, k: 0.6 }));
+  if (o.between) o.between();
+  lpPar(D_MID, () => lpRidge('mid', 1030, 130, lpHaze(pal.ridge, 0.45), { bot: 1280, n: 5, shim: 0.2, k: 0.8 }));
+  lpPar(D_PEAK, () => lpPeak('main', PEAK.x, PEAK.y, PEAK.w, PEAK.h, pal.peak, { t0: o.peakT0, dur: 1.25, capT0: o.capT0, shim: 0.45 }));
+  lpPar(D_LAKE, () => lpWater('lake', -200, 1150, W + 400, 170, pal.water, { glint: o.glint }));
+  lpPoly('fore', FORE, pal.ground, { cell: 190, z: (x, y, R) => -y * 0.2 + R.n(20), shim: 0.15, k: 0.8 });
+  lpRock('a', 590, 1264, 44); lpRock('b', 318, 1256, 26);
+  TREES.forEach(([x, y, h], i) => lpTree(x, y, h, { t0: o.treeT0 != null ? o.treeT0 + i * E8 : null }));
+}
+
+// ---- era 1: dawn
+function sceneDawn() {
+  const pal = lpUse('dawn');
+  lpSky(pal);
+  // the sun climbs out from behind the ridges on a heavy spring
+  const sy = SUN.y + (1 - springEase(TT - cu.sun, SPRING.heavy.k, SPRING.heavy.d)) * 560;
+  lpPar(D_SKY, () => lpGem(SUN.x, sy, SUN.r, LP.sun, { spike: SUN.spike, pal: LP.sunPal }));
+  world({ pal, peakT0: cu.peak - 0.35, capT0: cu.cap, treeT0: cu.tree, glint: { x: SUN.x, w: 190, c: LP.sun },
+    between: () => lpPar(0.4, () => {
+      lpCloud('a', 80, 800, 230, null, { drift: 16 }); lpCloud('b', 640, 880, 170, null, { drift: 10 });
+      for (let i = 0; i < 3; i++) {   // three birds cross the sky
+        const u = TT - cu.birds - i * 0.22; if (u < 0) continue;
+        lpBird(-60 + u * 210 - i * 14, 470 + i * 46 - u * 16 + Math.sin(u * 3 + i) * 10, 46 - i * 6, pal.ink, { ph: i * 1.7 });
+      }
+    }) });
+  lpFox(FOX.x, FOX.y, FOX.s, { key: 'hero', flip: true, tilt: 0.04 });
+  lpTag('01', 'PAGI');
+  lpCaption('Pagi merekah\ndi *gunung*', { at: 0.75 });
+}
+
+// ---- era 2: night
+function sceneNight() {
+  const pal = lpUse('night');
+  lpSky(pal);
+  const peak = lpPeakPts(PEAK.x, PEAK.y, PEAK.w, PEAK.h).P;
+  lpStars('sky', 24, [40, 250, 1000, 790], { t0: cu.stars, avoid: (x, y) => Math.hypot(x - MOON.x, y - MOON.y) < MOON.r + 50 || (x < 420 && y < 360) || lpInside(peak, x, y + 40) });
+  lpPar(D_SKY, () => lpGem(MOON.x, MOON.y, MOON.r, LP.moon, { pal: LP.moonPal }));
+  world({ pal, glint: { x: MOON.x, w: 170, c: LP.moon },
+    between: () => lpPar(0.4, () => { lpCloud('n1', 600, 760, 250, null, { drift: 14 }); lpCloud('n2', 60, 900, 180, null, { drift: 9 }); }) });
+  // crystals shoot up out of the ground, one per 16th
+  [[440, 1270, 150, -0.1], [494, 1274, 96, 0.22], [392, 1266, 84, -0.32]].forEach(([x, y, h, lean], i) => lpCrystal(x, y, h, pal.crystal, { t0: cu.crystal + i * E16, lean }));
+  lpMotes('fly', 9, [120, 1000, 900, 1210], pal.hi, { t0: cu.stars });
+  const up = springEase(TT - cu.look, SPRING.playful.k, SPRING.playful.d);   // the fox lifts its head toward the moon
+  lpFox(FOX.x, FOX.y, FOX.s, { key: 'hero', flip: true, tilt: 0.04 - 0.2 * up, twitch: [cu.look, cu.twitch] });
+  lpTag('02', 'MALAM');
+  lpCaption('malam turun,\n*rubah* berjaga', { at: 0.75 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — low-poly demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [LP.dawn.bg, LP.night.bg];
+function pieceCam(era, t) {
+  // dawn: a slow push toward the mountain with a small pan, so the depth layers slide against each other
+  if (era === 0) return push(t, 0.2, 2.9, { z: 1.07, p: [520, 1250], to: [480, 1250] });
+  const z = springMove(3.0, 1.1, 1.0, { k: 22, d: 9.5 });   // night opens a touch close and settles out on a slow spring
+  return camOf({ z, p: [470, 1250], to: [470, 1250] });
+}
+const BRIDGES = [
+  // the sun (a 12-gon gem with shallow spikes) -> the moon (a 12-gon gem): both live on a far layer, so their
+  // outlines are handed over in the camera's own coordinates (lpParPts)
+  { tc: 3.0,
+    A: () => ({ P: lpParPts(lpGemPts(SUN.x, SUN.y, SUN.r, 12, SUN.spike), D_SKY, camAt(0, TT)), c: LP.sun }),
+    B: () => ({ P: lpParPts(lpGemPts(MOON.x, MOON.y, MOON.r, 12, 0), D_SKY, camAt(1, TT)), c: LP.moon }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — low-poly demo (inside buildScore(); see kit/score-head.js). Dawn: a warm pad in F, a soft bass on the
+  // beats and one pentatonic pluck per 8th climbing while the mountain assembles (a facet row each), a chime as the
+  // sun clears the ridge, bird chirps. A sweep into the morph, then the payoff at 3.0 (chord stab + sub, the loudest
+  // hit) and a calm night groove in D minor: sub on the beats, off-beat bass, an 8th-note arp, soft 16th crickets,
+  // a glassy note per star and per crystal, two little blips when the fox's ear twitches.
+  const T = TIMELINE, q = T.cues;
+  to = 'm';
+  pad(0.0, 3.0, ['F3', 'C4', 'A4'], 0.024, { type: 'triangle', cut: 1500, att: 0.3, rel: 0.35, send: 0.5 });
+  pad(3.0, 6.05, ['D3', 'A3', 'F4', 'C5'], 0.032, { type: 'triangle', cut: 1800, att: 0.12, rel: 0.3, send: 0.5 });
+  for (let i = 0; i < 5; i++) bass(i * BEAT, nz('F2') * (i % 2 ? 1.5 : 1), 0.05);                     // dawn: the beat (it drops out before the morph)
+  const climb = ['F4', 'G4', 'A4', 'C5', 'D5', 'F5', 'G5', 'A5', 'C6'];
+  for (let i = 0; i < 9; i++) pluck(q.peak + 0.125 + i * E8, nz(climb[i]), 0.038, i % 2 ? 0.3 : -0.3, 0.26, 3400, 0.35);   // facets flipping in, row by row
+  chime(q.sun + 0.75, [nz('F5'), nz('A5'), nz('C6')], 0.03, 0.2);                                      // the sun clears the ridge
+  for (let i = 0; i < 4; i++) pluck(1.75 + i * BEAT / 2 + E16, nz(['A4', 'C5', 'F5', 'C5'][i]), 0.036, i % 2 ? -0.3 : 0.3, 0.26, 3600, 0.35);
+  // the payoff: a short chord stab + a sub on the morph, then the night groove
+  for (const [n, p] of [['D3', -0.3], ['A3', 0.3], ['D4', -0.15], ['F4', 0.15], ['A4', 0]]) pluck(3.0, nz(n), 0.046, p, 0.42, 4000, 0.4);
+  sub(3.0, 0.1);
+  for (let i = 1; i < 6; i++) sub(3.0 + i * BEAT, 0.075);
+  for (let i = 0; i < 6; i++) bass(3.0 + i * BEAT + E8, nz('D2') * (i % 2 ? 1.5 : 1), 0.085);
+  const arpB = ['A4', 'D5', 'F5', 'D5'];
+  for (let i = 2; i < 12; i++) pluck(3.0 + i * E8, nz(arpB[i % 4]), 0.05, i % 2 ? 0.3 : -0.3, 0.28, 4200, 0.4);
+  for (let i = 0; i < 12; i++) noiseHit(3.0 + i * E8 + E16, 0.03, 'highpass', 8500, 0.7, 0.02, i % 2 ? 0.3 : -0.3);   // crickets
+  for (let i = 0; i < 3; i++) pluck(q.crystal + i * E16, nz(['D5', 'F5', 'A5'][i]), 0.03, -0.4 + i * 0.1, 0.3, 6000, 0.45);   // the crystals shoot up
+  to = 's';
+  for (let i = 0; i < 3; i++) blip(q.tree + i * E8, 420 + i * 90, 900 + i * 140, 0.07, 0.04, i === 2 ? 0.4 : -0.4);          // the pines pop up
+  for (let i = 0; i < 3; i++) { blip(q.birds + 0.1 + i * 0.22, 2400, 3300, 0.035, 0.016, -0.5); blip(q.birds + 0.17 + i * 0.22, 3000, 2500, 0.03, 0.012, -0.5); }   // birds
+  blip(q.cap, 900, 1700, 0.07, 0.03, -0.1);                                                              // the snow cap
+  sweep(2.45, 3.0, 0.012, 500, 3000, 0);                                                                // into the morph
+  noiseHit(3.0, 0.3, 'bandpass', 1400, 1.0, 0.03, 0, 0.3, 500);
+  for (let i = 0; i < 8; i++) blip(q.stars + i * 0.07, 2600 + (i * 370) % 1500, 2400 + (i * 370) % 1500, 0.02, 0.014, (i % 3 - 1) * 0.5);   // stars pop in
+  blip(q.look, 500, 900, 0.1, 0.035, 0.3);                                                              // the fox looks up
+  blip(q.twitch, 1300, 1700, 0.03, 0.02, 0.3); blip(q.twitch + 0.25, 1300, 1700, 0.03, 0.02, 0.3);      // its ear flicks twice
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

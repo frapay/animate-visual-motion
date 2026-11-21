@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1040; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LIQUID DEMO — 9:16, 6.0s @ 120 BPM, 24fps. On a light ground a wave band sweeps away, Tetes the drop falls
+//  into its puddle and splashes while a coral blob of ideas pulls droplets in and out of itself. At 3.0s the
+//  blob morphs into a rounded heart on a deep ground: waves roll, bubbles rise, the heart drips into the water
+//  and Tetes pops up to ride the wave. Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/liquid/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneIde()], [3, 6, () => sceneKarya()]];
+const SHOTS = [
+  ['ide',   0, 0.0, 3.0, 'a wave sweeps off; the drop falls into its puddle and splashes; a blob of ideas merges and splits'],
+  ['karya', 1, 3.0, 6.0, 'the blob becomes a heart over rolling waves; it drips, bubbles rise, the drop rides the wave'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { fall: 0.25, land: 0.75, split1: 1.0, split2: 1.5, join: 2.0, waves: 3.2, pop: 3.75, drip1: 4.0, drip2: 5.0 },
+  acts: [
+    { name: '1 Ide',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Karya', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.5, title: 'ideas flow', sound: 'soft pad, marimba, a plop', next: 'the blob becomes a heart' },
+    { t: 5.0, title: 'the work is loved', sound: 'kick, arpeggio, drips', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

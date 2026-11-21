@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Constellation demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #03040c; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  CONSTELLATION DEMO — 9:16, 6.0s @ 120 BPM, 24fps. The night sky fades up under a full moon. Kejora, a little
+//  gold star, flies from star to star lighting them, and the lines join into a boat (perahu) that rocks on dotted
+//  waves. At 3.0s the round moon morphs into a ringed planet at the centre of a chart ring; its moons run round
+//  their orbit, Kejora lights a bird (burung) constellation above it and a shooting star crosses.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/constellation/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneBintang()], [3, 6, () => sceneLangit()]];
+const SHOTS = [
+  ['bintang', 0, 0.0, 3.0, 'the sky fades up; the little gold star lights eight stars and the lines join into a boat under the full moon'],
+  ['langit',  1, 3.0, 6.0, 'the moon becomes a ringed planet in a chart ring; the gold star lights a bird; a shooting star crosses'],
+];
+// the times each line of a figure finishes (its far star lights then): stars land on the 8ths
+const BOAT_T = [0.25, 0.5, 0.75, 1.0, 1.25, 1.375, 1.5, 1.75, 2.0, 2.125, 2.25];
+const BIRD_T = [3.75, 4.0, 4.25, 4.5, 4.625, 4.75, 5.0, 5.125, 5.25, 5.5];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { first: 0.25, shoot1: 0.875, boat: 2.25, ring: 3.5, bird0: 3.75, shoot2: 4.875, bird: 5.5 },
+  acts: [
+    { name: '1 Bintang', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Langit',  role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.3, title: 'stars become a boat', sound: 'a slow pad, one bell per star, a soft whoosh', next: 'the moon becomes a planet' },
+    { t: 5.6, title: 'a sky full of signs', sound: 'the pad opens, bells climb, a shooting star', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

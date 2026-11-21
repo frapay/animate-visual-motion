@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI mockup demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #e6e8ee; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  UI MOCKUP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A feature launch for an invented to-do app, shown being used.
+//  Era 1, a phone on a light studio ground: the list loads out of skeletons, a touch dot taps the field, "Call the lab"
+//  is typed key by key, a tap on the add button drops a new row into the list and a banner confirms it. At 3.0s the
+//  app-icon tile becomes the accent card of era 2: the same app in a browser window on graphite, where a cursor
+//  switches the view (the chart and the count answer), the page scrolls, a lens magnifies the peak, a toggle flips
+//  and a banner drops in.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/ui-mockup/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+const HAND = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+const ERA_LIST = [[0, 3, () => scenePhone()], [3, 6, () => sceneBrowser()]];
+const SHOTS = [
+  ['phone',   0, 0.0, 3.0, 'a phone drifts in: the list loads out of skeletons, a tap focuses the field, a task is typed, a tap adds it as a new row, a banner confirms'],
+  ['browser', 1, 3.0, 6.0, 'the app icon becomes the count card in a browser window: a click switches the view and the chart answers, the page scrolls, a lens magnifies the peak, a toggle flips, a banner drops in'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { load: 0.2, tap: 0.5, type: 0.625, add: 1.75, toast: 1.875, kick: 2.0, seg: 4.0, scroll: 4.25, lens: 4.625, toggle: 5.0, toast2: 5.125 },
+  acts: [
+    { name: '1 Phone',   role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Browser', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.75, title: 'add it in one tap', sound: 'a light pluck pulse, a soft tap, key ticks while it types, a pop and a two-note chime', next: 'the app icon becomes the count card' },
+    { t: 5.0, title: 'watch it add up', sound: 'the pulse opens up; a mouse click, bars rising as plucks, a toggle blip, a chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

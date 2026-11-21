@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diorama demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d080d; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  DIORAMA DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A paper-cut light box of one valley. "Senja": under a low sun the
+//  sheets rise one behind the other — far hills, a village with a small mosque, the ridge where a deer grazes, the
+//  near ground, a frame of leaves — while clouds and birds drift. At 3.0s the sun disc becomes a hanging paper
+//  lantern and the same valley is seen at night ("Malam"): moon, punched stars, windows lighting one by one,
+//  fireflies, and the deer walking in and looking up at the lantern.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/diorama/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneSenja()], [3, 6, () => sceneMalam()]];
+const SHOTS = [
+  ['senja', 0, 0.0, 3.0, 'dusk: the valley builds sheet by sheet under a low sun; clouds, birds, falling leaves; a deer grazes and lifts its head'],
+  ['malam', 1, 3.0, 6.0, 'the sun disc becomes a paper lantern; the same valley at night: moon, stars, windows lighting up, fireflies, the deer'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { vil: 0.25, ridge: 0.6, near: 0.95, leaves: 1.3, birds: 0.7, look: 2.0,
+          stars: 3.3, near2: 3.2, leaves2: 3.35, deer: 3.6, stop: 4.6, win1: 4.0, win2: 4.25, win3: 4.5, win4: 4.75, win5: 5.0, flies: 4.2, look2: 4.8, ear: 5.3 },
+  acts: [
+    { name: '1 Senja', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Malam', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'dusk falls on the valley', sound: 'a music box, a warm pad, paper sliding', next: 'the sun becomes a lantern' },
+    { t: 5.3, title: 'night: the lanterns are lit', sound: 'a lower pad, chimes as windows light, crickets', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
