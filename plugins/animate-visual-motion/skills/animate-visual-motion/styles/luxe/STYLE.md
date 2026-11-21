@@ -102,7 +102,7 @@ Liquids (`LUX.liquid`): `amber` `#421603` `#bd610f` `#ffc45c`; `rose`; `clear`. 
 
 - Built from the genre's conventions (perfume and jewellery films), not measured against one reference film; products, names and the monogram are invented.
 - The lighting is a 2D fake. Gold bands follow the shape's bounding box, not its form; a strongly 3D object needs its parts drawn as separate outlines (as the ring and the bow do).
-- Satin folds only run along the cloth: no cross wrinkles, no folds that overlap each other, no knots. Up close a drape shows a faint row texture from the mesh; `soft` hides most of it.
+- Satin folds only run along the cloth: no cross wrinkles, no folds that overlap each other, no knots. The mesh is 160 rows deep and the scaled-up cloth gets a small blur, so a drape is smooth at full resolution; this costs render time (the satin is the slowest part of a frame).
 - Marble veins are a seeded random walk: now and then a slab puts a strong vein behind the caption or the product. Change `key` for another slab. `lxTable`'s perspective is row scaling, so far veins compress and near ones enlarge.
 - The mirror image is a flip with a blur (`ctx.filter`) and a gradient mask: no ripple, no real refraction. It costs a full-frame composite per call.
 - The stone is always a round brilliant seen from above; there is no side view and no other cut. `lxGoldConic` needs `createConicGradient` (current Chromium, Safari and Firefox); without it the ring falls back to a linear gradient.

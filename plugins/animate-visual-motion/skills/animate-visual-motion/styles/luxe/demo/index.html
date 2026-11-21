@@ -860,7 +860,7 @@ function lxSilkTone(c) {
 //    fall ([brightness at the start, ..., at the end]: two or more values along the cloth), shadow (alpha of a soft shadow under it, for cloth lying on the slab),
 //    soft (1 = crisp, 2 = default, 3–4 = out of focus: the cloth is drawn at 1/soft size and scaled up), a, nu (columns; default one per ~5 px of width), nv
 function lxSilk(spine, o = {}) {
-  const lut = lxSilkTone(o.color), key = o.key ?? 'silk', R = RNG('lxsilk', key), NV = o.nv ?? 48, NU = o.nu ?? Math.round(clamp((Array.isArray(o.w) ? Math.max(...o.w) : typeof o.w === 'number' ? o.w : 600) / 5.5, 90, 250)), folds = o.folds ?? 5, depth = o.depth ?? 1, z = lxZ();
+  const lut = lxSilkTone(o.color), key = o.key ?? 'silk', R = RNG('lxsilk', key), NV = o.nv ?? 160, NU = o.nu ?? Math.round(clamp((Array.isArray(o.w) ? Math.max(...o.w) : typeof o.w === 'number' ? o.w : 600) / 5.5, 90, 250)), folds = o.folds ?? 5, depth = o.depth ?? 1, z = lxZ();
   const S = lxSpine(spine, NV), wf = typeof o.w === 'function' ? o.w : Array.isArray(o.w) ? (v) => lxArr(o.w, v) : () => o.w ?? 400;
   const k = [0, 1, 2, 3, 4, 5].map(() => R.r(0, TAU)), sheen = o.sheen ?? TT * 0.55, light = (o.light ?? -0.45) + 0.3 * Math.sin(sheen + k[5]), travel = o.travel ?? mod(TT * 0.17 + k[5], 1.5) - 0.25;
   const fall = o.fall ?? [1, 1];
@@ -911,7 +911,7 @@ function lxSilk(spine, o = {}) {
   } finally { ctx = main; }
   if (soft > 1) {
     const cv = LUX_CACHE['silkscratch' + (LUX_LITE ? 'L' : '')];
-    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'low'; if (o.a != null) ctx.globalAlpha = clamp(o.a);
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.filter = 'blur(' + (soft * 0.9).toFixed(1) + 'px)'; if (o.a != null) ctx.globalAlpha = clamp(o.a);
     ctx.drawImage(cv, 0, 0, cv.width * soft, cv.height * soft); ctx.restore();
   }
 }
