@@ -4,14 +4,14 @@
     "name": "frapay"
   },
   "metadata": {
-    "description": "Procedural animated videos made in code (canvas + synthesized score → MP4), in 50 built-in styles.",
+    "description": "Procedural animated videos made in code (canvas + synthesized score → MP4), in 55 built-in styles.",
     "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "animate-visual-motion",
       "source": "./plugins/animate-visual-motion",
-      "description": "Make short procedural animations — explainers, histories, stories, product launches — as single-file canvas videos with a synthesized score, rendered to MP4. 50 built-in styles plus new ones from your references.",
+      "description": "Make short procedural animations — explainers, histories, stories, product launches — as single-file canvas videos with a synthesized score, rendered to MP4. 55 built-in styles plus new ones from your references.",
       "version": "1.0.0",
       "category": "creative",
       "keywords": ["animation", "video", "motion-graphics", "canvas", "mp4", "explainer"]

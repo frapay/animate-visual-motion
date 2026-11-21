@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splash demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a0d00; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  SPLASH DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A freeze-frame drink commercial in two flavours. On a glowing orange
+//  ground a crown of juice erupts and an invented can pops up through it; orange wheels, ice and mint are thrown out
+//  and hang, a NEW badge slaps on, a glint crosses the cold can. At 3.0s the scene closes onto the can and it becomes
+//  a glass bottle on a lime-green ground: a second crown, lime wheels, mint, ice, a 0 SUGAR badge.
+//  Proves the style kit renders, morphs and stays deterministic. Both products and all copy are invented.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/splash/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneCitrus()], [3, 6, () => sceneLime()]];
+const SHOTS = [
+  ['citrus', 0, 0.0, 3.0, 'a crown of orange juice erupts, the can pops up through it; orange wheels, ice and mint hang in the air, a NEW badge slaps on, a glint crosses the can'],
+  ['lime',   1, 3.0, 6.0, 'the can becomes a glass bottle on a lime ground: a second crown, lime wheels, mint and ice thrown out, a 0 SUGAR badge, condensation runs'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { splash1: 0.125, pop: 0.125, head1: 0.5, badge1: 1.25, glint1: 1.75, morph: 3.0, splash2: 3.25, head2: 3.5, badge2: 4.25, glint2: 4.75 },
+  acts: [
+    { name: '1 Citrus', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Lime',   role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.5, title: 'the orange hit', sound: 'a splash and a sub on the first beat, fizz, a bright major riff; a pop for the badge', next: 'the scene closes onto the can: it becomes a bottle' },
+    { t: 5.0, title: 'the cold snap', sound: 'a second splash a step up, ice clinks, fizz, a chime for the badge', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

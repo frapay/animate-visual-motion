@@ -1,6 +1,6 @@
 ---
 name: animate-visual-motion
-description: Make a short procedural animation — an explainer, a history, a little story, a product launch — as a single-file canvas video with a synthesized score, rendered to MP4. Ships with 50 styles (e.g. cut paper, crosshatch, riso, pixel, wayang, batik, Islamic geometric, neon, kinetic type, claymation, watercolour, Art Deco, keynote reveal, bento grid, UI mockup; full list in styles/README.md) and makes new ones from the user's references. Walks through intake and three check-ins (story, look, storyboard) before animating, then proves the result with measured review checks. Use when the user asks for an animated video, short, explainer or reel made in code, or wants a look matched from references.
+description: Make a short procedural animation — an explainer, a history, a little story, a product launch — as a single-file canvas video with a synthesized score, rendered to MP4. Ships with 55 styles (e.g. cut paper, crosshatch, riso, pixel, wayang, batik, Islamic geometric, neon, kinetic type, claymation, watercolour, Art Deco, keynote reveal, bento grid, UI mockup; full list in styles/README.md) and makes new ones from the user's references. Walks through intake and three check-ins (story, look, storyboard) before animating, then proves the result with measured review checks. Use when the user asks for an animated video, short, explainer or reel made in code, or wants a look matched from references.
 argument-hint: "[what the video is about] [style or reference]"
 ---
 

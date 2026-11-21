@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luxe demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #070605; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LUXE DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A luxury still-life film. A faceted perfume bottle with a gold cap and
+//  amber liquid stands on polished black marble in front of a burgundy satin drape: the light comes up, the satin's
+//  sheen travels, a specular sweep crosses the gold and the glass, the cap glints. At 3.0s the frame closes onto the
+//  bottle and it becomes a cut stone: a solitaire ring lying on emerald marble across a champagne satin ribbon, seen
+//  from above, its facets flashing one after another, two four-point glints.
+//  Proves the style kit renders, morphs and stays deterministic. The products are invented and unbranded.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/luxe/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneFragrance()], [3, 6, () => sceneStone()]];
+const SHOTS = [
+  ['fragrance', 0, 0.0, 3.0, 'a perfume bottle on black marble before a satin drape: the light comes up, the sheen travels, a sweep crosses gold and glass, the cap glints'],
+  ['stone',     1, 3.0, 6.0, 'the bottle becomes a cut stone: a ring on emerald marble across a champagne ribbon, facets flashing, two star glints'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { light: 0.0, title: 0.5, sweep: 1.25, glint: 2.0, morph: 3.0, light2: 3.25, title2: 3.5, sweep2: 4.25, glint2: 4.5, glint3: 5.25 },
+  acts: [
+    { name: '1 Fragrance', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Stone',     role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.1, title: 'light, bottled', sound: 'a low warm pad, a slow harp figure, air that brightens with the sweep, a small bell on the glint', next: 'the frame closes onto the bottle: it becomes a cut stone' },
+    { t: 5.3, title: 'cut to catch it', sound: 'a warm major chord, high harp notes, two glassy bells on the star glints', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

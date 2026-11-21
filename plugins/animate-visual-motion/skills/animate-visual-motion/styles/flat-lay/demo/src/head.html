@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flat lay demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2622; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  FLAT LAY DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Looking straight down at a pale oak table: a coffee set slides in
+//  from the frame edges, one piece per eighth note, each turning and snapping square onto a 3 x 4 grid (a cup on its
+//  saucer, a carton, a spoon, a sugar bowl, a jar lid, a folded cloth), then beans and sugar cubes are set down, an
+//  arrow draws itself to the cup and "still warm" is written beside it. The coffee ripples, steam curls, a plant's
+//  shadow sways and a patch of sun drifts. At 3.0s the table closes onto the cup, the cup becomes a terracotta tin,
+//  and a linen table opens out of it: the tin is the hero in the middle and a skincare set arrives round it (a tube,
+//  a dropper bottle, sunglasses, a eucalyptus sprig, citrus slices, dried flowers), then a card is taped down and a
+//  numbered ingredient list writes itself while the numbered dots pop onto the things they name.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/flat-lay/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneCoffee()], [3, 6, () => sceneSkin()]];
+const SHOTS = [
+  ['coffee', 0, 0.0, 3.0, 'a coffee set slides in piece by piece and snaps square onto a grid on pale oak; beans and sugar are set down, a note is written to the cup'],
+  ['skin',   1, 3.0, 6.0, 'the cup becomes a terracotta tin on linen; a skincare set arrives round it and a numbered ingredient list writes itself'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { cup: 0.0, box: 0.25, spoon: 0.5, bowl: 0.75, tin: 1.0, cloth: 1.25, beans: 1.4, sugar: 1.5, note: 1.5,
+          tube: 3.35, bottle: 3.6, glasses: 3.85, sprig: 4.1, citrus: 4.35, flower: 4.5, card: 4.6, list: 4.95 },
+  acts: [
+    { name: '1 Coffee', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Skincare', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.3, title: 'a coffee set, knolled on oak', sound: 'a brushed shuffle; a slide and a soft wooden knock for every piece', next: 'the table closes onto the cup' },
+    { t: 5.7, title: 'the hero tin and what is in it, on linen', sound: 'the chord opens; soft knocks, pencil scratches, three little pops', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

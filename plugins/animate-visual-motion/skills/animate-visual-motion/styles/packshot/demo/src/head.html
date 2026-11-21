@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Packshot demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f7efe6; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  PACKSHOT DEMO — 9:16, 6.0s @ 120 BPM, 24fps. Two product ads in a sunlit pastel studio. On a sky-blue cyclorama a
+//  podium rises, an arch and a half-disc slide in, a pump bottle drops onto the podium and settles, a "NEW" pill
+//  pops, a callout points at it and a glint sweeps it while a palm shadow drifts on the wall. At 3.0s the set closes
+//  onto the bottle and it becomes a cream jar on a peach set: props slide in, a "50 ml" pill, a callout, the price pill,
+//  window-blind shadows drifting on the wall. The little yellow jar (the hero) sits beside the product in both.
+//  Proves the style kit renders, morphs and stays deterministic. Both products are invented and unbranded.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/packshot/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneSerum()], [3, 6, () => sceneCream()]];
+const SHOTS = [
+  ['serum', 0, 0.0, 3.0, 'a sky-blue studio: the podium rises, props slide in, a pump bottle drops and settles, a NEW pill pops, a callout points, a glint sweeps it'],
+  ['cream', 1, 3.0, 6.0, 'the bottle becomes a cream jar on a peach set: props slide in, a 50 ml pill, a callout, the price pill; blind shadows drift on the wall'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { rise: 0.05, arch: 0.15, disc: 0.3, drop: 0.5, hero: 0.95, ball: 1.1, badge: 1.3, call: 1.55, glint: 1.9,
+          morph: 3.0, arch2: 3.35, steps: 3.5, hero2: 3.7, ball2: 3.85, badge2: 4.05, call2: 4.3, price: 4.7, glint2: 5.1 },
+  acts: [
+    { name: '1 Serum', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Cream', role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.2, title: 'the serum lands', sound: 'a light marimba pattern in C; a soft thud as the bottle lands, a pop for the pill, a shimmer for the glint', next: 'the set closes onto the bottle: it becomes the jar' },
+    { t: 5.5, title: 'the cream, and its price', sound: 'the pattern lifts to F; pops as props arrive, a two-note chime for the price', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

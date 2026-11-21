@@ -1,0 +1,1771 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luxe demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #070605; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  LUXE DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A luxury still-life film. A faceted perfume bottle with a gold cap and
+//  amber liquid stands on polished black marble in front of a burgundy satin drape: the light comes up, the satin's
+//  sheen travels, a specular sweep crosses the gold and the glass, the cap glints. At 3.0s the frame closes onto the
+//  bottle and it becomes a cut stone: a solitaire ring lying on emerald marble across a champagne satin ribbon, seen
+//  from above, its facets flashing one after another, two four-point glints.
+//  Proves the style kit renders, morphs and stays deterministic. The products are invented and unbranded.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/luxe/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };          // keep content in x 60–940, y 250–1500
+const CX = 500;                                               // caption centre (left of the right-hand UI strip)
+
+const ERA_LIST = [[0, 3, () => sceneFragrance()], [3, 6, () => sceneStone()]];
+const SHOTS = [
+  ['fragrance', 0, 0.0, 3.0, 'a perfume bottle on black marble before a satin drape: the light comes up, the sheen travels, a sweep crosses gold and glass, the cap glints'],
+  ['stone',     1, 3.0, 6.0, 'the bottle becomes a cut stone: a ring on emerald marble across a champagne ribbon, facets flashing, two star glints'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  cues: { light: 0.0, title: 0.5, sweep: 1.25, glint: 2.0, morph: 3.0, light2: 3.25, title2: 3.5, sweep2: 4.25, glint2: 4.5, glint3: 5.25 },
+  acts: [
+    { name: '1 Fragrance', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Stone',     role: 'gift',  t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 2.1, title: 'light, bottled', sound: 'a low warm pad, a slow harp figure, air that brightens with the sweep, a small bell on the glint', next: 'the frame closes onto the bottle: it becomes a cut stone' },
+    { t: 5.3, title: 'cut to catch it', sound: 'a warm major chord, high harp notes, two glassy bells on the star glints', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/luxe/kit.js — a luxury still-life film for premium physical products (perfume, jewellery, watches,
+//  cosmetics, chocolate). Built on kit/core.js. Materials are the subject, all procedural: a polished marble slab
+//  with branching white and gold veins and a soft mirror image (lxMarble / lxTable), satin that flows in folds with
+//  a sheen that travels (lxSilk), banded polished and brushed gold for any outline or word (lxGold / lxGoldText),
+//  cut glass with liquid, facets and refraction lines (lxGlass), a brilliant-cut gem that flashes facet by facet
+//  (lxGem), four-point glints, warm bokeh discs, a thin haze. lxProduct('perfume' | 'ring' | 'lipstick' | 'gift', ...)
+//  draws an invented, unbranded product. Type is a high-contrast serif in gold foil, tracked caps, a thin gold rule
+//  and a monogram seal. The product never moves: the light does.
+//  Needs from the piece head: CX (caption centre x).
+// =====================================================================
+const LUX = {
+  ground: '#070605',                                   // the dark of the studio: the sheet a morph happens on
+  wall: '#2b1a10', ember: '#5a3416',                   // the warm lift on the wall behind the product
+  ivory: '#f4ecd9', cream: '#d8c9ab', taupe: '#93846c',   // type that is not gold
+  gold: { deep: '#2b1a06', lo: '#6a4413', mid: '#b3822e', base: '#d6ad58', hi: '#f8e4a4', white: '#fffbe6' },
+  marble: {                                            // base stone, its clouding, white veins, gold veins, the sheen it throws back
+    black:   { base: '#0b0a0b', cloud: '#232024', vein: '#ece6da', gold: '#d6ad58', sheen: '#6b4a2a', edge: '#f1dfb4' },
+    emerald: { base: '#041a13', cloud: '#0d4c38', vein: '#dcefe3', gold: '#e0bd68', sheen: '#2f7a5c', edge: '#e9f3d4' },
+    ivory:   { base: '#e6dccb', cloud: '#fbf6ea', vein: '#8a7d68', gold: '#b88d3a', sheen: '#fff4d8', edge: '#ffffff' },
+  },
+  silk: {                                              // lo (the valley of a fold), base, hi (the lit ridge)
+    champagne: { lo: '#4b3520', base: '#bf9b69', hi: '#f8e6c3' },
+    ivory:     { lo: '#6d6250', base: '#d9ccb4', hi: '#fffaee' },
+    burgundy:  { lo: '#22060b', base: '#7c1626', hi: '#e77a86' },
+    emerald:   { lo: '#04201a', base: '#0e6b50', hi: '#62cfa4' },
+    noir:      { lo: '#060607', base: '#2a2930', hi: '#b5b2c0' },
+  },
+  liquid: {
+    amber: { lo: '#421603', base: '#bd610f', hi: '#ffc45c' },
+    rose:  { lo: '#3d0d18', base: '#c04a66', hi: '#ffb3c0' },
+    clear: { lo: '#15191c', base: '#6f7f88', hi: '#e8f4fa' },
+  },
+  gem: { diamond: '#cfe6f5', emerald: '#1fae7a', ruby: '#d21f4a', sapphire: '#2c5fd6', amber: '#f0a030' },
+  grain: 0.02,                                         // fixed dither over the dark gradients (post)
+};
+const LUX_SERIF = 'Didot, "Bodoni 72", "Bodoni MT", "Playfair Display", "Libre Bodoni", "Noto Serif Display", "DejaVu Serif", Georgia, "Times New Roman", serif';
+const LUX_CACHE = {};                                  // static, keyed and seeded things only (marble slabs, colour ramps, grain)
+let LUX_LITE = false, LUX_SCRATCH = null;              // LITE: drawing a mirror image (no shadow, no nested mirror)
+
+// ---------------------------------------------------------------------
+//  colour, timing, small helpers
+// ---------------------------------------------------------------------
+const lxRGB = (c) => (c[0] === '#' ? [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16)) : c.match(/[\d.]+/g).slice(0, 3).map(Number));
+const lxHex = (v) => '#' + v.map((x) => Math.round(clamp(x, 0, 255)).toString(16).padStart(2, '0')).join('');
+const lxMix = (a, b, u) => { const x = lxRGB(a), y = lxRGB(b); return lxHex(x.map((v, i) => lerp(v, y[i], u))); };
+const lxA = (c, al) => { const [r, g, b] = lxRGB(c); return `rgba(${Math.round(r)},${Math.round(g)},${Math.round(b)},${clamp(al).toFixed(4)})`; };
+const lxW = (al) => `rgba(255,248,228,${clamp(al).toFixed(4)})`;         // the light is warm
+const lxK = (al) => `rgba(0,0,0,${clamp(al).toFixed(4)})`;
+const lxZ = () => Math.abs(ctx.getTransform().a) || 1;                    // the camera zoom: hairlines divide by it
+const lxIn = (t0, d = 0.6) => EZ.io(seg(TT, t0, t0 + d));                 // ease in-out from t0 over d: the only curve this look uses
+const lxPoly = (P) => { ctx.beginPath(); P.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath(); };   // a sharp-cornered outline (trace() rounds)
+const lxArr = (a, v) => { const f = clamp(v) * (a.length - 1), i = Math.min(a.length - 2, Math.floor(f)); return lerp(a[i], a[i + 1], f - i); };
+function lxRamp(stops, u) {                                               // [[t, hex], ...] -> hex at u
+  if (u <= stops[0][0]) return stops[0][1];
+  for (let i = 1; i < stops.length; i++) if (u <= stops[i][0]) return lxMix(stops[i - 1][1], stops[i][1], (u - stops[i - 1][0]) / (stops[i][0] - stops[i - 1][0]));
+  return stops[stops.length - 1][1];
+}
+// a three-tone material (lo, base, hi) from a preset name, an object, or any base colour (hex, or the renderer's rgb() blend)
+function lxTone(table, c, fallback) {
+  if (c && typeof c === 'object') return c;
+  if (table[c ?? fallback]) return table[c ?? fallback];
+  const base = lxHex(lxRGB(c));
+  return { lo: lxMix(base, '#000000', 0.76), base, hi: lxMix(base, '#ffffff', 0.62) };
+}
+function lxBridgeK() {                                                    // 1 outside bridges, 0 inside: type steps aside for the morph
+  if (typeof BRIDGES === 'undefined') return 1;
+  let k = 1; for (const r of BRIDGES) k = Math.min(k, clamp((Math.abs(TT - r.tc) - (r.d ?? 0.6)) / 0.2));
+  return k;
+}
+const lxDefer = (f) => { if (DEFER) DEFER.push(f); else f(); };
+function lxSpine(K, n) {                                                  // a smooth curve through control points K: n + 1 samples
+  const m = K.length - 1, out = [];
+  for (let i = 0; i <= n; i++) {
+    const f = i / n * m, k = Math.min(m - 1, Math.floor(f)), t = f - k, p0 = K[Math.max(0, k - 1)], p1 = K[k], p2 = K[k + 1], p3 = K[Math.min(m, k + 2)];
+    out.push([0, 1].map((d) => 0.5 * (2 * p1[d] + (-p0[d] + p2[d]) * t + (2 * p0[d] - 5 * p1[d] + 4 * p2[d] - p3[d]) * t * t + (-p0[d] + 3 * p1[d] - 3 * p2[d] + p3[d]) * t * t * t)));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
+//  the room: a warm lift on a dark wall, a vignette, bokeh, haze, glints
+// ---------------------------------------------------------------------
+function lxVignette(al = 0.62) {
+  ctx.save(); screen();
+  const g = ctx.createRadialGradient(W / 2, H * 0.5, Math.min(W, H) * 0.4, W / 2, H * 0.5, Math.hypot(W, H) * 0.58);
+  g.addColorStop(0, lxK(0)); g.addColorStop(1, lxK(al)); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
+}
+// the wall: near-black with one warm pool of light behind the product. o: cx, cy, r, light 0..1, color, ground
+function lxWall(o = {}) {
+  const cx = o.cx ?? W / 2, cy = o.cy ?? H * 0.42, r = o.r ?? 900, L = clamp(o.light ?? 1);
+  fillAll(o.ground ?? LUX.ground);
+  ctx.save();
+  const g = ctx.createRadialGradient(cx, cy, 30, cx, cy, r);
+  g.addColorStop(0, lxA(o.color ?? LUX.ember, 0.75 * L)); g.addColorStop(0.4, lxA(LUX.wall, 0.6 * L)); g.addColorStop(1, lxA(LUX.wall, 0));
+  ctx.fillStyle = g; ctx.fillRect(-W, -H, W * 3, H * 3); ctx.restore();
+}
+// warm out-of-focus discs drifting in the dark. o: n, key, a, area { x0, y0, x1, y1 }, rmin, rmax, colors, speed
+function lxBokeh(o = {}) {
+  const a = clamp(o.a ?? 1); if (a <= 0.003) return;
+  const n = o.n ?? 14, R = RNG('lxbokeh', o.key ?? 'bokeh'), ar = o.area ?? { x0: 0, y0: 0, x1: W, y1: H }, sp = o.speed ?? 1;
+  const cols = o.colors ?? [LUX.gold.hi, LUX.gold.base, '#ffb866', LUX.ivory, '#e08a3c'];
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < n; i++) {
+    const x0 = R.r(ar.x0, ar.x1), y0 = R.r(ar.y0, ar.y1), r = R.r(o.rmin ?? 22, o.rmax ?? 86), c = R.pick(cols), ph = R.r(0, TAU), w1 = R.r(0.12, 0.3), w2 = R.r(0.1, 0.24), vy = R.r(4, 14), al0 = R.r(0.05, 0.17);
+    const x = x0 + Math.sin(TT * w1 * sp + ph) * 34, y = y0 - TT * vy * sp + Math.cos(TT * w2 * sp + ph * 2) * 22;
+    const al = a * al0 * (0.6 + 0.4 * Math.sin(TT * 0.7 * sp + ph * 3));
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);                  // a lens disc: nearly flat, a slightly brighter rim, a soft edge
+    g.addColorStop(0, lxA(c, al * 0.55)); g.addColorStop(0.78, lxA(c, al * 0.7)); g.addColorStop(0.92, lxA(c, al)); g.addColorStop(1, lxA(c, 0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+// a thin haze: a few very large soft veils sliding sideways. o: a, key, y0, y1, color, n
+function lxHaze(o = {}) {
+  const a = clamp(o.a ?? 1); if (a <= 0.003) return;
+  const R = RNG('lxhaze', o.key ?? 'haze'), n = o.n ?? 5, y0 = o.y0 ?? H * 0.25, y1 = o.y1 ?? H * 0.8, c = o.color ?? '#c9a27a';
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < n; i++) {
+    const r = R.r(360, 640), y = R.r(y0, y1), ph = R.r(0, TAU), v = R.r(10, 26) * (R.f() < 0.5 ? -1 : 1), x = mod(R.r(0, W) + TT * v, W + r * 2) - r, al = a * R.r(0.025, 0.055) * (0.75 + 0.25 * Math.sin(TT * 0.5 + ph));
+    ctx.save(); ctx.translate(x, y); ctx.scale(1, 0.34);
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, r); g.addColorStop(0, lxA(c, al)); g.addColorStop(1, lxA(c, 0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill(); ctx.restore();
+  }
+  ctx.restore();
+}
+// a four-point star glint with a small halo. s = the long spike's half-length.
+// o: a 0..1, or at + dur (one brief flash), or every + off + dur (a flash that returns), rot, color
+function lxGlint(x, y, s, o = {}) {
+  let a = clamp(o.a ?? 1);
+  if (o.at != null) a *= Math.sin(Math.PI * seg(TT, o.at, o.at + (o.dur ?? 0.5))) ** 1.4;
+  else if (o.every) a *= Math.sin(Math.PI * clamp(mod(TT + (o.off ?? 0), o.every) / (o.dur ?? 0.5))) ** 1.4;
+  if (a <= 0.01) return;
+  const c = o.color ?? '#fff6dc', L = s * (0.45 + 0.55 * a);
+  ctx.save(); ctx.translate(x, y); ctx.rotate((o.rot ?? 0) + (1 - a) * 0.25); ctx.globalCompositeOperation = 'lighter';
+  let g = ctx.createRadialGradient(0, 0, 0, 0, 0, L * 0.42); g.addColorStop(0, lxA(c, 0.7 * a)); g.addColorStop(0.35, lxA(c, 0.2 * a)); g.addColorStop(1, lxA(c, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, L * 0.42, 0, TAU); ctx.fill();
+  for (let i = 0; i < 8; i++) {
+    const diag = i % 2 === 1, len = L * (diag ? 0.36 : i % 4 === 0 ? 1 : 0.72), hw = L * (diag ? 0.022 : 0.034);
+    ctx.save(); ctx.rotate(i * Math.PI / 4);
+    g = ctx.createLinearGradient(0, 0, len, 0); g.addColorStop(0, lxA(c, a)); g.addColorStop(0.3, lxA(c, 0.55 * a)); g.addColorStop(1, lxA(c, 0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(0, -hw); ctx.lineTo(len, 0); ctx.lineTo(0, hw); ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  ctx.fillStyle = lxA('#ffffff', a); ctx.beginPath(); ctx.arc(0, 0, L * 0.045, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+// a soft dark band across the frame, so type keeps its dark empty space over a busy ground (world coords). al = its darkest
+function lxDim(y0, y1, al = 0.45) {
+  const g = ctx.createLinearGradient(0, y0, 0, y1); g.addColorStop(0, lxK(0)); g.addColorStop(0.35, lxK(al)); g.addColorStop(0.65, lxK(al)); g.addColorStop(1, lxK(0));
+  ctx.save(); ctx.fillStyle = g; ctx.fillRect(-W, y0, W * 3, y1 - y0); ctx.restore();
+}
+// the contact shadow where something stands on the slab
+function lxShadow(x, y, rx, o = {}) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(1, o.sq ?? 0.1);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx); g.addColorStop(0, lxK(o.a ?? 0.85)); g.addColorStop(0.6, lxK((o.a ?? 0.85) * 0.5)); g.addColorStop(1, lxK(0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rx, 0, TAU); ctx.fill(); ctx.restore();
+}
+// the polished slab's mirror: draw() again, flipped about y = floorY, fading with depth and a little soft. draw() must not draw text.
+function lxReflect(floorY, draw, o = {}) {
+  const al = o.a ?? 0.3; if (LUX_LITE || al <= 0.003) return;
+  const main = ctx, T = main.getTransform(), cv = main.canvas;
+  if (!LUX_SCRATCH || LUX_SCRATCH.width !== cv.width || LUX_SCRATCH.height !== cv.height) { LUX_SCRATCH = document.createElement('canvas'); LUX_SCRATCH.width = cv.width; LUX_SCRATCH.height = cv.height; }
+  const c2 = LUX_SCRATCH.getContext('2d'), spark = SPARK_AT, defer = DEFER;
+  c2.save(); c2.setTransform(1, 0, 0, 1, 0, 0); c2.globalAlpha = 1; c2.globalCompositeOperation = 'source-over'; c2.filter = 'none'; c2.clearRect(0, 0, cv.width, cv.height);
+  c2.setTransform(T); c2.translate(0, 2 * floorY); c2.scale(1, -1);
+  ctx = c2; DEFER = null; LUX_LITE = true;
+  try { draw(); } finally { ctx = main; DEFER = defer; SPARK_AT = spark; LUX_LITE = false; }
+  c2.setTransform(T); c2.globalAlpha = 1; c2.globalCompositeOperation = 'destination-in';
+  const depth = o.depth ?? 300, g = c2.createLinearGradient(0, floorY, 0, floorY + depth);
+  g.addColorStop(0, lxK(al)); g.addColorStop(0.5, lxK(al * 0.32)); g.addColorStop(1, lxK(0));
+  c2.fillStyle = g; c2.fillRect(-W * 4, floorY - H * 4, W * 9, H * 9);
+  c2.restore();
+  main.save(); main.setTransform(1, 0, 0, 1, 0, 0); if (o.blur) main.filter = `blur(${o.blur}px)`; main.drawImage(LUX_SCRATCH, 0, 0); main.restore();
+}
+
+// ---------------------------------------------------------------------
+//  marble: a seeded slab of stone, made once and kept
+// ---------------------------------------------------------------------
+function lxVein(g, R, x, y, a, len, w, col, al, depth, sc) {
+  const pts = [[x, y]], kids = [], n = Math.max(4, Math.floor(len / (6 * sc))), drift = R.n(0.004), ph = R.r(0, TAU), mf = R.r(0.03, 0.08);
+  for (let i = 0; i < n; i++) {
+    a += R.n(0.05) + drift + 0.022 * Math.sin(i * mf + ph); if (R.f() < 0.012) a += R.n(0.5);             // stone veins wander, then kink
+    x += Math.cos(a) * 6 * sc; y += Math.sin(a) * 6 * sc; pts.push([x, y]);
+    if (depth < 2 && R.f() < 0.011) kids.push([x, y, a + R.pick([-1, 1]) * R.r(0.15, 0.55), len * R.r(0.22, 0.5), i / n]);
+  }
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  for (const [wk, ak] of [[18, 0.025], [7, 0.07], [2.6, 0.3], [1, 1]]) {              // a soft bleed into the stone, then the vein's core
+    for (let c = 0; c < pts.length - 1; c += 4) {
+      const f = c / pts.length, taper = Math.sin(Math.PI * clamp(0.06 + f * 0.94)) ** 0.5, wv = w * sc * (0.3 + 0.7 * (0.5 + 0.5 * Math.sin(c * 0.05 + ph))) * taper;
+      g.beginPath(); pts.slice(c, c + 5).forEach(([px, py], i) => (i ? g.lineTo(px, py) : g.moveTo(px, py)));
+      g.lineWidth = Math.max(0.4, wv * wk); g.strokeStyle = lxA(col, al * ak * (0.12 + 0.88 * Math.sin(c * 0.017 + ph * 2) ** 2)); g.stroke();   // the core fades in and out along its run
+    }
+  }
+  for (const [kx, ky, ka, kl, kf] of kids) lxVein(g, R, kx, ky, ka, kl, w * 0.6 * (1 - kf * 0.3), col, al * 0.85, depth + 1, sc);
+}
+// the stone seen flat, as a canvas w x h. preset: 'black' | 'emerald' | 'ivory'
+function lxMarbleTex(preset = 'black', key = 'slab', w = 1280, h = 1280) {
+  const id = ['tex', preset, key, w, h].join('|'); if (LUX_CACHE[id]) return LUX_CACHE[id];
+  const m = LUX.marble[preset] || LUX.marble.black, cv = document.createElement('canvas'), R = RNG('lxmarble', preset, key), sc = Math.min(w, h) / 1000, light = preset === 'ivory';
+  cv.width = w; cv.height = h; const g = cv.getContext('2d');
+  g.fillStyle = m.base; g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 90; i++) {                                          // clouding: soft lighter and darker drifts inside the stone
+    const x = R.r(0, w), y = R.r(0, h), r = R.r(90, 420) * sc, dark = R.f() < 0.3, al = R.r(0.05, 0.24);
+    g.save(); g.translate(x, y); g.rotate(R.r(0, Math.PI)); g.scale(1, R.r(0.3, 0.8));
+    const gr = g.createRadialGradient(0, 0, 0, 0, 0, r); gr.addColorStop(0, dark ? lxA(light ? m.vein : '#000000', al * (light ? 0.35 : 1)) : lxA(m.cloud, al)); gr.addColorStop(1, lxA(m.cloud, 0));
+    g.fillStyle = gr; g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fill(); g.restore();
+  }
+  const flow = R.r(0.5, 0.95) * (R.f() < 0.5 ? 1 : -1);                    // the veins share one grain direction
+  const start = () => { const side = R.f(), t = R.f(); return side < 0.5 ? [t * w, -20 * sc, Math.abs(flow) + R.n(0.35)] : flow > 0 ? [-20 * sc, t * h, Math.abs(flow) - 0.4 + R.n(0.35)] : [w + 20 * sc, t * h, Math.PI - Math.abs(flow) + 0.4 + R.n(0.35)]; };
+  const dirOf = (a0, top) => (top ? (flow > 0 ? a0 : Math.PI - a0) : a0);
+  for (let i = 0; i < 150; i++) {                                         // mottling: small patches
+    const x = R.r(0, w), y = R.r(0, h), r = R.r(18, 90) * sc, al = R.r(0.04, 0.15), gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, R.f() < 0.45 ? lxK(light ? al * 0.3 : al * 1.6) : lxA(m.cloud, al)); gr.addColorStop(1, lxA(m.cloud, 0)); g.fillStyle = gr; g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  }
+  for (let i = 0; i < 9; i++) { const [x, y] = [R.r(0, w), R.r(0, h)]; lxVein(g, R, x, y, flow + R.n(0.4), R.r(500, 1200) * sc, R.r(10, 22), m.vein, R.r(0.05, 0.1), 2, sc); }      // broad ghost veins deep in the stone
+  for (let i = 0; i < 9; i++) { const [x, y] = [R.r(0, w), R.r(0, h)]; lxVein(g, R, x, y, flow + R.n(0.3), R.r(160, 520) * sc, R.r(0.6, 1.2), m.vein, R.r(0.08, 0.2), 1, sc); }   // a hairline network
+  for (let i = 0; i < 4; i++) { const s = start(), top = s[1] < 0; lxVein(g, R, s[0], s[1], dirOf(s[2], top), Math.hypot(w, h) * R.r(0.7, 1.2), R.r(2.4, 5.5), m.vein, R.r(0.65, 1), 0, sc); }   // the main white veins
+  for (let i = 0; i < 2; i++) { const s = start(), top = s[1] < 0; lxVein(g, R, s[0], s[1], dirOf(s[2], top), Math.hypot(w, h) * R.r(0.6, 1.1), R.r(1.8, 3.6), m.gold, R.r(0.8, 1), 0, sc); }      // and the gold ones
+  const img = g.getImageData(0, 0, w, h), d = img.data, RG = RNG('lxmarblegrain', preset, key);   // the stone's fine crystal grain
+  for (let i = 0; i < d.length; i += 4) { const v = (RG.f() - 0.5) * 9; d[i] += v; d[i + 1] += v; d[i + 2] += v; }
+  g.putImageData(img, 0, 0);
+  return (LUX_CACHE[id] = cv);
+}
+// the slab seen from straight above, filling the frame. o: preset, key, light 0..1, cx, cy (where the light pools), sweep (a slow sheen crossing; default by time)
+function lxMarble(o = {}) {
+  const preset = o.preset ?? 'black', m = LUX.marble[preset] || LUX.marble.black, pad = 60, L = clamp(o.light ?? 1), cx = o.cx ?? W / 2, cy = o.cy ?? H * 0.45;
+  ctx.drawImage(lxMarbleTex(preset, o.key ?? 'flat', W + pad * 2, H + pad * 2), -pad, -pad);
+  ctx.save();
+  let g = ctx.createRadialGradient(cx, cy, 80, cx, cy, 1250);              // the light falls off toward the edges
+  g.addColorStop(0, lxK(0)); g.addColorStop(0.5, lxK(0.24)); g.addColorStop(1, lxK(0.7)); ctx.fillStyle = g; ctx.fillRect(-pad, -pad, W + pad * 2, H + pad * 2);
+  ctx.globalCompositeOperation = 'lighter';
+  g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 720); g.addColorStop(0, lxA(m.sheen, 0.3 * L)); g.addColorStop(1, lxA(m.sheen, 0));
+  ctx.fillStyle = g; ctx.fillRect(-pad, -pad, W + pad * 2, H + pad * 2);
+  const sw = o.sweep ?? mod(TT * 0.11 + 0.2, 1.3) - 0.15, p = lerp(-400, W + H * 0.5 + 400, sw);   // the polish catches a soft bar of light that crosses slowly
+  g = ctx.createLinearGradient(p - 260, 0, p + 260, 0); g.addColorStop(0, lxW(0)); g.addColorStop(0.5, lxW(0.055 * L)); g.addColorStop(1, lxW(0));
+  ctx.transform(1, 0, -0.5, 1, 0, 0); ctx.fillStyle = g; ctx.fillRect(-pad - H, -pad, W + H * 2, H + pad * 2);
+  ctx.restore();
+}
+// the slab as a table top seen from a little above: its back edge is the line y = horizon, the stone runs to the bottom of the frame.
+// o: horizon, preset, key, light 0..1, cx (where the light pools), cy
+function lxTable(o = {}) {
+  const hor = o.horizon ?? 1040, preset = o.preset ?? 'black', m = LUX.marble[preset] || LUX.marble.black, pad = 80, L = clamp(o.light ?? 1), cx = o.cx ?? W / 2, z = lxZ();
+  const id = ['table', preset, o.key ?? 'table', hor, W, H].join('|');
+  if (!LUX_CACHE[id]) {                                                   // perspective by rows: far rows see more of the stone, squeezed
+    const tex = lxMarbleTex(preset, o.key ?? 'table', 2400, 1400), Hd = H - hor + pad, cw = W + pad * 2, cv = document.createElement('canvas'), d0 = Hd * 0.7;
+    cv.width = cw; cv.height = Hd; const g = cv.getContext('2d'), zmax = 1 / d0, zmin = 1 / (Hd + d0);
+    for (let j = 0; j < Hd; j++) { const zz = 1 / (j + d0), v = (zmax - zz) / (zmax - zmin), sw = tex.width * zz / zmax; g.drawImage(tex, (tex.width - sw) / 2, v * (tex.height - 3), sw, 2, 0, j, cw, 1); }
+    LUX_CACHE[id] = cv;
+  }
+  ctx.drawImage(LUX_CACHE[id], -pad, hor);
+  ctx.save(); ctx.beginPath(); ctx.rect(-pad, hor, W + pad * 2, H - hor + pad); ctx.clip();
+  let g = ctx.createLinearGradient(0, hor, 0, H);                           // polished stone is a dark mirror: it falls to black toward the camera
+  g.addColorStop(0, lxK(0.08)); g.addColorStop(0.45, lxK(0.28)); g.addColorStop(1, lxK(0.6)); ctx.fillStyle = g; ctx.fillRect(-pad, hor, W + pad * 2, H - hor + pad);
+  ctx.globalCompositeOperation = 'lighter'; ctx.translate(cx, o.cy ?? hor + 150); ctx.scale(1, 0.34);
+  g = ctx.createRadialGradient(0, 0, 0, 0, 0, 700); g.addColorStop(0, lxA(m.sheen, 0.5 * L)); g.addColorStop(0.5, lxA(m.sheen, 0.16 * L)); g.addColorStop(1, lxA(m.sheen, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 700, 0, TAU); ctx.fill();
+  ctx.restore();
+  ctx.save();                                                              // the slab's polished back edge catches the light
+  g = ctx.createLinearGradient(cx - 620, 0, cx + 620, 0); g.addColorStop(0, lxA(m.edge, 0)); g.addColorStop(0.5, lxA(m.edge, 0.5 * L)); g.addColorStop(1, lxA(m.edge, 0));
+  ctx.fillStyle = g; ctx.fillRect(cx - 620, hor - 1 / z, 1240, 2.5 / z); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  silk: a cloth that runs along a spine, shaded as satin folds; the sheen travels
+// ---------------------------------------------------------------------
+function lxSilkTone(c) {
+  const t = lxTone(LUX.silk, c, 'champagne'), id = 'silk|' + t.lo + t.base + t.hi;
+  if (!LUX_CACHE[id]) { const st = [[0, lxMix(t.lo, '#000000', 0.62)], [0.2, t.lo], [0.52, t.base], [0.86, t.hi], [1, lxMix(t.hi, '#ffffff', 0.4)]], lut = []; for (let i = 0; i < 256; i++) lut.push(lxRamp(st, i / 255)); LUX_CACHE[id] = lut; }
+  return LUX_CACHE[id];
+}
+// spine: control points the cloth runs along (a drape: top to bottom; a ribbon lying on the slab: any curve).
+// o: w (width: number | array along the spine | fn(v)), color (preset | hex | { lo, base, hi }), folds (how many across), depth 0..1.5 (how deep the folds are),
+//    key, light (angle the light comes from), sheen (phase of the travelling light; default by time), travel (0..1 where the bright bar is along the cloth),
+//    fall ([brightness at the start, ..., at the end]: two or more values along the cloth), shadow (alpha of a soft shadow under it, for cloth lying on the slab),
+//    soft (1 = crisp, 2 = default, 3–4 = out of focus: the cloth is drawn at 1/soft size and scaled up), a, nu (columns; default one per ~5 px of width), nv
+function lxSilk(spine, o = {}) {
+  const lut = lxSilkTone(o.color), key = o.key ?? 'silk', R = RNG('lxsilk', key), NV = o.nv ?? 48, NU = o.nu ?? Math.round(clamp((Array.isArray(o.w) ? Math.max(...o.w) : typeof o.w === 'number' ? o.w : 600) / 5.5, 90, 250)), folds = o.folds ?? 5, depth = o.depth ?? 1, z = lxZ();
+  const S = lxSpine(spine, NV), wf = typeof o.w === 'function' ? o.w : Array.isArray(o.w) ? (v) => lxArr(o.w, v) : () => o.w ?? 400;
+  const k = [0, 1, 2, 3, 4, 5].map(() => R.r(0, TAU)), sheen = o.sheen ?? TT * 0.55, light = (o.light ?? -0.45) + 0.3 * Math.sin(sheen + k[5]), travel = o.travel ?? mod(TT * 0.17 + k[5], 1.5) - 0.25;
+  const fall = o.fall ?? [1, 1];
+  // folds run along the cloth (their tone belongs to a column, so bands stay unbroken); they deepen and flatten slowly along it
+  const fold = (u) => { const ph = folds * TAU * (u + 0.035 * Math.sin(u * 9 + k[2])); return Math.sin(ph) + 0.3 * Math.sin(ph * 2.17 + k[3]) + 0.05 * Math.sin(ph * 4.3 + k[4]); };
+  const hgt = (u, v) => (1 + 0.26 * Math.sin(v * 5.3 + u * 6 + k[1])) * fold(u);
+  const wave = (u, v) => 0.05 * Math.sin(v * 4.2 + u * 2 + k[0]) + 0.02 * Math.sin(v * 9.1 + u * 7 + k[1]);   // and the whole cloth sways sideways
+  const G = [];
+  for (let j = 0; j <= NV; j++) {
+    const v = j / NV, p = S[j], a = S[Math.max(0, j - 1)], b = S[Math.min(NV, j + 1)], tl = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, nx = -(b[1] - a[1]) / tl, ny = (b[0] - a[0]) / tl, w = wf(v), row = [];
+    for (let i = 0; i <= NU; i++) { const u = i / NU, d = (u - 0.5 + wave(u, v)) * w + hgt(u, v) * depth * w * 0.009; row.push([p[0] + nx * d, p[1] + ny * d]); }
+    G.push(row);
+  }
+  if (o.shadow && !LUX_LITE) {                                            // cloth lying on the slab: a soft shadow down-right of it
+    ctx.save(); ctx.translate(14, 22); ctx.lineJoin = 'round';
+    const E = [...G.map((r) => r[0]), ...G.map((r) => r[NU]).reverse()];
+    for (let i = 0; i < 6; i++) { lxPoly(E); ctx.fillStyle = ctx.strokeStyle = lxK(o.shadow * 0.2); ctx.lineWidth = 8 + i * 13; ctx.fill(); ctx.stroke(); }
+    ctx.restore();
+  }
+  const e = 0.5 / NU, col = [], rows = [];
+  for (let i = 0; i < NU; i++) {                                          // a fold's tone belongs to its column: satin is a broad soft tone and a narrow bright ridge
+    const u = (i + 0.5) / NU, sl = (fold(u + e) - fold(u - e)) / (2 * e) / (folds * TAU), d = Math.max(0, Math.cos(Math.atan(sl * 0.95 * depth) - light));
+    col.push([0.08 + 0.62 * d * d * d + 0.3 * d ** 10, d ** 3, 1 - 0.4 * (2 * u - 1) ** 6]);
+  }
+  for (let j = 0; j < NV; j++) {
+    const v = (j + 0.5) / NV, bar = 0.3 * Math.exp(-(((v - travel) / 0.17) ** 2)), fv = lxArr(fall, v);   // the travelling bar of light; the light's fall along the cloth
+    rows.push([bar, fv]);
+  }
+  // drawn small and scaled up: the folds blend into each other, and cloth behind the product sits a little out of focus
+  const soft = Math.max(1, o.soft ?? 2), main = ctx, T = main.getTransform(), mc = main.canvas;
+  if (soft > 1) {
+    const sw = Math.ceil(mc.width / soft), sh = Math.ceil(mc.height / soft), id = 'silkscratch' + (LUX_LITE ? 'L' : '');
+    if (!LUX_CACHE[id] || LUX_CACHE[id].width !== sw || LUX_CACHE[id].height !== sh) { LUX_CACHE[id] = document.createElement('canvas'); LUX_CACHE[id].width = sw; LUX_CACHE[id].height = sh; }
+    ctx = LUX_CACHE[id].getContext('2d'); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, sw, sh);
+    ctx.setTransform(T.a / soft, T.b / soft, T.c / soft, T.d / soft, T.e / soft, T.f / soft);
+  }
+  try {
+    ctx.save();
+    for (let j = 0; j < NV; j++) {                                        // in raster order, each patch reaching under its right and lower neighbours: no seams, no stroke
+      const [bar, fv] = rows[j], j2 = Math.min(NV, j + 2), r0 = G[j], r1 = G[j2];
+      for (let i = 0; i < NU; i++) {
+        const i2 = Math.min(NU, i + 2), a = r0[i], b = r0[i2], c = r1[i2], dd = r1[i];
+        ctx.fillStyle = lut[Math.round(clamp((col[i][0] + bar * col[i][1]) * col[i][2] * fv) * (lut.length - 1))];
+        ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.lineTo(c[0], c[1]); ctx.lineTo(dd[0], dd[1]); ctx.closePath(); ctx.fill();
+      }
+    }
+    ctx.restore();
+  } finally { ctx = main; }
+  if (soft > 1) {
+    const cv = LUX_CACHE['silkscratch' + (LUX_LITE ? 'L' : '')];
+    ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'low'; if (o.a != null) ctx.globalAlpha = clamp(o.a);
+    ctx.drawImage(cv, 0, 0, cv.width * soft, cv.height * soft); ctx.restore();
+  }
+}
+
+// ---------------------------------------------------------------------
+//  gold: a banded metallic gradient for any outline, and for words
+// ---------------------------------------------------------------------
+const LUX_GOLD_STOPS = {
+  polished: [[0, 'lo'], [0.1, 'mid'], [0.22, 'hi'], [0.28, 'white'], [0.34, 'base'], [0.5, 'lo'], [0.6, 'deep'], [0.72, 'mid'], [0.84, 'hi'], [0.9, 'base'], [1, 'lo']],
+  brushed:  [[0, 'lo'], [0.25, 'mid'], [0.45, 'hi'], [0.56, 'base'], [0.8, 'mid'], [1, 'lo']],
+  round:    [[0, 'deep'], [0.13, 'mid'], [0.28, 'hi'], [0.34, 'white'], [0.42, 'base'], [0.68, 'lo'], [0.86, 'deep'], [0.94, 'mid'], [1, 'lo']],   // a turned form
+};
+function lxGoldGrad(x0, y0, x1, y1, kind = 'polished', shift = 0) {
+  const dx = (x1 - x0) * shift, dy = (y1 - y0) * shift, g = ctx.createLinearGradient(x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+  for (const [t, n] of LUX_GOLD_STOPS[kind] || LUX_GOLD_STOPS.polished) g.addColorStop(t, LUX.gold[n]);
+  return g;
+}
+function lxGoldConic(x, y, a0 = 0) {                                      // bands that run round a ring
+  if (!ctx.createConicGradient) return lxGoldGrad(x - 100, y - 100, x + 100, y + 100);
+  const g = ctx.createConicGradient(a0, x, y);
+  let t0 = 0;                                                             // five uneven lobes: polished metal mirrors the room as hard light and dark
+  for (const wd of [0.17, 0.24, 0.14, 0.26, 0.19]) { [[0, 'deep'], [0.14, 'lo'], [0.3, 'mid'], [0.48, 'base'], [0.64, 'hi'], [0.72, 'white'], [0.8, 'hi'], [0.9, 'base'], [0.97, 'lo']].forEach(([t, n]) => g.addColorStop(Math.min(1, t0 + t * wd), LUX.gold[n])); t0 += wd; }
+  g.addColorStop(1, LUX.gold.deep);
+  return g;
+}
+// fill outline P (points, or a function that builds the path; then give o.bb) with gold.
+// o: kind 'polished' | 'brushed' | 'round', dir 'h' | 'v' | angle (the way the bands run across), shift (-0.5..0.5: the bands slide as the light moves),
+//    spec 0..1 (a soft specular sweep crossing; outside 0..1 = none), specA, bevel (px: a lit top edge and a dark lower edge), sharp (corners stay sharp), a, bb
+function lxGold(P, o = {}) {
+  const fn = typeof P === 'function', bb = o.bb ?? bbox(P), w = bb.x1 - bb.x0, h = bb.y1 - bb.y0, cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, kind = o.kind ?? 'polished';
+  const path = () => (fn ? P() : o.sharp ? lxPoly(P) : trace(P, true)), box = () => ctx.fillRect(bb.x0 - 4, bb.y0 - 4, w + 8, h + 8);
+  const ang = o.dir === 'v' ? Math.PI / 2 : typeof o.dir === 'number' ? o.dir : 0, hl = (Math.abs(Math.cos(ang)) * w + Math.abs(Math.sin(ang)) * h) / 2, gx = Math.cos(ang) * hl, gy = Math.sin(ang) * hl;
+  ctx.save(); if (o.a != null) ctx.globalAlpha *= clamp(o.a); path(); ctx.clip();
+  ctx.fillStyle = lxGoldGrad(cx - gx, cy - gy, cx + gx, cy + gy, kind, o.shift ?? 0); box();
+  if (kind === 'brushed') {                                               // fine brush lines across the bands
+    const R = RNG('lxbrush', o.key ?? 'gold'), n = Math.min(160, Math.round((Math.abs(Math.sin(ang)) * w + Math.abs(Math.cos(ang)) * h) / 3)), px = -Math.sin(ang), py = Math.cos(ang), rr = Math.hypot(w, h) / 2;
+    ctx.lineWidth = 1.2;
+    for (let i = 0; i < n; i++) { const t = (i / n - 0.5) * 2 * rr + R.n(1.5), ox = cx + px * t, oy = cy + py * t; ctx.strokeStyle = R.f() < 0.5 ? lxA(LUX.gold.white, R.r(0.03, 0.16)) : lxA(LUX.gold.deep, R.r(0.04, 0.2)); ctx.beginPath(); ctx.moveTo(ox - Math.cos(ang) * rr, oy - Math.sin(ang) * rr); ctx.lineTo(ox + Math.cos(ang) * rr, oy + Math.sin(ang) * rr); ctx.stroke(); }
+  }
+  let g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1);                    // the lamp is overhead
+  g.addColorStop(0, lxW(0.2)); g.addColorStop(0.3, lxW(0)); g.addColorStop(0.7, lxK(0)); g.addColorStop(1, lxK(0.36)); ctx.fillStyle = g; box();
+  if (o.spec != null && o.spec > 0 && o.spec < 1) lxSpecBand(bb, o.spec, o.specA ?? 0.6, o.specW);
+  if (o.bevel) {
+    g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1); g.addColorStop(0, lxA(LUX.gold.white, 0.9)); g.addColorStop(0.4, lxA(LUX.gold.hi, 0.35)); g.addColorStop(1, lxA(LUX.gold.deep, 0.75));
+    path(); ctx.lineJoin = 'miter'; ctx.lineWidth = o.bevel * 2; ctx.strokeStyle = g; ctx.stroke();
+  }
+  ctx.restore(); return bb;
+}
+// a soft slanted band of light crossing a bbox at position u (0..1); drawn into the current clip
+function lxSpecBand(bb, u, al = 0.5, bw) {
+  const w = bb.x1 - bb.x0, h = bb.y1 - bb.y0, dx = 0.974, dy = 0.225, p0 = bb.x0 * dx + bb.y0 * dy, p1 = bb.x1 * dx + bb.y1 * dy, b = bw ?? Math.max(w, h * 0.4) * 0.22, p = lerp(p0 - b, p1 + b, u);
+  const g = ctx.createLinearGradient(dx * (p - b), dy * (p - b), dx * (p + b), dy * (p + b));
+  g.addColorStop(0, lxW(0)); g.addColorStop(0.4, lxW(al * 0.3)); g.addColorStop(0.5, lxW(al)); g.addColorStop(0.6, lxW(al * 0.3)); g.addColorStop(1, lxW(0));
+  ctx.save(); ctx.globalCompositeOperation = 'screen'; ctx.fillStyle = g; ctx.fillRect(bb.x0 - 4, bb.y0 - 4, w + 8, h + 8); ctx.restore();
+}
+// one line of gold-foil lettering (y = baseline). o: weight, italic, track (em), align, a, font,
+//    reveal 0..1 (a wipe of light uncovers it left to right), spec 0..1 (a later band of light crossing the letters), flat (one tone, for small sizes)
+function lxGoldText(str, x, y, size, o = {}) {
+  const al = clamp(o.a ?? 1), rev = clamp(o.reveal ?? 1); if (al <= 0.004 || rev <= 0) return 0;
+  ctx.save(); ctx.font = `${o.italic ? 'italic ' : ''}${o.weight ?? 400} ${size}px ${o.font ?? LUX_SERIF}`;
+  const tr = (o.track ?? 0) * size, hasLS = 'letterSpacing' in ctx; if (hasLS) ctx.letterSpacing = tr.toFixed(2) + 'px';
+  const w = ctx.measureText(str).width - (hasLS ? tr : 0), align = o.align ?? 'left', x0 = align === 'center' ? x - w / 2 : align === 'right' ? x - w : x, pad = size * 0.3;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.globalAlpha = al;
+  if (rev < 1) { ctx.beginPath(); ctx.rect(x0 - pad, y - size * 1.2, (w + pad * 2) * rev, size * 1.7); ctx.clip(); }
+  ctx.fillStyle = lxK(0.55); ctx.fillText(str, x0, y + Math.max(1.5, size * 0.03));            // pressed into the surface
+  let g;
+  if (o.flat) g = LUX.gold.base;
+  else { g = ctx.createLinearGradient(0, y - size * 0.74, 0, y + size * 0.2); [[0, 'hi'], [0.2, 'white'], [0.42, 'base'], [0.56, 'mid'], [0.64, 'hi'], [0.82, 'base'], [1, 'mid']].forEach(([t, n]) => g.addColorStop(t, LUX.gold[n])); }
+  ctx.fillStyle = g; ctx.fillText(str, x0, y);
+  const band = (p, bw, a2) => { const b = ctx.createLinearGradient(p - bw, 0, p + bw * 0.25, 0); b.addColorStop(0, lxA('#ffffff', 0)); b.addColorStop(0.8, lxA('#ffffff', a2)); b.addColorStop(1, lxA('#ffffff', 0)); ctx.fillStyle = b; ctx.fillText(str, x0, y); };
+  if (rev < 1) band(x0 - pad + (w + pad * 2) * rev, size * 1.3, 0.95);                          // the light that uncovers it
+  if (o.spec != null && o.spec > 0 && o.spec < 1) band(lerp(x0 - size, x0 + w + size * 1.6, o.spec), size * 1.1, 0.8);
+  ctx.restore(); return w;
+}
+
+// ---------------------------------------------------------------------
+//  cut glass and gems
+// ---------------------------------------------------------------------
+// a thick glass body from any closed outline. o: tint (hex | rgb()), liquid { level 0..1, color (preset | hex), inset, base }, facets (x fractions of vertical cuts),
+//    spec 0..1, specA, rim 0..1, sharp, key, bb
+function lxGlass(P, o = {}) {
+  const bb = o.bb ?? bbox(P), w = bb.x1 - bb.x0, h = bb.y1 - bb.y0, cx = (bb.x0 + bb.x1) / 2, z = lxZ(), R = RNG('lxglass', o.key ?? 'glass');
+  const tint = lxHex(lxRGB(o.tint ?? '#5a3a1e')), path = (Q) => (o.sharp ? lxPoly(Q) : trace(Q, true)), box = () => ctx.fillRect(bb.x0 - 4, bb.y0 - 4, w + 8, h + 8), fac = o.facets ?? [0.2, 0.8], rim = clamp(o.rim ?? 1);
+  ctx.save(); path(P); ctx.clip();
+  let g = ctx.createLinearGradient(bb.x0, 0, bb.x1, 0);                    // dark, thick glass: brighter where the wall is thickest (the edges)
+  const d0 = lxMix(tint, '#000000', 0.9), d1 = lxMix(tint, '#000000', 0.74), d2 = lxMix(tint, '#000000', 0.45);
+  g.addColorStop(0, d2); g.addColorStop(0.07, d0); g.addColorStop(0.5, d1); g.addColorStop(0.93, d0); g.addColorStop(1, d2); ctx.fillStyle = g; box();
+  const lq = o.liquid, base = (lq?.base ?? 0.1) * h;
+  if (lq) {                                                               // the liquid: the outline again, smaller, cut off at its level
+    const ins = lq.inset ?? 0.07, lc = lxTone(LUX.liquid, lq.color, 'amber'), kx = 1 - ins * 2, ky = (h - base - ins * w) / h, top = bb.y1 - base - h * ky * clamp(lq.level ?? 0.84);
+    const Q = P.map(([px, py]) => [cx + (px - cx) * kx, bb.y1 - base + (py - bb.y1) * ky]);
+    ctx.save(); path(Q); ctx.clip(); ctx.beginPath(); ctx.rect(bb.x0, top, w, h); ctx.clip();
+    g = ctx.createLinearGradient(bb.x0 + w * ins, 0, bb.x1 - w * ins, 0); g.addColorStop(0, lc.lo); g.addColorStop(0.2, lc.base); g.addColorStop(0.44, lc.hi); g.addColorStop(0.62, lc.base); g.addColorStop(1, lc.lo); ctx.fillStyle = g; box();
+    g = ctx.createLinearGradient(0, top, 0, bb.y1 - base); g.addColorStop(0, lxK(0.42)); g.addColorStop(0.45, lxK(0)); g.addColorStop(0.7, lxA(lc.hi, 0)); g.addColorStop(1, lxA(lc.hi, 0.5)); ctx.fillStyle = g; box();   // light gathers at the bottom
+    ctx.fillStyle = lxA(lc.hi, 0.8); ctx.fillRect(bb.x0, top, w, 3 / z); ctx.fillStyle = lxK(0.3); ctx.fillRect(bb.x0, top + 3 / z, w, 5 / z);   // the meniscus
+    ctx.restore();
+  }
+  fac.forEach((f, i) => {                                                 // vertical cuts: the side facets take a different tone
+    const fx = bb.x0 + f * w;
+    ctx.fillStyle = f < 0.5 ? lxW(0.075) : lxK(0.28); ctx.fillRect(f < 0.5 ? bb.x0 : fx, bb.y0, f < 0.5 ? fx - bb.x0 : bb.x1 - fx, h);
+    ctx.fillStyle = lxW(0.34); ctx.fillRect(fx - 1 / z, bb.y0, 2 / z, h); ctx.fillStyle = lxK(0.4); ctx.fillRect(fx + 1 / z, bb.y0, 2 / z, h);
+  });
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 9; i++) {                                           // refraction in the thick base: short bright and dark slivers
+    const x0 = bb.x0 + R.r(0.06, 0.94) * w, lean = R.n(0.09) * w; ctx.strokeStyle = R.f() < 0.6 ? lxW(R.r(0.14, 0.5)) : lxK(R.r(0.3, 0.6)); ctx.lineWidth = R.r(1.5, 5) / z;
+    ctx.beginPath(); ctx.moveTo(x0, bb.y1 - base * R.r(0.75, 1)); ctx.lineTo(x0 + lean, bb.y1 - base * R.r(0, 0.2)); ctx.stroke();
+  }
+  ctx.fillStyle = lxW(0.2); ctx.fillRect(bb.x0, bb.y1 - base - 1 / z, w, 2 / z);
+  for (let i = 0; i < 3; i++) {                                           // long faint reflections lying across the face
+    const x0 = bb.x0 + R.r(0.25, 0.75) * w, bw = R.r(0.02, 0.06) * w; ctx.fillStyle = lxW(R.r(0.03, 0.07));
+    ctx.beginPath(); ctx.moveTo(x0, bb.y0); ctx.lineTo(x0 + bw, bb.y0); ctx.lineTo(x0 + bw - h * 0.22, bb.y1); ctx.lineTo(x0 - h * 0.22, bb.y1); ctx.closePath(); ctx.fill();
+  }
+  g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1); g.addColorStop(0, lxW(0)); g.addColorStop(0.14, lxW(0.62)); g.addColorStop(0.6, lxW(0.3)); g.addColorStop(0.9, lxW(0));   // the long highlight down the left
+  ctx.fillStyle = g; ctx.fillRect(bb.x0 + w * 0.085, bb.y0, w * 0.035, h); ctx.fillStyle = lxW(0.2); ctx.fillRect(bb.x0 + w * 0.925, bb.y0 + h * 0.1, 2.5 / z, h * 0.7);
+  if (o.spec != null && o.spec > 0 && o.spec < 1) lxSpecBand(bb, o.spec, o.specA ?? 0.5);
+  if (rim > 0) {                                                          // the glass edge: a bright line inside the outline
+    g = ctx.createLinearGradient(0, bb.y0, 0, bb.y1); g.addColorStop(0, lxW(0.85 * rim)); g.addColorStop(0.5, lxW(0.4 * rim)); g.addColorStop(1, lxW(0.55 * rim));
+    path(P); ctx.lineJoin = 'miter'; ctx.strokeStyle = lxW(0.1 * rim); ctx.lineWidth = 16 / z; ctx.stroke(); ctx.strokeStyle = g; ctx.lineWidth = 5 / z; ctx.stroke();
+  }
+  ctx.restore(); return bb;
+}
+const lxGemPts = (x, y, r, n = 96) => ellipsePts(x, y, r, r, 0, n);
+// a round brilliant-cut stone seen from above: table, star, kite and girdle facets that flash one after another as the light turns.
+// o: color (preset | hex), light (angle of the light; default by time), rot, glint 0..1 (a four-point star on the table edge), key, anchor (sets SPARK_AT)
+function lxGem(x, y, r, o = {}) {
+  const base = LUX.gem[o.color ?? 'diamond'] ?? lxHex(lxRGB(o.color)), R = RNG('lxgem', o.key ?? 'gem'), light = o.light ?? TT * 0.85, a0 = (o.rot ?? 0) - Math.PI / 2 + Math.PI / 8, z = lxZ();
+  if (o.anchor && !LUX_LITE) SPARK_AT = toScreen(x, y);
+  const st = [[0, lxMix(base, '#000000', 0.88)], [0.3, lxMix(base, '#000000', 0.5)], [0.58, base], [0.82, lxMix(base, '#ffffff', 0.62)], [1, '#ffffff']], fire = ['#ffb347', '#7fe3ff', '#ff8fb0', '#b9ff9a'];
+  const pt = (rad, k) => [x + Math.cos(a0 + k * Math.PI / 8) * rad * r, y + Math.sin(a0 + k * Math.PI / 8) * rad * r];
+  const Fs = [];                                                          // [points, direction (16ths of a turn), class]
+  for (let i = 0; i < 8; i++) {
+    const k = i * 2;
+    Fs.push([[pt(1.04, k), pt(1.04, k + 1), pt(0.72, k + 1)], k + 0.5, 2], [[pt(1.04, k + 1), pt(1.04, k + 2), pt(0.72, k + 1)], k + 1.5, 2]);   // upper girdle
+    Fs.push([[pt(0.5, k), pt(0.72, k + 1), pt(1.04, k), pt(0.72, k - 1)], k, 1]);                                                              // kite
+    Fs.push([[pt(0.5, k), pt(0.5, k + 2), pt(0.72, k + 1)], k + 1, 0]);                                                                        // star
+    Fs.push([[[x, y], pt(0.5, k), pt(0.46, k + 1)], k + 0.5, 3], [[[x, y], pt(0.46, k + 1), pt(0.5, k + 2)], k + 1.5, 3]);                       // the pavilion, seen through the table
+  }
+  for (let i = 0; i < 8; i++) Fs.push([[[x, y], pt(0.25, i * 2 - 0.6), pt(0.33, i * 2), pt(0.25, i * 2 + 0.6)], i * 2, 4]);                      // the arrows round the culet
+  const off = [0, 1.9, 3.4, 0.8, 2.7], lobes = [2, 1, 3, 2, 1], sp = [1, -0.7, 1.3, -1.1, 0.9];
+  ctx.save(); ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.clip();
+  ctx.fillStyle = st[1][1]; ctx.fillRect(x - r, y - r, r * 2, r * 2); ctx.lineJoin = 'round';
+  for (const [Q, dir, cls] of Fs) {
+    const b = 0.5 + 0.5 * Math.cos(dir * Math.PI / 8 * lobes[cls] - light * sp[cls] + off[cls] + R.n(0.7)), lum = 0.1 + 0.5 * b * b + 0.5 * b ** 9, f = R.f(), fc = R.pick(fire);
+    let c = lxRamp(st, lum); if (lum > 0.62 && f < 0.3) c = lxMix(c, fc, 0.3);    // a little fire in the bright facets
+    lxPoly(Q); ctx.fillStyle = c; ctx.fill(); ctx.strokeStyle = lxW(cls === 4 ? 0.1 : 0.22); ctx.lineWidth = 1.2 / z; ctx.stroke();
+  }
+  let g = ctx.createRadialGradient(x - r * 0.4, y - r * 0.45, 0, x - r * 0.4, y - r * 0.45, r * 1.1);   // the lamp on the crown
+  g.addColorStop(0, lxW(0.3)); g.addColorStop(1, lxW(0)); ctx.globalCompositeOperation = 'lighter'; ctx.fillStyle = g; ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  ctx.globalCompositeOperation = 'source-over'; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.strokeStyle = lxW(0.75); ctx.lineWidth = 3 / z; ctx.stroke();
+  ctx.restore();
+  if (o.glint && !LUX_LITE) { const p = pt(0.5, 12); lxGlint(p[0], p[1], r * 1.5, { a: o.glint }); }
+}
+
+// ---------------------------------------------------------------------
+//  invented, unbranded products. lxProduct(kind, x, y, s, o): x = centre, y = where it stands, s = its height.
+//  o (all kinds): spec 0..1 (a specular sweep crossing gold and glass), shift (the gold's bands slide), glint 0..1, reflect (mirror alpha, 0 = none),
+//    shadow (false | 'drop' for a top-down shot), color, blur (softness of the mirror image), key
+// ---------------------------------------------------------------------
+function lxStand(x, y, w, h, draw, o) {
+  if (!LUX_LITE && o.shadow !== false && o.shadow !== 'drop') lxShadow(x, y, w * 0.66, { a: 0.9 });
+  if (o.shadow !== 'drop') lxReflect(y + 1, draw, { a: o.reflect ?? 0.34, depth: o.depth ?? h * 0.62, blur: o.blur ?? 2 });
+  draw();
+}
+// the bottle's silhouette (for bridges) and its glass body
+function lxBottleParts(x, y, s) {
+  const bw = 0.56 * s, bh = 0.62 * s, c1 = 0.03 * s, c2 = 0.1 * s, yb = y - bh, cw = 0.2 * s, ch = 0.055 * s, yc = yb - ch, kw = 0.27 * s, kh = 0.3 * s, yt = yc - kh, kc = 0.035 * s;
+  const body = [[x - bw / 2 + c2, yb], [x + bw / 2 - c2, yb], [x + bw / 2, yb + c2], [x + bw / 2, y - c1], [x + bw / 2 - c1, y], [x - bw / 2 + c1, y], [x - bw / 2, y - c1], [x - bw / 2, yb + c2]];
+  const cap = [[x - kw / 2 + kc, yt], [x + kw / 2 - kc, yt], [x + kw / 2, yt + kc], [x + kw / 2, yc], [x - kw / 2, yc], [x - kw / 2, yt + kc]];
+  const sil = [[x - kw / 2 + kc, yt], [x + kw / 2 - kc, yt], [x + kw / 2, yt + kc], [x + kw / 2, yc], [x + cw / 2, yc], [x + cw / 2, yb], ...body.slice(1, 8), [x - bw / 2 + c2, yb], [x - cw / 2, yb], [x - cw / 2, yc], [x - kw / 2, yc], [x - kw / 2, yt + kc]];
+  return { body, cap, sil, bw, bh, yb, yc, yt, cw, ch, kw, kh, kc };
+}
+// the outline a product is morphed from or to: 'perfume' (the whole bottle), 'gem' / 'ring' (the stone: s = the ring's height), 'lipstick', 'gift'
+function lxProductPts(kind, x, y, s) {
+  if (kind === 'perfume') return resample(lxBottleParts(x, y, s).sil, true, 14);
+  if (kind === 'ring') return lxGemPts(x, y - 0.77 * s, 0.225 * s);
+  if (kind === 'lipstick') return rrectPts(x - 0.13 * s, y - s, 0.26 * s, s, 0.05 * s, 8);
+  return rrectPts(x - 0.48 * s, y - 0.94 * s, 0.96 * s, 0.94 * s, 0.05 * s, 8);
+}
+// a faceted perfume bottle: thick cut glass, amber liquid, a gold collar and a faceted gold cap. o.liquid (preset | hex), o.level
+function lxPerfume(x, y, s, o = {}) {
+  const p = lxBottleParts(x, y, s), z = lxZ(), spec = o.spec, shift = o.shift ?? 0;
+  const draw = () => {
+    lxGlass(p.body, { sharp: true, tint: o.tint ?? '#6b3d17', liquid: { color: o.liquid ?? 'amber', level: o.level ?? 0.86, inset: 0.065, base: 0.11 }, facets: [0.19, 0.81], spec, key: o.key ?? 'perfume' });
+    ctx.save(); lxPoly(p.body); ctx.clip();                                 // the shoulders are cut: two bright facets
+    ctx.fillStyle = lxW(0.2); lxPoly([[x - p.bw / 2, p.yb], [x - p.bw / 2 + 0.1 * s, p.yb], [x - p.bw / 2 + 0.16 * s, p.yb + 0.06 * s], [x - p.bw / 2, p.yb + 0.2 * s]]); ctx.fill();
+    ctx.fillStyle = lxW(0.07); lxPoly([[x + p.bw / 2, p.yb], [x + p.bw / 2 - 0.1 * s, p.yb], [x + p.bw / 2 - 0.16 * s, p.yb + 0.06 * s], [x + p.bw / 2, p.yb + 0.2 * s]]); ctx.fill();
+    ctx.strokeStyle = lxW(0.3); ctx.lineWidth = 2 / z; ctx.beginPath(); ctx.moveTo(x - p.bw / 2 + 0.16 * s, p.yb + 0.06 * s); ctx.lineTo(x + p.bw / 2 - 0.16 * s, p.yb + 0.06 * s); ctx.stroke();
+    ctx.restore();
+    const lw = 0.2 * s, lh = 0.13 * s, ly = y - p.bh * 0.47;               // a small gold plaque with a lozenge (no lettering: it is mirrored in the slab)
+    ctx.save(); ctx.strokeStyle = lxGoldGrad(x - lw / 2, 0, x + lw / 2, 0, 'polished', shift); ctx.lineWidth = 3 / z; ctx.strokeRect(x - lw / 2, ly - lh / 2, lw, lh);
+    ctx.lineWidth = 1.2 / z; ctx.strokeRect(x - lw / 2 + 7, ly - lh / 2 + 7, lw - 14, lh - 14); ctx.restore();
+    lxGold([[x, ly - lh * 0.24], [x + lw * 0.13, ly], [x, ly + lh * 0.24], [x - lw * 0.13, ly]], { sharp: true, dir: 0.6, shift });
+    lxGold([[x - p.cw / 2, p.yc], [x + p.cw / 2, p.yc], [x + p.cw / 2, p.yb + 2], [x - p.cw / 2, p.yb + 2]], { sharp: true, kind: 'round', shift: shift * 0.5, spec, bevel: 1.5 });   // the collar
+    lxGold(p.cap, { sharp: true, kind: 'polished', shift, spec, bevel: 2.5 });                                                                                                      // the cap
+    ctx.save(); lxPoly(p.cap); ctx.clip();                                  // its cut faces
+    for (const f of [0.22, 0.78]) { const fx = x - p.kw / 2 + f * p.kw; ctx.fillStyle = lxA(LUX.gold.white, 0.5); ctx.fillRect(fx - 1 / z, p.yt, 2 / z, p.kh); ctx.fillStyle = lxA(LUX.gold.deep, 0.5); ctx.fillRect(fx + 1 / z, p.yt, 2 / z, p.kh); }
+    ctx.fillStyle = lxA(LUX.gold.deep, 0.32); ctx.fillRect(x + p.kw * 0.28, p.yt, p.kw * 0.22, p.kh); ctx.fillStyle = lxA(LUX.gold.white, 0.2); ctx.fillRect(x - p.kw / 2, p.yt, p.kw, p.kc * 1.2);
+    ctx.fillStyle = lxA(LUX.gold.deep, 0.55); ctx.fillRect(x - p.kw / 2, p.yc - 5, p.kw, 5);
+    ctx.restore();
+  };
+  lxStand(x, y, p.bw, s, draw, o);
+  if (o.glint && !LUX_LITE) lxGlint(x - p.kw / 2 + p.kc, p.yt + p.kc, s * 0.2, { a: o.glint });
+  return { bb: { x0: x - p.bw / 2, y0: p.yt, x1: x + p.bw / 2, y1: y }, cap: [x - p.kw / 2 + p.kc, p.yt + p.kc], shoulder: [x - p.bw / 2 + 0.05 * s, p.yb + 0.05 * s] };
+}
+// a solitaire ring seen as a jeweller shows it: the polished band as an ellipse, the stone face-on above it in four claws. o.color = the stone
+function lxRing(x, y, s, o = {}) {
+  const cy = y - 0.33 * s, rx = 0.36 * s, ry = 0.33 * s, ix = 0.318 * s, iy = 0.284 * s, icy = cy - 0.012 * s, gy = y - 0.77 * s, gr = 0.225 * s, z = lxZ(), turn = (o.shift ?? 0) * 1.6 + (o.spec != null ? o.spec * 1.2 : 0);
+  const band = () => { ctx.beginPath(); ctx.ellipse(x, cy, rx, ry, 0, 0, TAU); ctx.ellipse(x, icy, ix, iy, 0, 0, TAU); };
+  const body = () => {
+    ctx.save(); ctx.beginPath(); ctx.ellipse(x, icy, ix, iy, 0, 0, TAU); ctx.clip();          // the inside of the band, seen through the ring
+    ctx.beginPath(); ctx.ellipse(x, icy, ix, iy, 0, 0, TAU); ctx.ellipse(x, icy + 0.05 * s, ix * 0.985, iy * 0.97, 0, 0, TAU);
+    const g = ctx.createLinearGradient(x - ix, 0, x + ix, 0); g.addColorStop(0, LUX.gold.deep); g.addColorStop(0.3, LUX.gold.mid); g.addColorStop(0.5, LUX.gold.lo); g.addColorStop(0.75, LUX.gold.base); g.addColorStop(1, LUX.gold.deep);
+    ctx.fillStyle = g; ctx.fill('evenodd'); ctx.restore();
+    ctx.save(); band(); ctx.clip('evenodd');
+    ctx.fillStyle = lxGoldConic(x, cy, -2.2 + turn); ctx.fillRect(x - rx, cy - ry, rx * 2, ry * 2);
+    let g2 = ctx.createLinearGradient(0, cy - ry, 0, cy + ry); g2.addColorStop(0, lxW(0.16)); g2.addColorStop(0.4, lxW(0)); g2.addColorStop(1, lxK(0.3)); ctx.fillStyle = g2; ctx.fillRect(x - rx, cy - ry, rx * 2, ry * 2);
+    if (o.spec != null && o.spec > 0 && o.spec < 1) lxSpecBand({ x0: x - rx, y0: cy - ry, x1: x + rx, y1: cy + ry }, o.spec, 0.55);
+    const mx = (rx + ix) / 2, my = (ry + iy) / 2, mcy = (cy + icy) / 2;                       // the band is round in section: a lit crown along its middle
+    ctx.lineCap = 'round'; ctx.lineWidth = 0.014 * s; ctx.strokeStyle = lxA(LUX.gold.white, 0.5); ctx.beginPath(); ctx.ellipse(x, mcy, mx, my, 0, Math.PI * 1.08, Math.PI * 1.5); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(x, mcy, mx, my, 0, Math.PI * 0.2, Math.PI * 0.45); ctx.stroke();
+    ctx.lineWidth = 3 / z; ctx.strokeStyle = lxA(LUX.gold.white, 0.75); ctx.beginPath(); ctx.ellipse(x, cy, rx, ry, 0, Math.PI * 1.05, Math.PI * 1.75); ctx.stroke();
+    ctx.strokeStyle = lxA(LUX.gold.deep, 0.7); ctx.beginPath(); ctx.ellipse(x, icy, ix, iy, 0, 0, TAU); ctx.stroke();
+    ctx.lineWidth = 2.5 / z; ctx.strokeStyle = lxA(LUX.gold.white, 0.8); ctx.beginPath(); ctx.ellipse(x, icy + 3 / z, ix + 3 / z, iy + 3 / z, 0, Math.PI * 0.12, Math.PI * 0.62); ctx.stroke();
+    ctx.strokeStyle = lxA(LUX.gold.deep, 0.6); ctx.lineWidth = 3 / z; ctx.beginPath(); ctx.ellipse(x, cy, rx, ry, 0, Math.PI * 0.05, Math.PI * 0.8); ctx.stroke();
+    ctx.restore();
+    lxGold([[x - 0.045 * s, y - 0.655 * s], [x + 0.045 * s, y - 0.655 * s], [x + 0.13 * s, gy + gr * 0.5], [x - 0.13 * s, gy + gr * 0.5]], { sharp: true, kind: 'round', shift: o.shift ?? 0 });   // the basket under the stone
+    lxGem(x, gy, gr, { color: o.color ?? 'diamond', key: o.key ?? 'ring', light: o.light, anchor: o.anchor });
+    for (let i = 0; i < 4; i++) {                                          // four claws
+      const a = Math.PI / 4 + i * Math.PI / 2, px = x + Math.cos(a) * gr * 0.97, py = gy + Math.sin(a) * gr * 0.97, pr = 0.03 * s;
+      ctx.fillStyle = lxK(0.4); ctx.beginPath(); ctx.arc(px + 2, py + 3, pr, 0, TAU); ctx.fill();
+      const g3 = ctx.createRadialGradient(px - pr * 0.35, py - pr * 0.4, pr * 0.1, px, py, pr); g3.addColorStop(0, LUX.gold.white); g3.addColorStop(0.4, LUX.gold.base); g3.addColorStop(1, LUX.gold.lo);
+      ctx.fillStyle = g3; ctx.beginPath(); ctx.arc(px, py, pr, 0, TAU); ctx.fill();
+    }
+  };
+  if (o.shadow === 'drop' && !LUX_LITE) {                                  // lying on the slab, seen from above: a soft shadow down-right
+    ctx.save(); ctx.translate(16, 24); ctx.filter = `blur(${(13 * z).toFixed(2)}px)`;
+    ctx.strokeStyle = lxK(0.62); ctx.lineWidth = 0.06 * s; ctx.beginPath(); ctx.ellipse(x, cy, rx - 0.025 * s, ry - 0.025 * s, 0, 0, TAU); ctx.stroke(); ctx.fillStyle = lxK(0.6); ctx.beginPath(); ctx.arc(x, gy, gr, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+  lxStand(x, y, rx * 1.5, s, body, { depth: s * 0.45, ...o });
+  if (o.glint && !LUX_LITE) lxGlint(x - gr * 0.36, gy - gr * 0.36, gr * 1.7, { a: o.glint });
+  return { bb: { x0: x - rx, y0: gy - gr, x1: x + rx, y1: y }, gem: [x, gy, gr] };
+}
+// a lipstick: a gold tube with turned bands, a brushed sleeve, the bullet with its slanted tip. o.color = the bullet
+function lxLipstick(x, y, s, o = {}) {
+  const tw = 0.26 * s, th = 0.46 * s, sw = 0.21 * s, sh = 0.17 * s, bw = 0.17 * s, bh = 0.37 * s, yt = y - th, ys = yt - sh, yb = ys - bh, c = lxTone({}, o.color ?? '#a3152f'), z = lxZ(), shift = o.shift ?? 0;
+  const draw = () => {
+    const B2 = [[x - bw / 2, ys + 2], [x - bw / 2, yb + bh * 0.1], [x - bw * 0.36, yb + bh * 0.015], [x - bw * 0.1, yb], [x + bw * 0.34, yb + bh * 0.3], [x + bw / 2, yb + bh * 0.44], [x + bw / 2, ys + 2]];
+    ctx.save(); lxPoly(B2); ctx.clip();                                     // the bullet: a waxy cylinder cut on a slant
+    let g = ctx.createLinearGradient(x - bw / 2, 0, x + bw / 2, 0); g.addColorStop(0, c.lo); g.addColorStop(0.22, c.base); g.addColorStop(0.36, lxMix(c.base, c.hi, 0.7)); g.addColorStop(0.5, c.base); g.addColorStop(1, c.lo);
+    ctx.fillStyle = g; ctx.fillRect(x - bw, yb - 4, bw * 2, bh + 8);
+    ctx.fillStyle = lxA(c.hi, 0.35); lxPoly([[x - bw * 0.36, yb + bh * 0.015], [x - bw * 0.1, yb], [x + bw * 0.34, yb + bh * 0.3], [x + bw / 2, yb + bh * 0.44], [x + bw * 0.1, yb + bh * 0.32]]); ctx.fill();   // the cut face
+    if (o.spec != null && o.spec > 0 && o.spec < 1) lxSpecBand({ x0: x - bw / 2, y0: yb, x1: x + bw / 2, y1: ys }, o.spec, 0.4);
+    ctx.restore();
+    lxGold(rrectPts(x - sw / 2, ys, sw, sh + 4, 3, 2), { kind: 'brushed', dir: 0, key: 'sleeve', shift, spec: o.spec, bevel: 1.2 });
+    lxGold(rrectPts(x - tw / 2, yt, tw, th, 0.02 * s, 3), { kind: 'round', shift: shift * 0.6, spec: o.spec, bevel: 2 });
+    ctx.save(); for (const f of [0.06, 0.1, 0.9, 0.94]) { ctx.fillStyle = lxA(LUX.gold.deep, 0.55); ctx.fillRect(x - tw / 2, yt + th * f, tw, 2.5 / z); ctx.fillStyle = lxA(LUX.gold.white, 0.4); ctx.fillRect(x - tw / 2, yt + th * f + 2.5 / z, tw, 1.5 / z); } ctx.restore();
+  };
+  lxStand(x, y, tw, s, draw, o);
+  if (o.glint && !LUX_LITE) lxGlint(x - tw * 0.2, yt + th * 0.08, s * 0.16, { a: o.glint });
+  return { bb: { x0: x - tw / 2, y0: yb, x1: x + tw / 2, y1: y }, tip: [x - bw * 0.1, yb] };
+}
+// a small gift box: a lacquer body and lid, a gold satin ribbon and bow. o.color = the lacquer
+function lxGift(x, y, s, o = {}) {
+  const bw = 0.86 * s, bh = 0.5 * s, lw = 0.92 * s, lh = 0.16 * s, yb = y - bh, yl = yb - lh, rw = 0.15 * s, c = lxTone({}, o.color ?? '#141216'), z = lxZ(), shift = o.shift ?? 0;
+  const draw = () => {
+    const face = (x0, y0, w, h, top) => {
+      ctx.save(); ctx.beginPath(); ctx.rect(x0, y0, w, h); ctx.clip();
+      let g = ctx.createLinearGradient(x0, 0, x0 + w, 0); g.addColorStop(0, lxMix(c.base, c.hi, 0.22)); g.addColorStop(0.3, c.base); g.addColorStop(1, lxMix(c.base, '#000000', 0.55)); ctx.fillStyle = g; ctx.fillRect(x0, y0, w, h);
+      g = ctx.createLinearGradient(0, y0, 0, y0 + h); g.addColorStop(0, lxW(top ? 0.22 : 0.05)); g.addColorStop(0.25, lxW(0)); g.addColorStop(1, lxK(0.3)); ctx.fillStyle = g; ctx.fillRect(x0, y0, w, h);
+      if (o.spec != null && o.spec > 0 && o.spec < 1) lxSpecBand({ x0, y0, x1: x0 + w, y1: y0 + h }, o.spec, 0.22);
+      ctx.fillStyle = lxW(0.4); ctx.fillRect(x0, y0, w, 2 / z); ctx.restore();
+    };
+    face(x - bw / 2, yb, bw, bh, false); ctx.fillStyle = lxK(0.5); ctx.fillRect(x - bw / 2, yb, bw, 0.03 * s);    // the lid's shadow on the body
+    face(x - lw / 2, yl, lw, lh, true);
+    lxGold([[x - rw / 2, yl], [x + rw / 2, yl], [x + rw / 2, y], [x - rw / 2, y]], { sharp: true, kind: 'brushed', dir: 0, key: 'ribbon', shift, spec: o.spec });
+    ctx.fillStyle = lxK(0.35); ctx.fillRect(x - rw / 2, yb, rw, 0.03 * s);
+    for (const sd of [-1, 1]) {                                            // the bow: two satin loops and two tails
+      const loop = () => { ctx.beginPath(); ctx.moveTo(x, yl - 0.03 * s); ctx.bezierCurveTo(x + sd * 0.12 * s, yl - 0.3 * s, x + sd * 0.46 * s, yl - 0.26 * s, x + sd * 0.4 * s, yl - 0.09 * s); ctx.bezierCurveTo(x + sd * 0.36 * s, yl + 0.0 * s, x + sd * 0.12 * s, yl - 0.02 * s, x, yl - 0.03 * s); ctx.closePath(); };
+      lxGold(loop, { bb: { x0: Math.min(x, x + sd * 0.46 * s), y0: yl - 0.28 * s, x1: Math.max(x, x + sd * 0.46 * s), y1: yl }, kind: 'polished', dir: sd > 0 ? 0.5 : Math.PI - 0.5, shift, spec: o.spec, bevel: 1.5 });
+      const hole = () => { ctx.beginPath(); ctx.moveTo(x + sd * 0.07 * s, yl - 0.07 * s); ctx.bezierCurveTo(x + sd * 0.16 * s, yl - 0.2 * s, x + sd * 0.33 * s, yl - 0.19 * s, x + sd * 0.32 * s, yl - 0.1 * s); ctx.bezierCurveTo(x + sd * 0.28 * s, yl - 0.05 * s, x + sd * 0.14 * s, yl - 0.05 * s, x + sd * 0.07 * s, yl - 0.07 * s); ctx.closePath(); };
+      ctx.save(); hole(); ctx.fillStyle = lxA(LUX.gold.deep, 0.85); ctx.fill(); ctx.restore();
+      lxGold([[x + sd * 0.02 * s, yl - 0.02 * s], [x + sd * 0.1 * s, yl - 0.03 * s], [x + sd * 0.25 * s, yl + 0.13 * s], [x + sd * 0.15 * s, yl + 0.1 * s], [x + sd * 0.13 * s, yl + 0.17 * s]], { sharp: true, kind: 'brushed', dir: 0.4 * sd, key: 'tail' + sd, shift });
+    }
+    lxGold(rrectPts(x - 0.055 * s, yl - 0.1 * s, 0.11 * s, 0.1 * s, 0.03 * s, 4), { kind: 'round', shift, bevel: 1.5 });   // the knot
+  };
+  lxStand(x, y, bw, s * 0.7, draw, o);
+  if (o.glint && !LUX_LITE) lxGlint(x - 0.2 * s, yl - 0.2 * s, s * 0.2, { a: o.glint });
+  return { bb: { x0: x - lw / 2, y0: yl - 0.28 * s, x1: x + lw / 2, y1: y }, knot: [x, yl - 0.05 * s] };
+}
+function lxProduct(kind, x, y, s, o = {}) {
+  return kind === 'ring' ? lxRing(x, y, s, o) : kind === 'lipstick' ? lxLipstick(x, y, s, o) : kind === 'gift' ? lxGift(x, y, s, o) : lxPerfume(x, y, s, o);
+}
+
+// ---------------------------------------------------------------------
+//  type: a high-contrast serif, widely tracked small caps, a thin gold rule, a foil seal. Lots of dark empty space.
+// ---------------------------------------------------------------------
+// one line. o: weight, italic, color, track (em), align, a, font, and for a fade-in: at (seconds), dur, rise
+function lxType(str, x, y, size, o = {}) {
+  const u = o.at != null ? seg(TT, o.at, o.at + (o.dur ?? 0.6)) : 1, al = clamp(o.a ?? 1) * EZ.io(u);
+  ctx.save(); ctx.font = `${o.italic ? 'italic ' : ''}${o.weight ?? 400} ${size}px ${o.font ?? LUX_SERIF}`;
+  const tr = (o.track ?? 0) * size, hasLS = 'letterSpacing' in ctx; if (hasLS) ctx.letterSpacing = tr.toFixed(2) + 'px';
+  const w = ctx.measureText(str).width - (hasLS ? tr : 0), align = o.align ?? 'left';
+  if (al > 0.004) {
+    const xx = x + (hasLS ? (align === 'center' ? tr / 2 : align === 'right' ? tr : 0) : 0), yy = y + (o.rise ?? size * 0.14) * (1 - EZ.io(u));
+    ctx.textAlign = align; ctx.textBaseline = 'alphabetic'; ctx.globalAlpha = al;
+    ctx.fillStyle = lxK(0.6); ctx.fillText(str, xx, yy + 2); ctx.fillStyle = o.color ?? LUX.ivory; ctx.fillText(str, xx, yy);
+  }
+  ctx.restore(); return w;
+}
+// a thin gold rule that grows from its centre, with a small lozenge. o: a, at, dur, gem (false = no lozenge)
+function lxRule(x, y, w, o = {}) {
+  const f = o.at != null ? lxIn(o.at, o.dur ?? 0.7) : 1, al = clamp(o.a ?? 1); if (f <= 0 || al <= 0.004) return;
+  const z = lxZ(), hw = w / 2 * f, g = ctx.createLinearGradient(x - hw, 0, x + hw, 0);
+  g.addColorStop(0, lxA(LUX.gold.base, 0)); g.addColorStop(0.25, lxA(LUX.gold.base, 1)); g.addColorStop(0.5, lxA(LUX.gold.hi, 1)); g.addColorStop(0.75, lxA(LUX.gold.base, 1)); g.addColorStop(1, lxA(LUX.gold.base, 0));
+  ctx.save(); ctx.globalAlpha = al; ctx.fillStyle = g; ctx.fillRect(x - hw, y - 1 / z, hw * 2, 2 / z);
+  if (o.gem !== false) { const d = 7 * f / z; ctx.fillStyle = LUX.ground; lxPoly([[x, y - d * 1.6], [x + d * 1.6, y], [x, y + d * 1.6], [x - d * 1.6, y]]); ctx.fill(); ctx.fillStyle = LUX.gold.hi; lxPoly([[x, y - d], [x + d, y], [x, y + d], [x - d, y]]); ctx.fill(); }
+  ctx.restore();
+}
+// a small gold-foil monogram seal: a scalloped disc, two rings, a pressed italic letter. o: mono, a, spec 0..1, shift
+function lxSeal(x, y, r, o = {}) {
+  const al = clamp(o.a ?? 1); if (al <= 0.004) return;
+  const n = 26, P = []; for (let i = 0; i < n * 6; i++) { const a = i / (n * 6) * TAU, rr = r * (1 + 0.035 * Math.cos(a * n)); P.push([x + Math.cos(a) * rr, y + Math.sin(a) * rr]); }
+  ctx.save(); ctx.globalAlpha = al;
+  lxGold(P, { dir: 0.9, shift: o.shift ?? 0, spec: o.spec, specA: 0.8 });
+  ctx.lineWidth = r * 0.04; ctx.strokeStyle = lxA(LUX.gold.deep, 0.75); ctx.beginPath(); ctx.arc(x, y, r * 0.8, 0, TAU); ctx.stroke();
+  ctx.lineWidth = r * 0.02; ctx.strokeStyle = lxA(LUX.gold.white, 0.7); ctx.beginPath(); ctx.arc(x, y + r * 0.02, r * 0.8, 0, TAU); ctx.stroke();
+  ctx.font = `italic 400 ${r * 1.12}px ${LUX_SERIF}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = lxA(LUX.gold.white, 0.65); ctx.fillText(o.mono ?? 'L', x, y + r * 0.4 + r * 0.035); ctx.fillStyle = LUX.gold.deep; ctx.fillText(o.mono ?? 'L', x, y + r * 0.4);
+  ctx.restore();
+}
+
+// ---- screen-space type, through DEFER (after the camera, at screen size); all of it steps aside for a bridge
+// tracked caps over a thin gold rule over a gold-foil headline that a wipe of light uncovers. head may be an array of lines.
+// o: x, y (first headline baseline), size, at (seconds into the era), ksize, rule (width), italic
+function lxTitle(kicker, head, o = {}) {
+  lxDefer(() => {
+    const k = lxBridgeK(); if (k <= 0) return;
+    const at = E0 + (o.at ?? 0.4), x = o.x ?? CX, y = o.y ?? 500, size = o.size ?? 100;
+    if (kicker) lxType(String(kicker).toUpperCase(), x, y - size * 1.42, o.ksize ?? 28, { color: LUX.cream, track: 0.38, align: 'center', a: k, at, rise: 8 });
+    lxRule(x, y - size * 1.08, o.rule ?? 250, { a: k, at: at + 0.15 });
+    [].concat(head).forEach((line, i) => lxGoldText(line, x, y + i * size * 1.08, size, { align: 'center', italic: o.italic, a: k, reveal: lxIn(at + 0.3 + i * 0.35, 1.0), spec: seg(TT, at + 1.7 + i * 0.2, at + 2.6 + i * 0.2) }));
+  });
+}
+// one caption line near the bottom, in italic serif; words inside *...* are set in gold. Words arrive one at a time.
+function lxCaption(str, o = {}) {
+  lxDefer(() => {
+    const k = lxBridgeK(); if (k <= 0) return;
+    const at = E0 + (o.at ?? 0.6), size = o.size ?? 52, y = o.y ?? (H > W * 1.2 ? 1440 : H - 120), cx = o.x ?? CX;
+    const words = []; String(str).split('*').forEach((part, i) => part.split(/\s+/).filter(Boolean).forEach((wd) => words.push({ s: wd, hi: i % 2 === 1 })));
+    ctx.save(); ctx.font = `italic 400 ${size}px ${LUX_SERIF}`; const sp = size * 0.26, ws = words.map((wd) => ctx.measureText(wd.s).width); ctx.restore();
+    let x = cx - (ws.reduce((a, b) => a + b, 0) + sp * (words.length - 1)) / 2;
+    words.forEach((wd, i) => {
+      const t0 = at + i * 0.1;
+      if (wd.hi) lxGoldText(wd.s, x, y, size, { italic: true, a: k * lxIn(t0, 0.5) }); else lxType(wd.s, x, y, size, { italic: true, color: LUX.ivory, a: k, at: t0, dur: 0.5, rise: 10 });
+      x += ws[i] + sp;
+    });
+  });
+}
+// a small mark, top left: the foil seal and a line of tracked caps
+function lxTag(str, o = {}) {
+  lxDefer(() => {
+    const k = lxBridgeK() * lxIn(E0 + (o.at ?? 0.15), 0.5); if (k <= 0.004) return;
+    const x = o.x ?? 104, y = o.y ?? (H > W * 1.2 ? 292 : 90), r = o.r ?? 30;
+    lxSeal(x, y, r, { mono: o.mono, a: k, spec: seg(TT, E0 + 0.8, E0 + 1.6) });
+    lxType(String(str).toUpperCase(), x + r + 22, y + 9, o.size ?? 25, { color: LUX.cream, track: 0.3, a: k });
+  });
+}
+// dither: a fine fixed grain, so the dark gradients do not band in the video (held still: moving grain multiplies the file size)
+function lxGrain(al = LUX.grain) {
+  if (al <= 0) return;
+  if (!LUX_CACHE.grain) {
+    const n = 256, R = RNG('lxgrain'), cv = document.createElement('canvas'); cv.width = cv.height = n;
+    const g = cv.getContext('2d'), img = g.createImageData(n, n);
+    for (let i = 0; i < n * n; i++) { const v = Math.floor(R.f() * 256); img.data[i * 4] = v; img.data[i * 4 + 1] = v * 0.96; img.data[i * 4 + 2] = v * 0.88; img.data[i * 4 + 3] = 255; }
+    g.putImageData(img, 0, 0); LUX_CACHE.grain = cv;
+  }
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = al; ctx.globalCompositeOperation = 'lighter'; ctx.imageSmoothingEnabled = false;
+  for (let y = 0; y < H; y += 256) for (let x = 0; x < W; x += 256) ctx.drawImage(LUX_CACHE.grain, x, y);
+  ctx.restore();
+}
+
+// =====================================================================
+//  STYLE — the renderer's hooks. Bridge colours are 6-digit hex (a liquid's or a stone's base colour); mid-morph the blend arrives as rgb().
+// =====================================================================
+const STYLE = {
+  name: 'luxe',
+  paper: LUX.ground,                                                     // the dark of the studio
+  backdrop(c) { fillAll(c); lxBokeh({ n: 9, key: 'bridge', a: 0.8 }); lxVignette(0.6); },   // the lights are down: only bokeh drifts
+  window(P, key, src) {                                                  // the scene through the product's outline, edged in gold
+    const bb = bbox(P), far = bb.y1 - bb.y0 > H * 2.4;
+    ctx.save(); trace(P, true); ctx.clip(); ctx.drawImage(src, 0, 0);
+    if (!far) { trace(P, true); ctx.lineJoin = 'round'; ctx.lineWidth = 12; ctx.strokeStyle = lxGoldGrad(bb.x0, bb.y0, bb.x1, bb.y1, 'polished'); ctx.stroke(); }
+    ctx.restore();
+  },
+  blob(P, c, key, u = 0) {                                               // cut glass changing shape while a band of light crosses it and a glint flares
+    const bb = bbox(P);
+    lxGlass(P, { tint: c, liquid: { color: c, level: 0.9, inset: 0.05, base: 0.06 }, facets: [0.22, 0.78], spec: 0.1 + 0.8 * clamp(u), specA: 0.6, key: 'blob' });
+    ctx.save(); trace(P, true); ctx.lineJoin = 'round'; ctx.lineWidth = 3; ctx.strokeStyle = lxGoldGrad(bb.x0, bb.y0, bb.x1, bb.y1, 'polished', u * 0.3 - 0.15); ctx.stroke(); ctx.restore();
+    lxGlint(lerp(bb.x0, bb.x1, 0.24), lerp(bb.y0, bb.y1, 0.2), (bb.x1 - bb.x0) * 0.5, { a: Math.sin(Math.PI * clamp(u)) ** 2 });
+  },
+  hero(x, y, r, o = {}) { lxGem(x, y, r * 0.9, { key: o.key ?? 'hero', anchor: true, glint: 0.5 + 0.5 * Math.sin(TT * 3) }); },   // r = half the hero's size
+  heroColor: LUX.gem.diamond,
+  heroPts(x, y, r) { return lxGemPts(x, y, r * 0.9); },
+  post() { lxGrain(); },
+  ones: true,                                                            // slow and sensual: on 1s
+};
+// =====================================================================
+//  SCENES — luxe demo. World coordinates 1080x1920; time TT on 1s. One product per frame; the materials round it are
+//  the subject and the light is what moves. Content inside x 60-940, y 250-1500.
+// =====================================================================
+const cu = TIMELINE.cues;
+// the bridge objects: nothing else may overlap them at the bridge, or it shows in the morph window
+const BOTTLE = { x: 500, y: 1218, s: 560 }, RING = { x: 500, y: 1196, s: 540 };
+const HORIZON = 1052;                                         // the back edge of the marble slab in era 1
+
+// ---- era 1: the fragrance. Black marble, a burgundy satin drape, gold and amber.
+function sceneFragrance() {
+  const up = 0.35 + 0.65 * lxIn(cu.light, 1.2), sweep = seg(TT, cu.sweep, cu.sweep + 1.3), shift = 0.1 * Math.sin(TT * 0.9);
+  const drape = () => lxSilk([[590, -120], [580, 400], [540, 780], [545, HORIZON + 40]], { w: [1500, 1320, 1320, 1420], color: 'burgundy', folds: 5, key: 'drape', soft: 3, fall: [0.12 * up, 0.3 * up, 0.82 * up, 0.92 * up] });
+  lxWall({ cx: BOTTLE.x, cy: 820, light: up });
+  drape();
+  lxTable({ horizon: HORIZON, preset: 'black', cx: BOTTLE.x, light: up });
+  lxReflect(HORIZON, drape, { a: 0.34, depth: 360, blur: 3 });         // the polished stone mirrors the cloth behind it
+  lxBokeh({ n: 12, key: 'back', a: up, area: { x0: 40, y0: 260, x1: 1040, y1: 980 } });
+  lxProduct('perfume', BOTTLE.x, BOTTLE.y, BOTTLE.s, { spec: sweep, shift, reflect: 0.5, blur: 1.5, glint: Math.sin(Math.PI * seg(TT, cu.glint, cu.glint + 0.55)) ** 1.4 });
+  lxGlint(BOTTLE.x - 132, BOTTLE.y - 330, 70, { every: 1.5, off: 0.4, dur: 0.45 });   // a small flash on the cut shoulder
+  lxHaze({ a: up, y0: 600, y1: 1300 });
+  lxBokeh({ n: 4, key: 'front', a: up * 0.8, rmin: 70, rmax: 150, area: { x0: 0, y0: 1250, x1: 1080, y1: 1900 } });
+  lxVignette(0.6);
+  lxTag('Atelier · 01');
+  lxTitle('Eau de parfum', 'Light, bottled', { at: cu.title, y: 520 });
+  lxCaption('The *light* moves, not the product', { at: 0.9, size: 50 });
+}
+
+// ---- era 2: the stone. Emerald marble seen from above, a champagne satin ribbon, a solitaire ring.
+function sceneStone() {
+  const t = TT - 3, up = 0.5 + 0.5 * lxIn(cu.light2, 1.0), sweep = seg(TT, cu.sweep2, cu.sweep2 + 1.2);
+  lxMarble({ preset: 'emerald', cx: RING.x, cy: 860, light: up });
+  lxDim(180, 700, 0.42);                                              // dark empty space for the title
+  lxSilk([[1300, 560], [900, 760], [560, 1010], [200, 1150], [-240, 1090]], { w: [300, 380, 470, 400, 330], color: 'emerald', folds: 4, key: 'ribbon', shadow: 0.6, depth: 1.0, fall: [0.9 * up, 1.0 * up] });
+  lxBokeh({ n: 8, key: 'back2', a: 0.7 * up, area: { x0: 40, y0: 240, x1: 1040, y1: 700 } });
+  const r = lxProduct('ring', RING.x, RING.y, RING.s, { shadow: 'drop', spec: sweep, shift: 0.12 * Math.sin(t * 0.9), color: 'diamond', anchor: true, key: 'hero' });
+  lxGlint(r.gem[0] - r.gem[2] * 0.36, r.gem[1] - r.gem[2] * 0.4, 210, { at: cu.glint2, dur: 0.6 });      // the stone catches the light: a brief four-point star
+  lxGlint(r.gem[0] + r.gem[2] * 0.5, r.gem[1] + r.gem[2] * 0.22, 150, { at: cu.glint3, dur: 0.55, rot: 0.2 });
+  lxGlint(RING.x - 150, RING.y - 96, 60, { every: 1.5, off: 0.9, dur: 0.4 });                           // and the band
+  lxHaze({ a: 0.7, color: '#a8c9a0', y0: 500, y1: 1400 });
+  lxBokeh({ n: 4, key: 'front2', a: 0.7, rmin: 70, rmax: 150, area: { x0: 0, y0: 1300, x1: 1080, y1: 1900 } });
+  lxVignette(0.62);
+  lxTag('Atelier · 02');
+  lxTitle('Fine jewellery', 'Cut to catch it', { at: cu.title2 - 3, y: 520 });
+  lxCaption('Marble, satin, gold, *a stone*', { at: 0.9, size: 50 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — luxe demo (read by kit/morph.js). Two very slow pushes, eased in and out; no cuts.
+//  Colours given to the renderer are 6-digit hex: the studio's dark for ERA_BG, a liquid's / a stone's base colour for the bridge shapes.
+// =====================================================================
+const ERA_BG = ['#0b0807', '#06140f'];
+function pieceCam(era, t) {
+  return era === 0 ? push(t, 0.0, 3.0, { z: 1.06, p: [BOTTLE.x, BOTTLE.y - 300], to: [BOTTLE.x, BOTTLE.y - 300] })
+                   : push(t, 3.0, 6.0, { z: 1.05, p: [RING.x, RING.y - 400], to: [RING.x, RING.y - 400] });
+}
+const BRIDGES = [
+  // the bottle -> the stone of the ring: cut glass with amber in it becomes a clear cut stone while a band of light crosses it
+  { tc: 3.0, d: 0.5, A: () => ({ P: lxProductPts('perfume', BOTTLE.x, BOTTLE.y, BOTTLE.s), c: LUX.liquid.amber.base }), B: () => ({ P: lxProductPts('ring', RING.x, RING.y, RING.s), c: LUX.gem.diamond }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — luxe demo (inside buildScore(); see kit/score-head.js). A quiet room: a low warm pad and a slow
+  // harp figure in D, air that brightens as the light sweeps across the gold, a small bell on each glint; then a warm
+  // D major chord when the stone appears and two glassy bells on its star glints.
+  const T = TIMELINE, q = T.cues;
+  const bell = (t, n, vel, pan = 0) => chime(t, [nz(n), nz(n) * 2], vel, pan);
+  to = 'm';
+  drone(0.0, 3.1, 73.4, 0.03, { att: 0.8, rel: 0.3 });                                                                      // the room
+  pad(0.0, 3.1, ['D3', 'A3', 'E4', 'Fs4'], 0.045, { type: 'triangle', cut: 800, att: 1.0, rel: 0.4, send: 0.6 });
+  ['D4', 'A4', 'E5', 'Fs5', 'A5', 'E5'].forEach((n, i) => pluck(0.5 + i * BEAT * 0.75, nz(n), 0.05, -0.3 + i * 0.12, 0.9, 2400, 0.55));   // a slow harp figure
+  for (let i = 0; i < 3; i++) bass(i * BEAT * 2, nz('D2'), 0.06);
+  pad(3.0, 6.05, ['D2', 'A2', 'Fs3', 'A3', 'D4', 'E4'], 0.065, { type: 'triangle', cut: 1500, att: 0.2, rel: 0.5, send: 0.6 });   // the stone: D major
+  ['D4', 'Fs4', 'A4', 'D5'].forEach((n, i) => pluck(3.0 + 1 / 6 + i * 0.03, nz(n), 0.08, -0.3 + i * 0.2, 1.0, 3000, 0.5));
+  for (let i = 0; i < 3; i++) bass(3.0 + i * BEAT * 2, nz(i === 1 ? 'A2' : 'D2'), 0.075);
+  ['A5', 'Fs5', 'D6', 'A5', 'E6', 'Fs6', 'D6', 'A6'].forEach((n, i) => pluck(3.5 + i * E8 * 1.25, nz(n), 0.028, i % 2 ? 0.35 : -0.35, 0.5, 3200, 0.5));
+  to = 's';
+  sweep(q.light, q.light + 1.2, 0.01, 300, 1100, 0);                                                                        // the light comes up
+  sweep(q.sweep, q.sweep + 1.3, 0.018, 900, 4200, 0.1);                                                                     // the sweep crosses gold and glass
+  bell(q.glint + 0.25, 'A6', 0.03, -0.2);                                                                                   // the cap glints
+  sweep(2.5, 3.0, 0.025, 400, 2400, 0);                                                                                     // the frame closes onto the bottle
+  sub(q.morph, 0.26); noiseHit(q.morph, 0.5, 'lowpass', 900, 0.7, 0.04, 0, 0.3, 200);                                       // the stone lands
+  sweep(q.sweep2, q.sweep2 + 1.2, 0.014, 1200, 5000, -0.1);
+  bell(q.glint2 + 0.3, 'D6', 0.04, -0.15); bell(q.glint2 + 0.36, 'A6', 0.02, 0.1);                                           // star glints
+  bell(q.glint3 + 0.27, 'Fs6', 0.035, 0.2);
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>
