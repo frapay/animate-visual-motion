@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infographic demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b2a41; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  INFOGRAPHIC DEMO — 9:16, 6.0s @ 120 BPM, 24fps. ALL NUMBERS ARE INVENTED (an illustrative, fictional class of
+//  ten pupils): they claim nothing about the real world, and the piece says so on screen ("data ilustrasi").
+//  Era 1: ten people on a card take colour one per 8th note, 7 of 10, the pin hero hopping from head to head while
+//  "70%" and a donut count with them; the donut closes into a solid disc, which morphs at 3.0s (disc -> rounded card)
+//  into era 2: five columns grow, Wednesday in coral, the hero lands on it; a small line draws on and its average counts.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/infographic/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneSurvey()], [3, 6, () => sceneDays()]];
+const SHOTS = [
+  ['survey', 0, 0.0, 3.0, '7 of 10 people fill one per 8th; 70% and the donut count with them; the hero hops head to head'],
+  ['days', 1, 3.0, 6.0, 'five columns grow, Wednesday in coral with the hero on it; a line draws on and its average counts'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s). fill = the first person; the others follow one per 8th up to `last`.
+  // solid = the donut closes into a disc; perch = the hero lands on the donut. cols = the first column starts;
+  // land = the hero lands on the coral column; line / lineEnd = the line draws on; chip = the change chip pops.
+  cues: { fill: 0.5, last: 2.0, solid: 2.25, perch: 2.5, cols: 3.5, land: 4.25, line: 4.5, lineEnd: 5.5, chip: 5.5 },
+  acts: [
+    { name: '1 Survei', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Per hari', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.8, title: '7 of 10, counted one by one', sound: 'a rising pluck per person', next: 'the donut closes into a disc' },
+    { t: 5.0, title: 'the busiest day', sound: 'column blips, a chime on the landing', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

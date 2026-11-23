@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editorial collage demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #191919; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  EDITORIAL COLLAGE DEMO — 9:16, 6.0s @ 120 BPM, 24fps. "Kenapa kita suka menunda?" On a desk, a halftone
+//  person cut-out, a taped clipping and the question on paper strips, word by word; the highlighter sweeps "menunda?"
+//  and the pointing hand taps it. A round kraft scrap with a "?" is pinned on; at 3.0s it morphs into a squarish
+//  newsprint clipping that holds an alarm clock, beside a phone cut-out: a red marker circles the phone, an arrow
+//  links it to the clock, a to-do card gets one cross, the stamp NANTI SAJA thuds and the hand taps it.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/editorial-collage/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneAsk()], [3, 6, () => sceneLater()]];
+const SHOTS = [
+  ['ask', 0, 0.0, 3.0, 'the question on paper strips beside a halftone person and a taped clipping; the highlighter sweeps "menunda?"'],
+  ['later', 1, 3.0, 6.0, 'a phone and a clock linked by the red marker; the stamp NANTI SAJA thuds and the hand taps it'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s): the moment a piece is first seen, or a mark starts to be drawn
+  cues: {
+    person: -0.25, kicker: -0.25, clip: 0.0, tape: 0.25, w1: 0.25, w2: 0.5, w3: 0.75, w4: 1.0, hi: 1.25, cap1: 1.0, hand: 1.25, tap1: 1.5, tap2: 1.75, q: 1.75, pin: 2.0,
+    phone: 3.5, title: 3.5, circle: 4.0, arrow: 4.25, cap2: 4.25, cross: 4.5, stamp: 5.0, hand2: 5.25, tap3: 5.5, tap4: 5.75,
+  },
+  acts: [
+    { name: '1 Tanya', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Nanti', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.8, title: 'the question, word by word', sound: 'paper slaps, a marker squeak', next: 'the "?" scrap becomes the clock clipping' },
+    { t: 5.0, title: 'the usual answer: NANTI SAJA', sound: 'a stamp thud', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

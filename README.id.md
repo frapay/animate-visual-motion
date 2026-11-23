@@ -1,12 +1,12 @@
 # animate-visual-motion
 
-**Video animasi prosedural yang dibuat sepenuhnya dengan kode, dalam 55 gaya. Agent Skill untuk Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot, dan lainnya.**
+**Video animasi prosedural yang dibuat sepenuhnya dengan kode, dalam 60 gaya. Agent Skill untuk Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot, dan lainnya.**
 
 Minta Claude membuat video penjelasan, sejarah, cerita pendek, atau reel peluncuran produk. Claude akan bertanya beberapa hal dan meminta persetujuanmu tiga kali (cerita → tampilan → storyboard). Setelah itu ia menggambar setiap frame di satu `<canvas>`, menyusun musik sintesis, lalu merender MP4 dengan browser headless dan ffmpeg. Hasilnya deterministik: piece yang sama selalu menghasilkan video yang sama.
 
 🇬🇧 [Read in English](README.md)
 
-![55 gaya bawaan](docs/styles.jpg)
+![60 gaya bawaan](docs/styles.jpg)
 
 ---
 
@@ -158,7 +158,7 @@ cp -R $SKILL/styles/wayang/demo pieces/coba-wayang
 node $SKILL/tools/export.mjs pieces/coba-wayang --share
 ```
 
-Daftar lengkap 55 gaya ada di [README bahasa Inggris](README.md#styles) dan di [styles/README.md](plugins/animate-visual-motion/skills/animate-visual-motion/styles/README.md).
+Daftar lengkap 60 gaya ada di [README bahasa Inggris](README.md#styles) dan di [styles/README.md](plugins/animate-visual-motion/skills/animate-visual-motion/styles/README.md).
 
 ---
 
@@ -189,6 +189,6 @@ Piece-mu tersimpan di proyekmu sendiri, jadi memperbarui atau menghapus skill ti
 
 ## Kredit dan lisensi
 
-Repo ini adalah fork dari [**cth9191/animate**](https://github.com/cth9191/animate), skill animasi Claude Code aslinya (grammar cerita, kit, tools, dan gaya-gaya awal). Fork ini mengganti nama skill menjadi `animate-visual-motion` dan menambah katalog menjadi 55 gaya, termasuk gaya Indonesia (wayang, batik), sejarah poster, kerajinan, dan peluncuran produk.
+Repo ini adalah fork dari [**cth9191/animate**](https://github.com/cth9191/animate), skill animasi Claude Code aslinya (grammar cerita, kit, tools, dan gaya-gaya awal). Fork ini mengganti nama skill menjadi `animate-visual-motion` dan menambah katalog menjadi 60 gaya, termasuk gaya Indonesia (wayang, batik), sejarah poster, kerajinan, dan peluncuran produk.
 
 MIT. Lihat [LICENSE](LICENSE).

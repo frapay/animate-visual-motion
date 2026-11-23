@@ -1,12 +1,12 @@
 # animate-visual-motion
 
-**Procedural animated videos, made entirely in code, in 55 styles — an Agent Skill for Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot and more.**
+**Procedural animated videos, made entirely in code, in 60 styles — an Agent Skill for Claude Code, OpenCode, Codex, Gemini CLI, Cursor, Copilot and more.**
 
 Ask Claude for an explainer, a history, a little story or a product launch reel. It walks you through a few questions and three quick check-ins (story → look → storyboard), then draws every frame on one `<canvas>`, composes a synthesized score, and renders an MP4 with a headless browser and ffmpeg. Every piece is deterministic, so the same piece always renders the same video.
 
 🇮🇩 [Baca dalam Bahasa Indonesia](README.id.md)
 
-![the 55 built-in styles](docs/styles.jpg)
+![the 60 built-in styles](docs/styles.jpg)
 
 ---
 
@@ -182,7 +182,7 @@ Try a style's demo first: `cp -R $SKILL/styles/wayang/demo pieces/wayang-test &&
 
 ## Styles
 
-55 built-in styles. Each one has its rules and frame checklist (`STYLE.md`), a drawing kit (`kit.js`), a preview (`sample.png`) and a small demo piece. The full table is in [styles/README.md](plugins/animate-visual-motion/skills/animate-visual-motion/styles/README.md).
+60 built-in styles. Each one has its rules and frame checklist (`STYLE.md`), a drawing kit (`kit.js`), a preview (`sample.png`) and a small demo piece. The full table is in [styles/README.md](plugins/animate-visual-motion/skills/animate-visual-motion/styles/README.md).
 
 | group | styles |
 |---|---|
@@ -195,6 +195,7 @@ Try a style's demo first: `cp -R $SKILL/styles/wayang/demo pieces/wayang-test &&
 | **Screen & tech** | pixel · terminal · neon · glass · aurora |
 | **Product launch** | keynote · bento · ui-mockup |
 | **Physical product ads** | packshot · splash · flash-sale · luxe · flat-lay |
+| **Narrated explainers** | infographic · flow-diagram · metro-map · editorial-collage · study-notes |
 
 **Your own look:** give the skill references (a video, stills, a web page). It measures palette, line weight, texture, motion and cut rhythm, draws matched frames next to your references, and saves the result as a new style in your project. Reference media stays on your machine.
 
@@ -251,6 +252,6 @@ Your pieces live in your projects, so updating or removing the skill never touch
 
 ## Credits and license
 
-This is a fork of [**cth9191/animate**](https://github.com/cth9191/animate), the original Claude Code animation skill: the story grammar, kit, tools and the first styles. This fork renames the skill to `animate-visual-motion` and grows the catalogue to 55 styles, including Indonesian (wayang, batik), poster-history, craft and product-launch looks.
+This is a fork of [**cth9191/animate**](https://github.com/cth9191/animate), the original Claude Code animation skill: the story grammar, kit, tools and the first styles. This fork renames the skill to `animate-visual-motion` and grows the catalogue to 60 styles, including Indonesian (wayang, batik), poster-history, craft and product-launch looks.
 
 MIT. See [LICENSE](LICENSE).

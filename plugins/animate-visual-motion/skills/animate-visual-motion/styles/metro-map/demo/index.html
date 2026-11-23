@@ -1,0 +1,1659 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metro map demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2330; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  METRO MAP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. "Rute belajar desain": an invented personal roadmap as a transit map.
+//  Era 1 (a close ride): the red line grows down the frame through Dasar -> Latihan -> Proyek, the train hero
+//  riding behind its head and stopping on the beats, a river and a yellow cross line behind. The station under the
+//  train swells into a big station disc, which morphs at 3.0s into an interchange capsule (disc -> capsule) that
+//  opens onto era 2 (the whole map): a blue line joins at the interchange, both run on to their termini, the train
+//  arrives at Karier and the "you are here" marker lands on it; a legend, a second train on the blue line.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/metro-map/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneRide()], [3, 6, () => sceneMap()]];
+const SHOTS = [
+  ['ride', 0, 0.0, 3.0, 'the red line grows through Dasar, Latihan, Proyek; the train rides it stop by stop'],
+  ['map', 1, 3.0, 6.0, 'the whole map: a blue line joins at the interchange, the train reaches Karier, "you are here"'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s).
+  //   era 1: line = the red line starts growing; st2 / st3 = its head passes Latihan / Proyek (the stations pop);
+  //          dep1 / arr1 / dep2 / arr2 = the train leaves and arrives; halo = the station swells for the morph
+  //   era 2: legend, blue (the blue line starts), join (it reaches the interchange: the capsule opens), ext (the red
+  //          line goes on), dep3 / term (the red line reaches Karier) / arr3 (the train arrives: "you are here")
+  cues: { line: 0.0, dep1: 0.5, st2: 0.75, arr1: 1.0, dep2: 1.5, st3: 1.5, arr2: 2.0, halo: 2.25,
+    legend: 3.5, blue: 3.25, join: 4.0, ext: 4.0, dep3: 4.25, bluend: 4.5, term: 4.75, arr3: 5.0 },
+  acts: [
+    { name: '1 Perjalanan', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Peta', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.8, title: 'the ride: one station per beat', sound: 'rail clicks, a ding per stop', next: 'the station swells' },
+    { t: 5.0, title: 'the whole map: you are here', sound: 'two-tone arrival chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
+// =====================================================================
+//  kit/core.js — seeded RNG, math, easing, palette, geometry, the hand-drawn drawing kit
+//  (wobble on the boil, ink, paint, hatch, pencil, stipple, grain), cameras, mono text.
+//  Needs from the piece head: FPS, W, H. Render state: ctx, F (frame), B (boil = floor(F/2)).
+// =====================================================================
+
+// ---------------------------------------------------------------------
+//  seeded RNG
+// ---------------------------------------------------------------------
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash(...xs) {
+  let h = 2166136261 >>> 0;
+  for (const x of xs) {
+    const s = String(x);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= 124; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function RNG(...xs) {
+  const f = mulberry32(hash(...xs));
+  return {
+    f,
+    r: (a, b) => a + (b - a) * f(),
+    n: (amt) => (f() * 2 - 1) * amt,
+    i: (a, b) => a + Math.floor(f() * (b - a + 1)),
+    pick: (arr) => arr[Math.floor(f() * arr.length)],
+  };
+}
+
+// ---------------------------------------------------------------------
+//  math
+// ---------------------------------------------------------------------
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (x, a = 0, b = 1) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+// has absolute time t reached cut time c? (cuts snap to the nearest frame, like shot boundaries)
+const past = (t, c) => Math.round(t * FPS + 1e-6) >= Math.round(c * FPS);
+const dist = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+const EZ = {
+  o2: (t) => 1 - (1 - clamp(t)) ** 2,
+  o3: (t) => 1 - (1 - clamp(t)) ** 3,
+  i2: (t) => clamp(t) ** 2,
+  i3: (t) => clamp(t) ** 3,
+  io: (t) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; },
+  back: (t) => { t = clamp(t) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; },
+};
+
+// ---------------------------------------------------------------------
+//  render state
+// ---------------------------------------------------------------------
+let ctx = null;   // current 2d context
+let F = 0;        // absolute frame index
+let B = 0;        // boil index — reseeds every 2 frames (Math.floor(t*12))
+
+const C = {
+  ink: '#3a2417', cream: '#efe5cf', paper: '#f4ecd9', paperLine: 'rgba(90,130,190,0.32)',
+  orange: '#e58a4e', orangeD: '#c3622e', orangeL: '#f4b27c', terra: '#d97757',
+  rose: '#d98b8b', roseD: '#b0616a', roseL: '#efb9b0',
+  wood: '#d6a466', woodD: '#a8773f', woodL: '#e9c48f',
+  sky: '#9cc4d6', skyD: '#6f9fb8', skyL: '#c9e1ea',
+  teal: '#3d9f96', tealL: '#86c9be',
+  yellow: '#f0c55a', yellowL: '#f7dd92',
+  green: '#5f9c5c', greenL: '#a3cf92',
+  red: '#d4382c', redL: '#ea7a6c',
+  skin: '#ebb68f', skinD: '#c7815d', skinL: '#f7d4b4',
+  lav: 'rgba(104,112,214,0.7)', lavS: 'rgba(104,112,214,0.42)',
+  navy: '#0c0d1c', navy2: '#15173a', peri: '#c8d0f0', periD: '#7c86c4', periS: 'rgba(150,164,230,0.20)',
+  cyan: '#52d6c4', mag: '#e0368f', glow: '#5de37a', white: '#f4f6ff',
+};
+const RAINBOW = ['#f0d042', '#e050b8', '#46cde0', '#7ad866', '#a47ef0'];
+const MONO = 'Consolas, "Cascadia Mono", Menlo, "DejaVu Sans Mono", "Courier New", monospace';   // Windows first, then macOS / Linux
+
+// ---------------------------------------------------------------------
+//  geometry
+// ---------------------------------------------------------------------
+function ellipsePts(cx, cy, rx, ry, rot = 0, n = 64, a0 = 0, a1 = TAU) {
+  const P = [], c = Math.cos(rot), s = Math.sin(rot), full = Math.abs(a1 - a0 - TAU) < 1e-6;
+  for (let i = 0; i < n; i++) {
+    const a = a0 + (a1 - a0) * i / (full ? n : n - 1);
+    const x = Math.cos(a) * rx, y = Math.sin(a) * ry;
+    P.push([cx + x * c - y * s, cy + x * s + y * c]);
+  }
+  return P;
+}
+function rrectPts(x, y, w, h, r, n = 6) {
+  r = Math.min(r, w / 2, h / 2);
+  const P = [], cs = [[x + w - r, y + r, -Math.PI / 2], [x + w - r, y + h - r, 0], [x + r, y + h - r, Math.PI / 2], [x + r, y + r, Math.PI]];
+  for (const [cx, cy, a0] of cs) for (let i = 0; i <= n; i++) { const a = a0 + (Math.PI / 2) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  return P;
+}
+function arcPts(cx, cy, r, a0, a1, n = 18, sy = 1) {
+  const P = [];
+  for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; P.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r * sy]); }
+  return P;
+}
+function xform(P, tx, ty, rot = 0, sx = 1, sy = sx) {
+  const c = Math.cos(rot), s = Math.sin(rot);
+  return P.map(([x, y]) => [tx + x * sx * c - y * sy * s, ty + x * sx * s + y * sy * c]);
+}
+function bbox(P, pad = 0) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [x, y] of P) { if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+  return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+}
+function resample(P, closed, step) {
+  const out = [], n = P.length, m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const a = P[i], b = P[(i + 1) % n], k = Math.max(1, Math.ceil(dist(a, b) / step));
+    for (let j = 0; j < k; j++) out.push([a[0] + (b[0] - a[0]) * j / k, a[1] + (b[1] - a[1]) * j / k]);
+  }
+  if (!closed) out.push(P[n - 1]);
+  return out;
+}
+function pathLen(P) { let L = 0; for (let i = 1; i < P.length; i++) L += dist(P[i - 1], P[i]); return L; }
+function subPath(P, frac) {
+  let want = pathLen(P) * clamp(frac);
+  const out = [P[0]];
+  for (let i = 1; i < P.length; i++) {
+    const d = dist(P[i - 1], P[i]);
+    if (want >= d) { out.push(P[i]); want -= d; }
+    else { const k = want / (d || 1); out.push([lerp(P[i - 1][0], P[i][0], k), lerp(P[i - 1][1], P[i][1], k)]); break; }
+  }
+  return out;
+}
+function pointAt(P, frac) { const S = subPath(P, frac); return S[S.length - 1]; }
+
+// ---------------------------------------------------------------------
+//  drawing kit — boil, sketchy lines, hatching, stipple, pencil, grain
+// ---------------------------------------------------------------------
+// smooth hand wobble along the normal; reseeded every boil step
+function wobble(P, closed, amt, key, step = 7) {
+  const Q = resample(P, closed, step), n = Q.length;
+  const R = RNG('wob', key, B);
+  const f1 = R.r(0.012, 0.03), f2 = R.r(0.05, 0.1), p1 = R.r(0, TAU), p2 = R.r(0, TAU);
+  const sx = R.n(amt * 0.5), sy = R.n(amt * 0.5);
+  const out = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Q[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = Q[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const nx = a[1] - b[1], ny = b[0] - a[0], l = Math.hypot(nx, ny) || 1;
+    if (i) s += dist(Q[i - 1], Q[i]);
+    const o = amt * (0.75 * Math.sin(s * f1 + p1) + 0.35 * Math.sin(s * f2 + p2));
+    out[i] = [Q[i][0] + nx / l * o + sx, Q[i][1] + ny / l * o + sy];
+  }
+  return out;
+}
+function trace(P, closed) {
+  ctx.beginPath();
+  const n = P.length; if (n < 2) return;
+  if (closed) {
+    ctx.moveTo((P[n - 1][0] + P[0][0]) / 2, (P[n - 1][1] + P[0][1]) / 2);
+    for (let i = 0; i < n; i++) { const p = P[i], q = P[(i + 1) % n]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.closePath();
+  } else {
+    ctx.moveTo(P[0][0], P[0][1]);
+    for (let i = 1; i < n - 1; i++) { const p = P[i], q = P[i + 1]; ctx.quadraticCurveTo(p[0], p[1], (p[0] + q[0]) / 2, (p[1] + q[1]) / 2); }
+    ctx.lineTo(P[n - 1][0], P[n - 1][1]);
+  }
+}
+// sketchy stroke. o: closed, color, w, amt, key, alpha, frac (write-on), double
+function ink(P, o = {}) {
+  const closed = !!o.closed, key = o.key ?? 'ink';
+  let Q = o.raw ? P : wobble(P, closed, o.amt ?? 1.8, key);
+  let cl = closed;
+  if (o.frac != null && o.frac < 1) { if (o.frac <= 0) return Q; Q = subPath(closed ? [...Q, Q[0]] : Q, o.frac); cl = false; }
+  ctx.strokeStyle = o.color || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.globalAlpha = o.alpha ?? 1;
+  trace(Q, cl); ctx.stroke();
+  if (o.double) {
+    let Q2 = wobble(P, closed, (o.amt ?? 1.8) * 1.6 + 0.8, key + '~');
+    if (!cl && closed) Q2 = subPath([...Q2, Q2[0]], o.frac ?? 1);
+    ctx.lineWidth = (o.w ?? 3) * 0.4; ctx.globalAlpha = (o.alpha ?? 1) * 0.55; trace(Q2, cl); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return Q;
+}
+// filled shape + textures (clipped) + ink outline
+function paint(P, o = {}) {
+  const key = o.key || 'paint';
+  const Q = o.raw ? P : wobble(P, true, o.amt ?? 1.6, key);
+  ctx.save();
+  trace(Q, true);
+  if (o.fill) { ctx.globalAlpha = o.fillAl ?? 1; ctx.fillStyle = o.fill; ctx.fill(); ctx.globalAlpha = 1; }
+  if (o.tex) { ctx.clip(); const bb = bbox(Q, 6); o.tex.forEach((t, i) => texture(bb, { key: key + ':' + i, ...t })); }
+  ctx.restore();
+  if (o.line !== false) {
+    ctx.strokeStyle = o.line || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.globalAlpha = o.lineAl ?? 1; trace(Q, true); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  return Q;
+}
+function texture(bb, t) {
+  if (t.k === 'hatch') hatch(bb, t);
+  else if (t.k === 'cross') { hatch(bb, t); hatch(bb, { ...t, a: (t.a ?? 0.7) + (t.a2 ?? 1.25), key: t.key + 'x' }); }
+  else if (t.k === 'pencil') pencil(bb, t);
+  else if (t.k === 'stipple') stipple(bb, t);
+  else if (t.k === 'fn') t.fn(bb);
+}
+// parallel hatching inside current clip. t: a angle, gap, c, w, al, dash [min,max], skip, dens(x,y)
+function hatch(bb, t) {
+  const a = t.a ?? 0.7, gap = t.gap ?? 7, S = RNG('hs', t.key), R = RNG('hj', t.key, B);
+  const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2, rad = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2 + 4;
+  const ca = Math.cos(a), sa = Math.sin(a), dens = t.dens, jit = t.jit ?? 0.9, dash = t.dash;
+  ctx.beginPath();
+  for (let d = -rad; d <= rad; d += gap) {
+    const dd = d + S.n(gap * 0.3);
+    let u = -rad + (dash ? S.r(0, dash[1]) : 0);
+    while (u < rad) {
+      const len = dash ? S.r(dash[0], dash[1]) : rad * 2, u2 = Math.min(rad, u + len);
+      const mu = (u + u2) / 2, mx = cx + ca * mu - sa * dd, my = cy + sa * mu + ca * dd, p = S.f();
+      if (!dens || p < dens(mx, my)) {
+        const e1 = R.n(jit), e2 = R.n(jit);
+        ctx.moveTo(cx + ca * u - sa * (dd + e1), cy + sa * u + ca * (dd + e1));
+        ctx.lineTo(cx + ca * u2 - sa * (dd + e2), cy + sa * u2 + ca * (dd + e2));
+      }
+      u = u2 + (dash ? S.r(t.skip?.[0] ?? 3, t.skip?.[1] ?? 12) : 0);
+    }
+  }
+  ctx.strokeStyle = t.c || C.ink; ctx.lineWidth = t.w ?? 1.2; ctx.globalAlpha = t.al ?? 0.5; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// colored-pencil diagonal strokes
+function pencil(bb, t) {
+  const S = RNG('ps', t.key), R = RNG('pj', t.key, B);
+  const area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+  const n = Math.min(t.max ?? 6000, t.n ?? Math.floor(area / (t.per ?? 700)));
+  const a = t.a ?? -0.95, L = t.len ?? 14, dens = t.dens;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), aa = a + S.n(0.22), l = L * (0.5 + S.f() * 0.7);
+    if (dens && p > dens(x, y)) continue;
+    const jx = R.n(1.1), jy = R.n(1.1), dx = Math.cos(aa) * l / 2, dy = Math.sin(aa) * l / 2;
+    ctx.moveTo(x - dx + jx, y - dy + jy); ctx.lineTo(x + dx + jx, y + dy + jy);
+  }
+  ctx.strokeStyle = t.c; ctx.lineWidth = t.w ?? 1.4; ctx.globalAlpha = t.al ?? 0.45; ctx.lineCap = 'round';
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+// square stipple dots
+function stipple(bb, t) {
+  const S = RNG('ss', t.key), R = RNG('sj', t.key, B);
+  const n = t.n ?? 400, sz = t.s ?? 2.2, dens = t.dens, jit = t.jit ?? 0.8;
+  ctx.fillStyle = t.c; ctx.globalAlpha = t.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = S.r(bb.x0, bb.x1), y = S.r(bb.y0, bb.y1), p = S.f(), s = sz * (0.6 + S.f() * 0.8);
+    if (dens && p > dens(x, y)) continue;
+    ctx.rect(x + R.n(jit), y + R.n(jit), s, s);
+  }
+  ctx.fill(); ctx.globalAlpha = 1;
+}
+// screen-space paper grain, reseeded with the boil
+function grain(o = {}) {
+  ctx.save(); screen();
+  const R = RNG('grain', B), n = o.n ?? 2600;
+  ctx.fillStyle = o.dark || 'rgba(70,45,25,0.13)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.7, 1.7);
+  ctx.fill();
+  ctx.fillStyle = o.light || 'rgba(255,250,236,0.20)'; ctx.beginPath();
+  for (let i = 0; i < n; i++) ctx.rect(R.r(0, W), R.r(0, H), 1.9, 1.9);
+  ctx.fill();
+  // a few paper fibres
+  ctx.strokeStyle = 'rgba(80,55,35,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i = 0; i < 90; i++) { const x = R.r(0, W), y = R.r(0, H), a = R.r(0, TAU), l = R.r(6, 22); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  construction lines, rulers, sparks, bursts, rainbow contours
+// ---------------------------------------------------------------------
+function construct(cx, cy, r, o = {}) {
+  const R = RNG('con', o.key ?? 'c', B);
+  ctx.save();
+  ctx.strokeStyle = o.c || C.lav; ctx.lineWidth = o.w ?? 1.4; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const a0 = (o.a0 ?? R.r(0, TAU)), sw = o.sweep ?? 1.05;
+  ctx.beginPath(); ctx.ellipse(cx + R.n(1.2), cy + R.n(1.2), r, r * (o.sq ?? 1), o.rot ?? 0, a0, a0 + TAU * sw); ctx.stroke();
+  if (o.cross) { const k = o.cross; ctx.beginPath(); ctx.moveTo(cx - k, cy); ctx.lineTo(cx + k, cy); ctx.moveTo(cx, cy - k); ctx.lineTo(cx, cy + k); ctx.stroke(); }
+  if (o.ticks) {
+    ctx.beginPath();
+    for (let i = 0; i < o.ticks; i++) { const a = i / o.ticks * TAU + (o.rot ?? 0); ctx.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6)); ctx.lineTo(cx + Math.cos(a) * (r + 6), cy + Math.sin(a) * (r + 6)); }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function cline(x1, y1, x2, y2, o = {}) {
+  const R = RNG('cl', o.key ?? 'l', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.lavS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1;
+  ctx.beginPath(); ctx.moveTo(x1 + R.n(1), y1 + R.n(1)); ctx.lineTo(x2 + R.n(1), y2 + R.n(1)); ctx.stroke(); ctx.restore();
+}
+function ruler(x1, y1, x2, y2, o = {}) {
+  const R = RNG('rul', o.key ?? 'r', B);
+  const L = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / L, uy = (y2 - y1) / L, nx = -uy, ny = ux;
+  const frac = clamp(o.frac ?? 1), step = o.step ?? 16, tk = o.tick ?? 7, side = o.side ?? 1;
+  ctx.save(); ctx.strokeStyle = o.c || C.periD; ctx.lineWidth = o.w ?? 1.5; ctx.globalAlpha = o.al ?? 1; ctx.lineCap = 'round';
+  const jx = R.n(0.8), jy = R.n(0.8);
+  ctx.beginPath(); ctx.moveTo(x1 + jx, y1 + jy); ctx.lineTo(x1 + ux * L * frac + jx, y1 + uy * L * frac + jy);
+  const n = Math.floor(L * frac / step);
+  for (let i = 0; i <= n; i++) {
+    const k = i % 5 === 0 ? tk * 1.9 : tk, px = x1 + ux * i * step + jx, py = y1 + uy * i * step + jy;
+    ctx.moveTo(px, py); ctx.lineTo(px + nx * k * side, py + ny * k * side);
+  }
+  ctx.moveTo(x1 - nx * tk * 1.6, y1 - ny * tk * 1.6); ctx.lineTo(x1 + nx * tk * 2.2, y1 + ny * tk * 2.2);
+  if (frac >= 1) { ctx.moveTo(x2 - nx * tk * 1.6, y2 - ny * tk * 1.6); ctx.lineTo(x2 + nx * tk * 2.2, y2 + ny * tk * 2.2); }
+  ctx.stroke(); ctx.restore();
+}
+// glowing radial spark (dark world)
+function sparkBurst(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  const R = RNG('spk', o.key ?? 's', B), n = o.n ?? 18, rays = [];
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + R.n(0.14); rays.push([a, r * R.r(0.28, 0.5), r * R.r(0.72, 1.15)]); }
+  const path = () => { ctx.beginPath(); for (const [a, r0, r1] of rays) { ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0); ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); } };
+  ctx.save(); ctx.lineCap = 'round';
+  path(); ctx.strokeStyle = o.glow || 'rgba(82,214,196,0.22)'; ctx.lineWidth = (o.w ?? 2.4) * 3.4; ctx.stroke();
+  path(); ctx.strokeStyle = o.c || '#8ff5e6'; ctx.lineWidth = o.w ?? 2.4; ctx.stroke();
+  if (o.core !== false) {
+    const cr = Math.max(2.5, r * (o.coreR ?? 0.15));
+    ctx.beginPath(); ctx.arc(cx, cy, cr * 2.2, 0, TAU); ctx.fillStyle = 'rgba(190,215,255,0.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy, cr, 0, TAU); ctx.fillStyle = C.white; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = C.periD; ctx.stroke();
+  }
+  if (o.specks) { ctx.fillStyle = o.c || '#8ff5e6'; for (let i = 0; i < o.specks; i++) { const a = R.r(0, TAU), d = r * R.r(0.2, 1.4); ctx.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, 2, 2); } }
+  ctx.restore();
+}
+// radial tick burst (warm world impact)
+function burst(cx, cy, r0, r1, o = {}) {
+  const R = RNG('bur', o.key ?? 'b', B), n = o.n ?? 12;
+  ctx.save(); ctx.strokeStyle = o.c || C.ink; ctx.lineWidth = o.w ?? 3; ctx.lineCap = 'round'; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = i / n * TAU + R.n(0.15) + (o.rot ?? 0), a1 = r0 * R.r(0.85, 1.1), b1 = r1 * R.r(0.75, 1.15);
+    ctx.moveTo(cx + Math.cos(a) * a1, cy + Math.sin(a) * a1); ctx.lineTo(cx + Math.cos(a) * b1, cy + Math.sin(a) * b1);
+  }
+  ctx.stroke(); ctx.restore();
+}
+function star4(x, y, s, c) {
+  ctx.save(); ctx.fillStyle = c; ctx.beginPath();
+  ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y); ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y); ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill(); ctx.restore();
+}
+// rainbow contour strokes around a moving part
+function rainbow(P, o = {}) {
+  const bb = bbox(P), cx = o.cx ?? (bb.x0 + bb.x1) / 2, cy = o.cy ?? (bb.y0 + bb.y1) / 2, n = o.n ?? 3;
+  for (let i = 0; i < n; i++) {
+    const S = RNG('rb', o.key, i, B), sc = 1 + (o.spread ?? 0.07) * (i + 1) + S.n(0.02);
+    const Q = P.map(([x, y]) => [cx + (x - cx) * sc + S.n(o.drift ?? 3), cy + (y - cy) * sc + S.n(o.drift ?? 3)]);
+    ink(Q, { closed: o.closed ?? true, color: RAINBOW[(i + (o.off ?? 0)) % RAINBOW.length], w: o.w ?? 1.6, amt: o.amt ?? 3.5, key: o.key + 'rb' + i, alpha: o.al ?? 0.85 });
+  }
+}
+// hex cell grid inside current clip
+function hexGrid(bb, size, o = {}) {
+  const h = size * Math.sqrt(3), R = RNG('hex', o.key ?? 'h', B);
+  ctx.save(); ctx.strokeStyle = o.c || C.periS; ctx.lineWidth = o.w ?? 1.2; ctx.globalAlpha = o.al ?? 1; ctx.beginPath();
+  let row = 0;
+  for (let y = bb.y0 - h; y < bb.y1 + h; y += h * 0.5, row++) {
+    for (let x = bb.x0 - size * 3 + (row % 2) * size * 1.5; x < bb.x1 + size * 3; x += size * 3) {
+      const jx = R.n(0.6), jy = R.n(0.6);
+      for (let k = 0; k < 6; k++) {
+        const a = k / 6 * TAU, b = (k + 1) / 6 * TAU;
+        if (k === 0) ctx.moveTo(x + Math.cos(a) * size + jx, y + Math.sin(a) * size + jy);
+        ctx.lineTo(x + Math.cos(b) * size + jx, y + Math.sin(b) * size + jy);
+      }
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  iris, camera, text
+// ---------------------------------------------------------------------
+// ragged hatched rim; dir=+1 strokes reach outward, -1 inward
+function irisRim(cx, cy, r, dir, o = {}) {
+  const R = RNG('irisR', o.key ?? 'i', B), n = Math.min(1600, Math.floor(r * TAU / 2.0));
+  ctx.strokeStyle = o.c || '#0b0c17'; ctx.lineWidth = o.w ?? 1.6; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = R.r(0, TAU), L = R.r(3, 11) + (R.f() < 0.28 ? R.r(10, 34) : 0), sl = R.n(0.4);
+    const r0 = r - dir * R.r(2, 6), r1 = r + dir * L, ax = Math.cos(a), ay = Math.sin(a);
+    ctx.moveTo(cx + ax * r0, cy + ay * r0); ctx.lineTo(cx + ax * r1 - ay * L * sl, cy + ay * r1 + ax * L * sl);
+  }
+  ctx.stroke();
+}
+// iris into a black hole (screen space)
+function irisHole(cx, cy, r, o = {}) {
+  if (r <= 0.5) return;
+  ctx.save(); screen();
+  const col = o.c || '#0b0c17';
+  const P = wobble(ellipsePts(cx, cy, r, r, 0, 140), true, Math.min(4, 0.6 + r * 0.02), 'ih' + (o.key ?? ''), 9);
+  trace(P, true); ctx.fillStyle = col; ctx.fill();
+  irisRim(cx, cy, r, +1, { c: col, key: o.key });
+  if (o.inner) { ctx.save(); trace(P, true); ctx.clip(); o.inner(r); ctx.restore(); }
+  ctx.restore();
+}
+// world point (cx,cy) lands at screen centre
+function camera(cx, cy, zoom = 1, rot = 0, sx = 0, sy = 0) {
+  const c = Math.cos(rot) * zoom, s = Math.sin(rot) * zoom;
+  ctx.setTransform(c, s, -s, c, W / 2 + sx - (c * cx - s * cy), H / 2 + sy - (s * cx + c * cy));
+}
+function screen() { ctx.setTransform(1, 0, 0, 1, 0, 0); }
+function toScreen(x, y) { const p = ctx.getTransform().transformPoint(new DOMPoint(x, y)); return [p.x, p.y]; }
+function fillAll(color) { ctx.save(); screen(); ctx.fillStyle = color; ctx.fillRect(0, 0, W, H); ctx.restore(); }
+
+// monospace text with per-glyph hand jitter
+function monoText(str, x, y, size, color, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight ?? 700} ${size}px ${MONO}`; ctx.fillStyle = color; ctx.textBaseline = 'alphabetic';
+  const cw = ctx.measureText('M').width, R = RNG('txt', o.key ?? str, B), jit = o.jit ?? 0.9;
+  const n = Math.min(o.count ?? str.length, str.length);
+  ctx.globalAlpha = o.al ?? 1;
+  for (let i = 0; i < n; i++) {
+    const ch = str[i]; if (ch === ' ') continue;
+    ctx.save(); ctx.translate(x + i * cw + R.n(jit), y + R.n(jit)); ctx.rotate(R.n(0.045)); ctx.fillText(ch, 0, 0); ctx.restore();
+  }
+  ctx.restore();
+  return cw;
+}
+function monoW(size) { ctx.save(); ctx.font = `700 ${size}px ${MONO}`; const w = ctx.measureText('M').width; ctx.restore(); return w; }
+
+// single-stroke hand lettering (x-height 0.5, ascender 1.0, baseline 0)
+const GLYPHS = {
+  ' ': { w: 0.26, s: [] },
+  c: { w: 0.5, s: [arcPts(0.26, -0.25, 0.25, -35 * DEG, -322 * DEG, 22)] },
+  o: { w: 0.52, s: [arcPts(0.26, -0.25, 0.25, -95 * DEG, -460 * DEG, 30)] },
+  a: { w: 0.54, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -0.5], [0.49, -0.05], [0.55, 0.0]]] },
+  d: { w: 0.56, s: [[...arcPts(0.25, -0.25, 0.235, -28 * DEG, -335 * DEG, 24)], [[0.49, -1.0], [0.49, -0.05], [0.56, 0.0]]] },
+  l: { w: 0.24, s: [[[0.08, -1.0], [0.08, -0.1], [0.12, -0.01], [0.2, 0.0]]] },
+  u: { w: 0.54, s: [[[0.03, -0.5], [0.03, -0.22], ...arcPts(0.255, -0.22, 0.225, 180 * DEG, 0, 14), [0.48, -0.5]], [[0.48, -0.5], [0.48, -0.04], [0.54, 0.0]]] },
+  e: { w: 0.52, s: [[[0.03, -0.26], [0.5, -0.26], ...arcPts(0.265, -0.25, 0.245, -4 * DEG, -318 * DEG, 26)]] },
+};
+function handwrite(str, x, y, size, o = {}) {
+  const strokes = []; let pen = 0;
+  for (const ch of str) {
+    const g = GLYPHS[ch] || GLYPHS[' '];
+    for (const s of g.s) strokes.push(s.map(([u, v]) => [x + (pen + u) * size, y + v * size]));
+    pen += g.w + 0.1;
+  }
+  const lens = strokes.map(pathLen), total = lens.reduce((a, b) => a + b, 0);
+  let budget = clamp(o.frac ?? 1) * total;
+  for (let i = 0; i < strokes.length && budget > 0; i++) {
+    const f = Math.min(1, budget / lens[i]); budget -= lens[i];
+    if (o.glow) ink(strokes[i], { color: o.glow, w: (o.w ?? size * 0.06) * 3, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+    ink(strokes[i], { color: o.c, w: o.w ?? size * 0.06, amt: o.amt ?? 1.0, key: 'hw' + i + str, frac: f });
+  }
+  return pen * size;
+}
+
+// =====================================================================
+// ---- small props and helpers
+function drawPencil(tx, ty, ang, len, k = 1, key = 'pencil') {
+  ctx.save(); ctx.translate(tx, ty); ctx.rotate(ang); ctx.scale(k, k);
+  paint([[46, -16], [len, -16], [len, 16], [46, 16]], {
+    fill: C.yellow, key: key + 'b', w: 3,
+    tex: [{ k: 'hatch', a: 0.05, gap: 5, c: '#a8741d', al: 0.55, w: 1.1, dash: [20, 90], dens: (x, y) => (y > 5 ? 1 : 0.08) }, { k: 'pencil', c: '#fff1b8', al: 0.5, a: 0.05, len: 30, per: 120, dens: (x, y) => (y < -4 ? 1 : 0.1) }],
+  });
+  ink([[50, -5], [len, -5]], { w: 1.6, key: key + 'f1', alpha: 0.7 });
+  ink([[50, 6], [len, 6]], { w: 1.6, key: key + 'f2', alpha: 0.7 });
+  paint([[1, 0], [46, -15], [46, 15]], { fill: '#efcf9f', key: key + 'c', w: 2.6, tex: [{ k: 'hatch', a: 1.2, gap: 4, al: 0.35, dens: (x, y) => (y > 2 ? 1 : 0.1) }] });
+  paint([[0, 0], [15, -5], [15, 5]], { fill: '#3b3438', key: key + 't', w: 2 });
+  paint([[len, -17], [len + 26, -17], [len + 26, 17], [len, 17]], { fill: '#bcb7ab', key: key + 'fe', w: 2.6, tex: [{ k: 'hatch', a: Math.PI / 2, gap: 5, al: 0.5 }] });
+  paint(rrectPts(len + 24, -16, 34, 32, 10), { fill: '#e58f8c', key: key + 'e', w: 2.6, tex: [{ k: 'pencil', c: C.roseD, al: 0.5, per: 60 }] });
+  ctx.restore();
+}
+// smoothstep of x between a and b (NOT manim's `smooth` rate function — the math style calls that smoothM)
+const smooth = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const mod = (a, n) => ((a % n) + n) % n;
+function asterisk(x, y, r0, r1, n, rot, color, w) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round'; ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = i / n * TAU + rot; ctx.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); ctx.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); }
+  ctx.stroke(); ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  time (set by the renderer): TT = absolute time on the motion step (on 2s unless STYLE.ones);
+//  E0 = the current era's start; DEFER = overlay queue (captions drawn after the camera); SPARK_AT = the hero's screen spot
+//  ev(t, d) = 0..1 progress of an event at t over d seconds; popS(t) = back-eased pop-in scale
+// ---------------------------------------------------------------------
+let TT = 0, E0 = 0, DEFER = null, SPARK_AT = null;
+const ev = (t, d = 0.25) => clamp((TT - t) / d);
+const popS = (t) => (TT < t ? 0 : EZ.back(clamp((TT - t) / 0.25)));
+
+// ---------------------------------------------------------------------
+//  springs: closed-form, so any frame can be drawn on its own (deterministic, no state)
+//  springEase(t, k, d)       0 -> 1 over time t >= 0 (stiffness k, damping d): accelerates, overshoots a hair, settles
+//  springMove(t0, a, b, p)   a value moving from a to b, starting at time t0 (p = a SPRING preset)
+//  springTrack(keys, p)      a value with many targets: keys = [[t, value], ...] sorted by t. One spring per change,
+//                            added up, so a target change mid-move stays continuous (cursors, widths, positions)
+// ---------------------------------------------------------------------
+const SPRING = {
+  snappy: { k: 320, d: 30 },    // UI: buttons, toggles, leading edges
+  smooth: { k: 170, d: 26 },    // cards, containers, the camera
+  heavy: { k: 90, d: 19 },      // big type, logos, large objects
+  playful: { k: 260, d: 14 },   // mascots, stickers: visible overshoot
+};
+function springEase(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) { const wd = w0 * Math.sqrt(1 - z * z); return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t)); }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+const springMove = (t0, a, b, p = SPRING.smooth) => a + (b - a) * springEase(TT - t0, p.k, p.d);
+function springTrack(keys, p = SPRING.smooth) {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * springEase(TT - keys[i][0], p.k, p.d);
+  return v;
+}
+
+// ---------------------------------------------------------------------
+//  layout for several formats (9:16, 1:1, 16:9, 4:5 from one piece): place things by fractions of the frame,
+//  size them by UNIT (1 at 1080 on the short side). LX(0.5), LY(0.62), 120 * UNIT. PORTRAIT / WIDE pick layouts.
+// ---------------------------------------------------------------------
+const LX = (f) => f * W, LY = (f) => f * H, UNIT = Math.min(W, H) / 1080, PORTRAIT = H > W * 1.2, WIDE = W > H * 1.2;
+
+// ---------------------------------------------------------------------
+//  the user's own assets (screenshots, logos): files in <piece>/assets/ that tools/build.mjs embeds in the page.
+//  asset('logo.png') -> the Image (or null); drawAsset(name, x, y, w, h, { fit: 'contain'|'cover', r, alpha })
+//  Real product UI only: never redraw a product screen from imagination when a screenshot exists.
+// ---------------------------------------------------------------------
+const asset = (name) => (typeof ASSETS !== 'undefined' && ASSETS[name] && ASSETS[name].complete ? ASSETS[name] : null);
+function drawAsset(name, x, y, w, h, o = {}) {
+  const img = asset(name); if (!img) return false;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const s = (o.fit === 'cover' ? Math.max : Math.min)(w / iw, h / ih), dw = iw * s, dh = ih * s;
+  ctx.save(); ctx.globalAlpha *= o.alpha ?? 1;
+  if (o.r || o.fit === 'cover') { ctx.beginPath(); ctx.roundRect(x, y, w, h, o.r || 0); ctx.clip(); }
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+  ctx.restore(); return true;
+}
+// =====================================================================
+//  styles/metro-map/kit.js — a transit (subway) diagram come alive.
+//  For narrated explainers about time and sequence: chronologies, roadmaps, stages of a journey, "where we are now".
+//  An original, generic transit-diagram look (no real city's map, names, roundel or signage): thick flat-colour lines
+//  that run only at 0 / 45 / 90 degrees with generous round bends, white station discs with a dark ring, capsule
+//  interchanges, bar termini, tick stops, line bullets, a legend box, a pulsing "you are here" marker, a pale river
+//  band, park and zone tints. Flat fills only: no gradients, no shadows, no texture.
+//  The hero is a small train capsule with a headlight eye: it is the "now" of the story and rides the line.
+//  Motion on 1s, smooth and steady: lines grow at constant speed, stations pop when the head passes, labels slide
+//  out from behind them, the train eases out of a stop and into the next, the camera glides with it.
+//  Widths and type are in WORLD units (they scale with the camera, like a real map being zoomed).
+//  Built on kit/core.js. Needs from the piece head: W, H, FPS, CX (caption centre x).
+//  Every reveal takes an absolute start time `t0` (seconds on the piece clock), so a narrated piece can cue it on a word.
+// =====================================================================
+
+// ---- palette (6-digit hex: the renderer's mixHex blends these)
+const MM = {
+  ground: '#f6f4ee', ink: '#1d2330', muted: '#8a8f9a', white: '#ffffff',
+  red: '#e23d3d', blue: '#2a6fdb', green: '#1f9d63', yellow: '#f2b414', purple: '#8a55c7', orange: '#f07f2e',   // the lines
+  water: '#cfe5f2', waterL: '#e9f3f9', waterD: '#6c9dbb',      // the river band, its drifting dashes, its label
+  park: '#dcebd2', parkD: '#6c9a58',                            // park tint and its label
+  zone: '#ebe7dc', zoneD: '#a39b86',                            // zone tint and its label
+  plan: '#d9d5c9',                                              // a planned (not yet built) line
+};
+const MM_W = 26;                                                // line width, world units
+const MM_SANS = '"Helvetica Neue", Helvetica, "Segoe UI", Inter, Roboto, Arial, "Liberation Sans", "DejaVu Sans", sans-serif';
+const MM_VIEW = { top: -1e9, bottom: 1e9 };                    // the map window in screen px (mmView): labels outside it are not drawn
+const MM_WARNED = new Set();
+
+// ---------------------------------------------------------------------
+//  timing
+// ---------------------------------------------------------------------
+// constant speed with eased ends: u 0..1 -> 0..1 (e = the share of the time spent accelerating, and braking)
+function mmGlide(u, e = 0.15) {
+  u = clamp(u); if (e <= 0) return u;
+  const v = 1 / (1 - e);
+  return u < e ? v * u * u / (2 * e) : u > 1 - e ? 1 - v * (1 - u) * (1 - u) / (2 * e) : v * (u - e / 2);
+}
+function mmGlideInv(s, e = 0.15) {
+  s = clamp(s); if (e <= 0) return s;
+  const v = 1 / (1 - e), s0 = v * e / 2;
+  return s < s0 ? Math.sqrt(2 * e * s / v) : s > 1 - s0 ? 1 - Math.sqrt(2 * e * (1 - s) / v) : s / v + e / 2;
+}
+const mmIO = (t) => { t = clamp(t); return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t); };   // a train's ease: soft out of a stop, soft into the next
+const mmPop = (t0, d = 0.25) => (t0 == null ? 1 : TT < t0 ? 0 : EZ.back(clamp((TT - t0) / d)));
+const mmIn = (t0, d = 0.25) => (t0 == null ? 1 : TT < t0 ? 0 : EZ.o3(clamp((TT - t0) / d)));
+// the map window in screen px: labels and tags are not drawn once they have scrolled fully above `top` (under the
+// title strip) or while their station is below `bottom` (the caption band). Call it first in every scene.
+function mmView(top, bottom) { MM_VIEW.top = top ?? -1e9; MM_VIEW.bottom = bottom ?? 1e9; }
+
+// ---------------------------------------------------------------------
+//  paths: a route is a dense list of points [[x, y], ...] with cached arc lengths
+// ---------------------------------------------------------------------
+function mmCum(P) {
+  if (P._cum) return P._cum;
+  const c = [0]; for (let i = 1; i < P.length; i++) c.push(c[i - 1] + dist(P[i - 1], P[i]));
+  P._cum = c; return c;
+}
+const mmLen = (P) => { const c = mmCum(P); return c[c.length - 1]; };
+// the point at a fraction of the path: [x, y, tangent angle]
+function mmAt(P, frac) {
+  const c = mmCum(P), n = P.length, s = clamp(frac) * c[n - 1];
+  let lo = 0, hi = n - 2;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (c[m] <= s) lo = m; else hi = m - 1; }
+  const a = P[lo], b = P[lo + 1], d = c[lo + 1] - c[lo] || 1, k = clamp((s - c[lo]) / d);
+  return [lerp(a[0], b[0], k), lerp(a[1], b[1], k), Math.atan2(b[1] - a[1], b[0] - a[0])];
+}
+// the fraction of the path nearest to a point (place a station by its coordinates)
+function mmFracAt(P, pt) {
+  const c = mmCum(P); let best = 0, bd = 1e18;
+  for (let i = 0; i < P.length - 1; i++) {
+    const a = P[i], b = P[i + 1], dx = b[0] - a[0], dy = b[1] - a[1], L2 = dx * dx + dy * dy || 1;
+    const k = clamp(((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / L2), d = Math.hypot(a[0] + dx * k - pt[0], a[1] + dy * k - pt[1]);
+    if (d < bd) { bd = d; best = (c[i] + (c[i + 1] - c[i]) * k) / c[c.length - 1]; }
+  }
+  return best;
+}
+// the stretch of the path between two fractions
+function mmSub(P, f0, f1) {
+  const c = mmCum(P), L = c[c.length - 1], s0 = clamp(f0) * L, s1 = clamp(f1) * L, out = [];
+  if (s1 <= s0) return out;
+  out.push(mmAt(P, f0)); for (let i = 0; i < P.length; i++) if (c[i] > s0 && c[i] < s1) out.push(P[i]); out.push(mmAt(P, f1));
+  return out;
+}
+// waypoints -> a dense rounded octilinear path. Every segment must run at 0 / 45 / 90 degrees: one that does not is
+// reported in the console and (unless o.snap === false) turned to the nearest allowed angle, keeping its length.
+// Bends are arcs of radius o.r (default 3 line widths; keep it at 2.5 or more), shortened only when a segment is too short.
+function mmRoute(pts, o = {}) {
+  const r = o.r ?? MM_W * 3, A8 = Math.PI / 4, Q = [[pts[0][0], pts[0][1]]];
+  for (let i = 1; i < pts.length; i++) {
+    const a = Q[Q.length - 1]; let dx = pts[i][0] - a[0], dy = pts[i][1] - a[1];
+    const L = Math.hypot(dx, dy); if (L < 1e-6) continue;
+    const ang = Math.atan2(dy, dx), sn = Math.round(ang / A8) * A8;
+    if (Math.abs(ang - sn) > 0.006) {
+      const msg = `mmRoute: segment ${i} (${a.map(Math.round)} -> ${[pts[i][0], pts[i][1]].map(Math.round)}) runs at ${(ang / DEG).toFixed(1)} deg, not 0/45/90` + (o.snap === false ? '' : `; snapped to ${Math.round(sn / DEG)} deg`);
+      if (!MM_WARNED.has(msg)) { MM_WARNED.add(msg); console.warn(msg); }
+      if (o.snap !== false) { dx = Math.cos(sn) * L; dy = Math.sin(sn) * L; }
+    }
+    Q.push([a[0] + dx, a[1] + dy]);
+  }
+  const out = [Q[0]];
+  for (let i = 1; i < Q.length - 1; i++) {
+    const a = Q[i - 1], b = Q[i], c = Q[i + 1], l1 = dist(a, b), l2 = dist(b, c);
+    const u1 = [(b[0] - a[0]) / l1, (b[1] - a[1]) / l1], u2 = [(c[0] - b[0]) / l2, (c[1] - b[1]) / l2];
+    const cr = u1[0] * u2[1] - u1[1] * u2[0], phi = Math.atan2(Math.abs(cr), u1[0] * u2[0] + u1[1] * u2[1]);
+    if (phi < 1e-3) continue;                                   // straight on: no bend
+    if (phi > Math.PI - 1e-3) { out.push(b); continue; }        // a reversal: keep the corner
+    const tn = Math.tan(phi / 2), t = Math.min(r * tn, l1 * 0.5, l2 * 0.5), rr = t / tn, sg = Math.sign(cr);
+    const s = [b[0] - u1[0] * t, b[1] - u1[1] * t], cx = s[0] - u1[1] * rr * sg, cy = s[1] + u1[0] * rr * sg;
+    const a0 = Math.atan2(s[1] - cy, s[0] - cx), n = Math.max(3, Math.ceil(rr * phi / 5));
+    for (let j = 0; j <= n; j++) { const q = a0 + sg * phi * j / n; out.push([cx + Math.cos(q) * rr, cy + Math.sin(q) * rr]); }
+  }
+  out.push(Q[Q.length - 1]);
+  const P = resample(out, false, 10); P.way = Q; P.r = r;
+  return P;
+}
+// a route from relative moves: mmPath([x0, y0], 'S 300', 'SE 200', 'S 400', { r }). Directions N E S W NE SE SW NW;
+// the number is the distance for N/E/S/W and the distance PER AXIS for diagonals ('SE 200' = 200 right and 200 down).
+const MM_DIR = { N: [0, -1], S: [0, 1], E: [1, 0], W: [-1, 0], NE: [1, -1], SE: [1, 1], SW: [-1, 1], NW: [-1, -1] };
+function mmPath(start, ...moves) {
+  const o = moves.length && typeof moves[moves.length - 1] === 'object' ? moves.pop() : {};
+  const pts = [[start[0], start[1]]];
+  for (const m of moves) {
+    const [d, n] = String(m).trim().split(/\s+/), v = MM_DIR[d.toUpperCase()], k = Number(n), p = pts[pts.length - 1];
+    if (!v || !isFinite(k)) { const msg = `mmPath: cannot read move "${m}"`; if (!MM_WARNED.has(msg)) { MM_WARNED.add(msg); console.warn(msg); } continue; }
+    pts.push([p[0] + v[0] * k, p[1] + v[1] * k]);
+  }
+  return mmRoute(pts, o);
+}
+// a parallel copy of a route, d world units to the traveller's right (negative = left): lines sharing a corridor
+// sit side by side at +-(MM_W / 2 + 2).
+function mmOffset(P, d) {
+  const n = P.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const a = P[Math.max(0, i - 1)], b = P[Math.min(n - 1, i + 1)], L = dist(a, b) || 1;
+    out.push([P[i][0] - (b[1] - a[1]) / L * d, P[i][1] + (b[0] - a[0]) / L * d]);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------
+//  drawing basics
+// ---------------------------------------------------------------------
+function mmPoly(Q, closed) { ctx.beginPath(); if (!Q.length) return; ctx.moveTo(Q[0][0], Q[0][1]); for (let i = 1; i < Q.length; i++) ctx.lineTo(Q[i][0], Q[i][1]); if (closed) ctx.closePath(); }
+function mmStroke(Q, color, w, cap = 'round') { if (Q.length < 2) return; ctx.save(); mmPoly(Q); ctx.lineWidth = w; ctx.strokeStyle = color; ctx.lineCap = cap; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore(); }
+function mmDisc(x, y, r, c) { if (r <= 0) return; ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = c; ctx.fill(); }
+// a rounded box path; rb = radius of the left corners, rf = of the right corners (default the same)
+function mmBox(x, y, w, h, rb, rf = rb) {
+  rb = Math.max(0, Math.min(rb, w / 2, h / 2)); rf = Math.max(0, Math.min(rf, w / 2, h / 2));
+  ctx.beginPath(); ctx.moveTo(x + rb, y); ctx.lineTo(x + w - rf, y); ctx.arcTo(x + w, y, x + w, y + rf, rf); ctx.lineTo(x + w, y + h - rf); ctx.arcTo(x + w, y + h, x + w - rf, y + h, rf);
+  ctx.lineTo(x + rb, y + h); ctx.arcTo(x, y + h, x, y + h - rb, rb); ctx.lineTo(x, y + rb); ctx.arcTo(x, y, x + rb, y, rb); ctx.closePath();
+}
+function mmPlate(x, y, w, h, r, fill, ring = 0, ringC = MM.ink) {   // a flat plate, optionally with a dark ring inside its edge
+  if (ring > 0) { mmBox(x, y, w, h, r); ctx.fillStyle = ringC; ctx.fill(); mmBox(x + ring, y + ring, w - ring * 2, h - ring * 2, Math.max(0, r - ring)); ctx.fillStyle = fill; ctx.fill(); } else { mmBox(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill(); }
+}
+function mmFont(size, weight = 700, italic = false, track = 0) { ctx.font = `${italic ? 'italic ' : ''}${weight} ${size}px ${MM_SANS}`; if ('letterSpacing' in ctx) ctx.letterSpacing = track + 'px'; }
+function mmTextW(str, size, weight = 700, track = 0) { ctx.save(); mmFont(size, weight, false, track); const w = ctx.measureText(str).width; ctx.restore(); return w - track; }
+function mmText(str, x, y, size, color, o = {}) {
+  ctx.save(); mmFont(size, o.weight ?? 700, o.italic, o.track ?? 0); ctx.fillStyle = color; ctx.textAlign = o.align ?? 'left'; ctx.textBaseline = 'alphabetic';
+  if (o.al != null) ctx.globalAlpha *= clamp(o.al);
+  const w = ctx.measureText(str).width - (o.track ?? 0);
+  // map text (drawn in a scene, not a deferred caption) that has scrolled fully under the title strip is not drawn
+  // nor is map text below the window's bottom (the caption band): it fades out over the last 40px
+  if (DEFER && (MM_VIEW.top > -1e8 || MM_VIEW.bottom < 1e8)) {
+    const m = ctx.getTransform(), z = Math.abs(m.d || m.a), sy = m.b * x + m.d * y + m.f, low = clamp((MM_VIEW.bottom - (sy - size * 0.75 * z)) / 40);
+    if (sy + size * 0.3 * z < MM_VIEW.top || low <= 0) { ctx.restore(); return w; }
+    ctx.globalAlpha *= low;
+  }
+  if (ctx.globalAlpha > 0.004) ctx.fillText(str, x, y);
+  ctx.restore(); return w;
+}
+// does dark or white type sit better on this fill? (yellow takes ink, the rest take white)
+function mmOn(c) { const v = [1, 3, 5].map((i) => parseInt(String(c).slice(i, i + 2), 16) / 255); return 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2] > 0.66 ? MM.ink : MM.white; }
+
+// ---------------------------------------------------------------------
+//  ground, water, tints
+// ---------------------------------------------------------------------
+function mmGround(c = MM.ground) { fillAll(c); }
+// a river: a pale band along octilinear waypoints with round bends, and slow dashes drifting downstream.
+// o: { r, label, at (0..1 along the band), size, speed (px/s), c }
+function mmWater(pts, w = 90, o = {}) {
+  const P = pts.way ? pts : mmRoute(pts, { r: o.r ?? Math.max(w * 1.3, MM_W * 3) });
+  mmStroke(P, o.c ?? MM.water, w, 'butt');
+  ctx.save(); ctx.lineWidth = Math.max(4, w * 0.06); ctx.strokeStyle = MM.waterL; ctx.lineCap = 'round'; ctx.setLineDash([w * 0.34, w * 0.62]);
+  [-0.24, 0.22].forEach((k, i) => { mmPoly(mmOffset(P, w * k)); ctx.lineDashOffset = -TT * (o.speed ?? 26) * (i ? 0.8 : 1) + i * w * 0.45; ctx.stroke(); });
+  ctx.restore();
+  if (o.label) {
+    const p = mmAt(P, o.at ?? 0.5), size = o.size ?? 28; let a = p[2]; if (Math.cos(a) < -1e-6) a += Math.PI;
+    ctx.save(); ctx.translate(p[0], p[1]); ctx.rotate(a); mmText(o.label, 0, size * 0.34, size, MM.waterD, { weight: 600, italic: true, align: 'center', track: 1 }); ctx.restore();
+  }
+  return P;
+}
+// a tinted area. Zones have 45-degree cut corners (they echo the lines), parks are rounded.
+// o: { label, at: 'tl' | 'tr' | 'bl' | 'br', cut, r, size, t0 }
+function mmTint(x, y, w, h, c, lc, o = {}) {
+  const al = mmIn(o.t0, 0.3); if (al <= 0) return;
+  ctx.save(); ctx.globalAlpha *= al;
+  if (o.r != null) mmBox(x, y, w, h, o.r);
+  else { const k = Math.min(o.cut ?? 46, w / 2, h / 2); mmPoly([[x + k, y], [x + w - k, y], [x + w, y + k], [x + w, y + h - k], [x + w - k, y + h], [x + k, y + h], [x, y + h - k], [x, y + k]], true); }
+  ctx.fillStyle = c; ctx.fill();
+  if (o.label) {
+    const size = o.size ?? 28, at = o.at ?? 'tl', pad = size * 0.9, right = at[1] === 'r';
+    mmText(o.label, right ? x + w - pad : x + pad, at[0] === 't' ? y + pad + size * 0.6 : y + h - pad, size, lc, { weight: 700, track: 2, align: right ? 'right' : 'left' });
+  }
+  ctx.restore();
+}
+function mmZone(x, y, w, h, o = {}) { mmTint(x, y, w, h, o.c ?? MM.zone, o.lc ?? MM.zoneD, o); }
+function mmPark(x, y, w, h, o = {}) { mmTint(x, y, w, h, o.c ?? MM.park, o.lc ?? MM.parkD, { r: 34, ...o }); }
+
+// ---------------------------------------------------------------------
+//  lines
+//  The options that time a line: { t0, d | speed, from, to, ease }. It grows from fraction `from` (0) to `to` (1) of its
+//  path, starting at t0 and taking d seconds (default: length / speed, speed 520 world px/s), at constant speed with
+//  eased ends. Pass the SAME options to mmArrive / mmStationsOn so stations pop when the head passes.
+// ---------------------------------------------------------------------
+function mmLineDur(P, o = {}) { return o.d ?? mmLen(P) * ((o.to ?? 1) - (o.from ?? 0)) / (o.speed ?? 520); }
+function mmLineFrac(P, o = {}, t = TT) {   // where the head is at time t, as a fraction of the path
+  const f0 = o.from ?? 0, f1 = o.to ?? 1;
+  if (o.frac != null) return clamp(o.frac);
+  return o.t0 == null ? f1 : lerp(f0, f1, mmGlide((t - o.t0) / Math.max(1e-6, mmLineDur(P, o)), o.ease ?? 0.15));
+}
+function mmArrive(P, frac, o = {}) {       // when the head reaches a fraction of the path
+  if (o.t0 == null) return null;
+  const f0 = o.from ?? 0, f1 = o.to ?? 1;
+  return o.t0 + mmLineDur(P, o) * mmGlideInv(clamp((frac - f0) / Math.max(1e-6, f1 - f0)), o.ease ?? 0.15);
+}
+// draw a line growing along its path. o: timing (above) + { w, cap, casing (a ground-colour edge so it reads as
+// passing over what it crosses), frac (set the head yourself) }. Returns the head: [x, y, angle].
+function mmLine(P, color, o = {}) {
+  const w = o.w ?? MM_W, f0 = o.from ?? 0, f = mmLineFrac(P, o), head = mmAt(P, Math.max(f0, f));
+  if (o.t0 != null && TT < o.t0 && o.frac == null) return head;
+  if (f <= f0) return head;
+  const Q = mmSub(P, f0, f);
+  if (o.casing) mmStroke(Q, o.casing === true ? MM.ground : o.casing, w + 14, 'butt');
+  mmStroke(Q, color, w, o.cap ?? 'round');
+  return head;
+}
+
+// ---------------------------------------------------------------------
+//  labels: a bold name with an optional regular sub-label, horizontal (or at 45 degrees with o.tilt),
+//  sliding out from behind the station over 0.25s.
+// ---------------------------------------------------------------------
+const MM_SIDE = { right: [1, 0], left: [-1, 0], top: [0, -1], bottom: [0, 1], ne: [1, -1], se: [1, 1], nw: [-1, -1], sw: [-1, 1] };
+function mmLabel(x, y, gap, o = {}) {
+  if (!o.name && !o.sub) return;
+  const u = o.t0 == null ? 1 : EZ.o3(clamp((TT - o.t0 - (o.lag ?? 0.05)) / 0.25));
+  if (u <= 0) return;
+  const size = o.size ?? 42, ss = o.subSize ?? 30, side = o.side ?? 'right', v = MM_SIDE[side] || MM_SIDE.right;
+  const sp = toScreen(x, y), z = Math.abs(ctx.getTransform().a) || 1, reach = (size + ss + gap) * z;
+  if (sp[1] + reach < MM_VIEW.top + 4 || sp[1] > MM_VIEW.bottom) return;               // outside the map window
+  const edge = clamp((MM_VIEW.bottom - sp[1]) / 40);                                    // fades in as it scrolls up into it
+  const cap = size * 0.72, lineGap = ss * 1.28, blockH = (o.name ? cap : 0) + (o.sub ? (o.name ? lineGap : ss * 0.72) : 0);
+  const col = o.c ?? (o.future ? MM.muted : MM.ink), slide = (1 - u) * 30;
+  ctx.save(); ctx.translate(x + (o.dx ?? 0), y + (o.dy ?? 0)); ctx.globalAlpha *= clamp(u * 2.2) * edge;
+  let ax = 0, top = 0, align = 'left', ox = 0, oy = 0;
+  if (o.tilt && v[0] && v[1]) {             // at 45 degrees: rising to the right for ne / sw, falling for se / nw
+    ctx.rotate(v[0] * v[1] > 0 ? Math.PI / 4 : -Math.PI / 4);
+    ax = v[0] * gap; top = -blockH / 2; align = v[0] > 0 ? 'left' : 'right'; ox = -v[0] * slide;
+    ctx.beginPath(); ctx.rect(v[0] > 0 ? gap - 8 : -4000, -2000, 4000 - gap + 8, 4000); ctx.clip();
+  } else if (v[0] && !v[1]) {               // right / left: centred on the station's height
+    ax = v[0] * gap; top = -blockH / 2; align = v[0] > 0 ? 'left' : 'right'; ox = -v[0] * slide;
+    ctx.beginPath(); ctx.rect(v[0] > 0 ? gap - 8 : -4000, -2000, 4000 - gap + 8, 4000); ctx.clip();
+  } else if (!v[0]) {                       // top / bottom: centred on the station
+    align = 'center'; top = v[1] < 0 ? -gap - blockH - 4 : gap + 4; oy = -v[1] * slide;
+    ctx.beginPath(); ctx.rect(-2000, v[1] > 0 ? gap - 6 : -4000, 4000, 4000 - gap + 6); ctx.clip();
+  } else {                                  // a quadrant: horizontal text up-right, down-right, up-left, down-left
+    const g = gap * 0.74; ax = v[0] * g; align = v[0] > 0 ? 'left' : 'right'; top = v[1] < 0 ? -g - blockH : g; ox = -v[0] * slide;
+    ctx.beginPath(); ctx.rect(v[0] > 0 ? g - 8 : -4000, -2000, 4000 - g + 8, 4000); ctx.clip();
+  }
+  let by = top + (o.name ? cap : 0);
+  if (o.name) mmText(o.name, ax + ox, by + oy, size, col, { weight: 700, align });
+  if (o.sub) { by += o.name ? lineGap : ss * 0.72; mmText(o.sub, ax + ox, by + oy, ss, o.subC ?? MM.muted, { weight: 400, align }); }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------
+//  stations
+//  mmStation(x, y, o): o = { t0, name, sub, side, tilt, size, subSize, dx, dy,
+//    minor (a tick stop: needs color, ang), terminus (a bar across the line end: needs ang), ang (the line's angle
+//    here, radians; default vertical), color (the line's colour), active (the stop the story is at: bigger, a
+//    line-colour core), visited (a small ink core), future (muted ring and name), w (line width) }
+// ---------------------------------------------------------------------
+function mmStation(x, y, o = {}) {
+  const w = o.w ?? MM_W, s = mmPop(o.t0), ang = o.ang ?? Math.PI / 2, side = MM_SIDE[o.side ?? 'right'] || MM_SIDE.right;
+  const sl = Math.hypot(side[0], side[1]), sv = [side[0] / sl, side[1] / sl], nx = -Math.sin(ang), ny = Math.cos(ang), across = Math.abs(sv[0] * nx + sv[1] * ny);
+  const ringC = o.future ? MM.muted : MM.ink;
+  let gap = w * 0.77 + 14;
+  if (o.terminus) {
+    const hb = w * 1.2, th = w * 0.5;
+    if (s > 0) mmStroke([[x - nx * hb * s, y - ny * hb * s], [x + nx * hb * s, y + ny * hb * s]], ringC, th, 'round');
+    gap = lerp(w * 0.5, hb + th / 2, across) + 14;
+  } else if (o.minor) {
+    const d = sv[0] * nx + sv[1] * ny >= 0 ? 1 : -1, L = w * 1.15;   // the tick sticks out on the label's side
+    if (s > 0) mmStroke([[x, y], [x + nx * d * L * s, y + ny * d * L * s]], o.color ?? ringC, w * 0.46, 'butt');
+    gap = lerp(w * 0.5, L, across) + 14;
+  } else {
+    const R = (o.r ?? w * 0.77) * (o.active ? 1.22 : 1), ring = R * 0.3;
+    if (s > 0) {
+      mmDisc(x, y, R * s, ringC); mmDisc(x, y, (R - ring) * s, MM.white);
+      if (o.active) mmDisc(x, y, (R - ring) * 0.52 * s, o.color ?? MM.red); else if (o.visited) mmDisc(x, y, (R - ring) * 0.42 * s, MM.ink);
+    }
+    gap = R + 14;
+  }
+  mmLabel(x, y, gap, o);
+  return [x, y];
+}
+// stations at fractions of a path, each popping when the line's head arrives.
+//   names: strings or { name, sub, side, minor, terminus, ... } (per-station options over o)
+//   o: shared station options + { line: the SAME timing options given to mmLine, color, lag (pop this much later) }
+// Returns [{ x, y, ang, t, frac }].
+function mmStationsOn(P, fracs, names = [], o = {}) {
+  const { line, lag, ...rest } = o, out = [];
+  fracs.forEach((f, i) => {
+    const p = mmAt(P, f), per = typeof names[i] === 'string' ? { name: names[i] } : names[i] || {};
+    const t = line ? mmArrive(P, f, line) + (lag ?? 0) : rest.t0 ?? null;
+    mmStation(p[0], p[1], { ...rest, ang: p[2], ...per, t0: per.t0 ?? t });
+    out.push({ x: p[0], y: p[1], ang: p[2], t, frac: f });
+  });
+  return out;
+}
+// an interchange: a white capsule with a dark ring spanning the lines it joins (a and b are points on those lines).
+// With a t0 it grows from a towards b; o.seed draws a plain station disc at a until then. Label options as mmStation.
+function mmInterchange(a, b, o = {}) {
+  const w = o.w ?? MM_W, R = o.r ?? w * 0.77, ring = R * 0.3, s = mmPop(o.t0, 0.3);
+  const e = [lerp(a[0], b[0], s), lerp(a[1], b[1], s)], show = s > 0 || o.seed;
+  if (show) { mmStroke([a, e[0] === a[0] && e[1] === a[1] ? [a[0] + 0.01, a[1]] : e], MM.ink, R * 2, 'round'); mmStroke([a, e[0] === a[0] && e[1] === a[1] ? [a[0] + 0.01, a[1]] : e], MM.white, (R - ring) * 2, 'round'); }
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2, side = MM_SIDE[o.side ?? 'right'] || MM_SIDE.right, sl = Math.hypot(side[0], side[1]);
+  const half = Math.abs(((b[0] - a[0]) * side[0] + (b[1] - a[1]) * side[1]) / sl) / 2;
+  mmLabel(mx, my, half + R + 14, { ...o, t0: o.labelT0 ?? (o.seed ? null : o.t0) });
+  return [mx, my];
+}
+
+// ---------------------------------------------------------------------
+//  bullets, legend, signs, tags, the "you are here" marker
+// ---------------------------------------------------------------------
+// a line bullet: a filled circle in the line colour holding a letter or number
+function mmBullet(x, y, r, color, char, o = {}) {
+  const s = o.s ?? 1; if (s <= 0) return;
+  mmDisc(x, y, r * s, color);
+  if (char != null && char !== '') mmText(String(char), x, y + r * s * 0.4, r * s * 1.12, o.tc ?? mmOn(color), { weight: 800, align: 'center' });
+}
+// a legend box: (x, y) is its top-left. items = [{ c, ch, label }]. o: { title, t0, size, w, tick (false = still bullets) }
+// The bullets pop in one per 8th and then tick in turn, one every half second. Returns { w, h }.
+function mmLegend(x, y, items, o = {}) {
+  const size = o.size ?? 30, pad = 26, br = size * 0.7, row = br * 2 + 16, th = o.title ? size * 1.5 : 0;
+  const w = o.w ?? pad * 2 + br * 2 + 16 + Math.max(...items.map((it) => mmTextW(it.label, size, 500)), o.title ? mmTextW(o.title, size * 0.93, 700, 2) - br * 2 - 16 : 0);
+  const h = pad * 2 + th + items.length * row - 16, s = mmPop(o.t0, 0.3);
+  if (s <= 0) return { w, h };
+  ctx.save(); ctx.translate(x + w / 2, y + h / 2); ctx.scale(0.86 + 0.14 * s, 0.86 + 0.14 * s); ctx.globalAlpha *= clamp(s * 3); ctx.translate(-w / 2, -h / 2);
+  mmPlate(0, 0, w, h, 24, MM.white, 5);
+  if (o.title) mmText(o.title, pad, pad + size * 0.7, size * 0.93, MM.muted, { weight: 700, track: 2 });
+  const tb = o.t0 ?? -1e9, done = tb + 0.3 + items.length * 0.125 + 0.3;
+  items.forEach((it, i) => {
+    const cy = pad + th + br + i * row, t = tb + 0.125 * (i + 1);
+    let bs = mmPop(o.t0 == null ? null : t);
+    if (o.tick !== false && TT >= done) { const k = Math.floor(TT / 0.5 + 1e-6), ph = TT - k * 0.5; if (mod(k, items.length) === i) bs *= 1 + 0.16 * Math.exp(-Math.max(0, ph) * 9); }
+    mmBullet(pad + br, cy, br, it.c, it.ch, { s: bs });
+    const u = mmIn(o.t0 == null ? null : t + 0.05);
+    if (u > 0) mmText(it.label, pad + br * 2 + 16 - (1 - u) * 16, cy + size * 0.35, size, MM.ink, { weight: 500, al: u * 1.6 });
+  });
+  ctx.restore();
+  return { w, h };
+}
+// a platform-sign plate: a line-colour strip and white type on a dark plate. (x, y) is its centre (o.align: 'left'
+// puts x on its left edge). o: { t0, size, light (white plate, ink type), bullet (a letter on the strip) }
+function mmSign(x, y, text, color = MM.red, o = {}) {
+  const size = o.size ?? 34, h = size * 1.9, strip = o.bullet != null ? h : size * 0.56, padX = size * 0.6;
+  const w = strip + padX * 2 + mmTextW(text, size, 700, 1), x0 = o.align === 'left' ? x : x - w / 2, y0 = y - h / 2, u = mmIn(o.t0, 0.3);
+  if (u <= 0) return { w, h };
+  ctx.save(); ctx.beginPath(); ctx.rect(x0 - 2, y0 - 2, (w + 4) * u, h + 4); ctx.clip();
+  mmBox(x0, y0, w, h, 12); ctx.fillStyle = o.light ? MM.white : MM.ink; ctx.fill();
+  ctx.save(); mmBox(x0, y0, w, h, 12); ctx.clip(); ctx.fillStyle = color; ctx.fillRect(x0, y0, strip, h); ctx.restore();
+  if (o.light) { ctx.save(); mmBox(x0 + 2, y0 + 2, w - 4, h - 4, 10); ctx.lineWidth = 4; ctx.strokeStyle = MM.ink; ctx.stroke(); ctx.restore(); }
+  if (o.bullet != null) mmText(String(o.bullet), x0 + strip / 2, y + size * 0.37, size * 1.05, mmOn(color), { weight: 800, align: 'center' });
+  mmText(text, x0 + strip + padX, y + size * 0.35, size, o.light ? MM.ink : MM.white, { weight: 700, track: 1, al: seg(u, 0.3, 1) });
+  ctx.restore();
+  return { w, h };
+}
+// a year (or date) beside a station: a white pill with a dark ring. (x, y) = the station; o: { side: 'left' | 'right'
+// | 'top' | 'bottom', gap, t0, size, c (a line colour fills the pill instead) }
+function mmYearTag(x, y, text, o = {}) {
+  const size = o.size ?? 28, h = size * 1.7, w = mmTextW(String(text), size, 700, 1) + size * 1.3, gap = o.gap ?? MM_W * 0.77 + 16;
+  const v = MM_SIDE[o.side ?? 'left'] || MM_SIDE.left, cx = x + v[0] * (gap + w / 2), cy = y + v[1] * (gap + h / 2), u = mmIn(o.t0, 0.25);
+  if (u <= 0) return;
+  const sp = toScreen(cx, cy), z = Math.abs(ctx.getTransform().a) || 1;
+  if (sp[1] + h * z < MM_VIEW.top + 4 || sp[1] > MM_VIEW.bottom) return;
+  ctx.save(); ctx.globalAlpha *= clamp(u * 2) * clamp((MM_VIEW.bottom - sp[1]) / 40); ctx.translate(-v[0] * (1 - u) * 24, -v[1] * (1 - u) * 24);
+  if (o.c) mmPlate(cx - w / 2, cy - h / 2, w, h, h / 2, o.c); else mmPlate(cx - w / 2, cy - h / 2, w, h, h / 2, MM.white, 4);
+  mmText(String(text), cx, cy + size * 0.35, size, o.c ? mmOn(o.c) : MM.ink, { weight: 700, align: 'center', track: 1 });
+  ctx.restore();
+}
+// a step number beside a station: a line bullet that pops, with an optional small label after it
+function mmMilestone(x, y, n, color = MM.red, o = {}) {
+  const r = o.r ?? 22, s = mmPop(o.t0);
+  mmBullet(x, y, r, color, n, { s });
+  if (o.label && s > 0) mmText(o.label, x + r + 12, y + (o.size ?? 28) * 0.35, o.size ?? 28, MM.muted, { weight: 400, al: mmIn(o.t0 == null ? null : o.t0 + 0.1) });
+}
+// "you are here": a ring that pulses outward once a second, with an optional small dark tag pointing at it.
+// o: { t0, color, r, spread (how far the pulse travels, x r; 2.1), label, side: 'left' | 'right' | 'top' | 'bottom', size }
+function mmHere(x, y, o = {}) {
+  const c = o.color ?? MM.ink, r = o.r ?? 40, s = mmPop(o.t0, 0.3); if (s <= 0) return;
+  const tb = o.t0 ?? 0;
+  ctx.save(); ctx.strokeStyle = c;
+  for (const off of [0, 0.5]) {                                 // two rings, half a second apart, on the beat
+    const p = mod(TT - tb - off, 1); if (TT - tb < off) continue;
+    ctx.globalAlpha = (1 - p) * 0.7; ctx.lineWidth = lerp(7, 2, p); ctx.beginPath(); ctx.arc(x, y, r * lerp(1, o.spread ?? 2.1, EZ.o2(p)), 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1; ctx.lineWidth = 7; ctx.beginPath(); ctx.arc(x, y, r * s, 0, TAU); ctx.stroke();
+  ctx.restore();
+  if (o.label) {
+    const size = o.size ?? 28, tw = mmTextW(o.label, size, 700, 1), w = tw + size * 1.2, h = size * 1.75, v = MM_SIDE[o.side ?? 'left'] || MM_SIDE.left, g = r + 22;
+    const cx = x + v[0] * (g + w / 2), cy = y + v[1] * (g + h / 2), u = mmPop(o.t0 == null ? null : o.t0 + 0.125);
+    if (u > 0) {
+      ctx.save(); ctx.translate(x + v[0] * g, y + v[1] * g); ctx.scale(u, u); ctx.translate(-(x + v[0] * g), -(y + v[1] * g));
+      ctx.fillStyle = MM.ink; ctx.beginPath(); ctx.moveTo(x + v[0] * (g - 12), y + v[1] * (g - 12)); ctx.lineTo(x + v[0] * (g + 4) - v[1] * 12, y + v[1] * (g + 4) + v[0] * 12); ctx.lineTo(x + v[0] * (g + 4) + v[1] * 12, y + v[1] * (g + 4) - v[0] * 12); ctx.closePath(); ctx.fill();
+      mmPlate(cx - w / 2, cy - h / 2, w, h, 12, MM.ink);
+      mmText(o.label, cx, cy + size * 0.35, size, MM.white, { weight: 700, align: 'center', track: 1 });
+      ctx.restore();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+//  the hero: a small train capsule. Line-colour body on a white casing, three windows, a headlight "eye" that
+//  looks ahead and blinks. It points along its path and squashes a little when it stops.
+// ---------------------------------------------------------------------
+// mmHero(x, y, r, o): r = half the train's length. o: { ang, color, squash (0..1), key, bg (a background train: does
+// not set SPARK_AT), s (scale) }
+function mmHero(x, y, r, o = {}) {
+  const key = o.key ?? 'train', c = o.color ?? MM.red, hw = r * 0.4, sq = clamp(o.squash ?? 0), s = o.s ?? 1;
+  if (s <= 0) return;
+  if (!o.bg) SPARK_AT = toScreen(x, y);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(o.ang ?? Math.PI / 2); ctx.scale(s * (1 - 0.1 * sq), s * (1 + 0.14 * sq));
+  const cs = r * 0.1;
+  mmBox(-r - cs, -hw - cs, r * 2 + cs * 2, hw * 2 + cs * 2, (hw + cs) * 0.62, hw + cs); ctx.fillStyle = MM.white; ctx.fill();
+  mmBox(-r, -hw, r * 2, hw * 2, hw * 0.55, hw); ctx.fillStyle = c; ctx.fill();
+  ctx.fillStyle = MM.white;
+  for (let i = 0; i < 3; i++) { mmBox(-r * 0.78 + i * r * 0.39, -hw * 0.5, r * 0.28, hw, r * 0.07); ctx.fill(); }
+  const ex = r * 0.63, er = hw * 0.56, blink = mod(F + hash('mmblink', key) % 80, 80) < 3;
+  mmDisc(ex, 0, er, MM.white);
+  ctx.fillStyle = MM.ink; ctx.beginPath(); ctx.ellipse(ex + er * 0.3, 0, blink ? er * 0.12 : er * 0.5, er * 0.5, 0, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+// the train at a fraction of a path, pointing along it (its chord follows the bends). o: as mmHero + { len }.
+// At the two ends of the path it stops with its nose (or tail) on the end, so a terminus stays visible.
+function mmTrain(P, frac, o = {}) {
+  const len = o.len ?? 140, L = mmLen(P), df = Math.min(0.5, len * 0.5 / L), f = clamp(frac, df, 1 - df);
+  const a = mmAt(P, f + df), b = mmAt(P, f - df);
+  mmHero((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, len / 2, { ...o, ang: Math.atan2(a[1] - b[1], a[0] - b[0]) });
+  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+}
+// the train's timetable: stops = [[tArrive, frac, travel?], ...] sorted by time. It waits at each stop, leaves
+// `travel` seconds before the next arrival (default o.travel ?? 0.75, never before it arrived), easing out and in.
+// Returns { frac, squash (a short bump on arrival), at (the stop it is at or left last), moving }.
+function mmRide(stops, o = {}) {
+  let frac = stops[0][1], squash = 0, at = 0, moving = false;
+  for (let i = 1; i < stops.length; i++) {
+    const [t1, f1] = stops[i], f0 = stops[i - 1][1], t0 = Math.max(stops[i - 1][0], t1 - (stops[i][2] ?? o.travel ?? 0.75));
+    if (TT >= t1) { frac = f1; at = i; const k = (TT - t1) / 0.3; squash = k < 1 ? Math.sin(Math.PI * k) * (1 - k) * 1.6 : 0; }
+    else { if (TT > t0) { frac = lerp(f0, f1, mmIO((TT - t0) / (t1 - t0))); moving = true; } break; }
+  }
+  return { frac, squash: clamp(squash), at, moving };
+}
+// a camera that follows the train with look-ahead, for pieceCam: the point a little ahead of `frac` sits on screen
+// point o.to (default [CX, H * 0.47]) at `zoom`. o: { ahead (world px, 90), lead (0..1, 0.6), xk / yk (how much of the
+// sideways / vertical travel the camera follows, 0..1; 9:16 routes run down, so damp x; 16:9 routes run across, so
+// damp y), x0 / y0 (the resting position the damping pulls to; default the path's middle), to }
+function mmFollow(P, frac, zoom = 1.15, o = {}) {
+  const L = mmLen(P), a = mmAt(P, frac), b = mmAt(P, clamp(frac + (o.ahead ?? 90) / L)), k = o.lead ?? 0.6;
+  let px = lerp(a[0], b[0], k), py = lerp(a[1], b[1], k);
+  if (o.xk != null || o.yk != null) {
+    const bb = P._bb || (P._bb = P.reduce((m, p) => [Math.min(m[0], p[0]), Math.min(m[1], p[1]), Math.max(m[2], p[0]), Math.max(m[3], p[1])], [1e9, 1e9, -1e9, -1e9]));
+    if (o.xk != null) px = lerp(o.x0 ?? (bb[0] + bb[2]) / 2, px, o.xk);
+    if (o.yk != null) py = lerp(o.y0 ?? (bb[1] + bb[3]) / 2, py, o.yk);
+  }
+  return camOf({ z: zoom, p: [px, py], to: o.to ?? [CX, H * 0.47] });
+}
+// bridge shapes (world coords): a station disc, an interchange capsule / rounded square
+const mmDiscPts = (x, y, r, n = 96) => ellipsePts(x, y, r, r, 0, n);
+const mmCapsulePts = (x, y, w, h, r = Math.min(w, h) / 2) => rrectPts(x - w / 2, y - h / 2, w, h, r, 14);
+
+// ---------------------------------------------------------------------
+//  captions: screen-size, drawn after the camera (DEFER). Both stay out of the way of a shape morph: they fade out
+//  as the era's window starts to shrink and enter only when the new era's window has opened.
+// ---------------------------------------------------------------------
+function mmLeaving() {
+  if (typeof BRIDGES === 'undefined') return 1;
+  for (const r of BRIDGES) { const d = r.d ?? 0.6; if (TT >= r.tc - d - 1e-6 && TT < r.tc + d - 1e-6) return TT < r.tc ? 1 - EZ.o2(seg(TT, r.tc - d, r.tc - d + 0.25)) : 0; }
+  return 1;
+}
+function mmEraIn() {
+  if (typeof BRIDGES === 'undefined') return -1e9;
+  for (const r of BRIDGES) if (Math.abs(r.tc - E0) < 1e-3) return r.tc + (r.d ?? 0.6);
+  return -1e9;
+}
+// the title: a header strip in the ground colour with a dark rule (the map scrolls under it), a kicker with an
+// optional line bullet, and a bold headline. o: { at (seconds after the era starts), bullet: [colour, char],
+// band (false = no strip), bandY (the rule's y, default 428: give the same to mmView), x, y (the kicker's baseline) }
+function mmTitleNow(kicker, headline, o = {}) {
+  const al = mmLeaving(); if (al <= 0.001) return;
+  const t0 = Math.max(E0 + (o.at ?? 0.1), mmEraIn()), x = o.x ?? 60, y = o.y ?? 306, bandY = o.bandY ?? 428;
+  ctx.save(); ctx.globalAlpha = al;
+  if (o.band !== false) { ctx.fillStyle = MM.ground; ctx.fillRect(0, 0, W, bandY); ctx.fillStyle = MM.ink; ctx.fillRect(0, bandY - 5, W, 5); }
+  if (TT > t0) {
+    let kx = x;
+    if (o.bullet) { mmBullet(x + 22, y - 11, 22, o.bullet[0], o.bullet[1], { s: mmPop(t0) }); kx += 58; }
+    const u = mmIn(t0, 0.3);
+    if (kicker) mmText(kicker, kx - (1 - u) * 20, y, 30, MM.muted, { weight: 700, track: 2, al: u * 1.5 });
+    const hs = o.size ?? 66, hy = y + 24 + hs * 0.78, v = mmIn(t0 + 0.1, 0.35);
+    if (v > 0) { ctx.save(); ctx.beginPath(); ctx.rect(0, hy - hs * 1.0, W, hs * 1.3); ctx.clip(); mmText(headline, x, hy + (1 - v) * hs * 1.1, hs, MM.ink, { weight: 800 }); ctx.restore(); }
+  }
+  ctx.restore();
+}
+// the caption: 'text with a *keyword*' on a white rounded plate with a dark ring, the keyword in a line colour.
+// The plate opens from a disc (a station turning into an interchange), then the words fade up.
+// o: { at, y (the last line's baseline, default 1440), size (56), c (the keyword's colour: not yellow), x, maxW }
+function mmCaptionNow(str, o = {}) {
+  const al = mmLeaving(); if (al <= 0.001) return;
+  const size = o.size ?? 56, t0 = Math.max(E0 + (o.at ?? 0.5), mmEraIn()); if (TT <= t0) return;
+  const lines = String(str).split('\n'), lh = size * 1.2, y = o.y ?? 1440, x = o.x ?? CX, kc = o.c ?? MM.red;
+  const rows = lines.map((line) => { const parts = line.split(/(\*[^*]+\*)/).filter((g) => g.length).map((g) => (g[0] === '*' ? { s: g.slice(1, -1), k: 1 } : { s: g, k: 0 })); parts.forEach((p) => { p.w = mmTextW(p.s, size, 700); }); return { parts, w: parts.reduce((a, p) => a + p.w, 0) }; });
+  const tw = Math.max(...rows.map((r) => r.w)), fit = Math.min(1, (o.maxW ?? W - 220) / tw), padX = size * 0.72;
+  const h = (lines.length - 1) * lh + size * 1.82, w = tw * fit + padX * 2, top = y - (lines.length - 1) * lh - size * 1.16;
+  const u = mmIn(t0, 0.3), cw = lerp(h, w, u);
+  ctx.save(); ctx.globalAlpha = al * clamp(u * 4);
+  mmPlate(x - cw / 2, top, cw, h, h / 2 > 60 ? 40 : h / 2, MM.white, 5);
+  mmBox(x - cw / 2 + 5, top + 5, cw - 10, h - 10, 36); ctx.clip();
+  ctx.globalAlpha = al * seg(u, 0.45, 1);
+  rows.forEach((r, li) => {
+    let xx = x - r.w * fit / 2; const yy = y - (lines.length - 1 - li) * lh;
+    for (const p of r.parts) { ctx.save(); ctx.translate(xx, yy); ctx.scale(fit, 1); mmText(p.s, 0, 0, size, p.k ? kc : MM.ink, { weight: 700 }); ctx.restore(); xx += p.w * fit; }
+  });
+  ctx.restore();
+}
+const mmTitle = (kicker, headline, o) => { const f = () => mmTitleNow(kicker, headline, o); if (DEFER) DEFER.push(f); else f(); };
+const mmCaption = (str, o) => { const f = () => mmCaptionNow(str, o); if (DEFER) DEFER.push(f); else f(); };
+
+// =====================================================================
+//  STYLE — the renderer's hooks. A morph happens on the bare map ground; the bridge shape is a giant station:
+//  a flat white disc inside a white band and a dark ring, and an era is seen through the same double ring.
+// =====================================================================
+const MM_RING = { band: 12, ring: 9 };   // screen px
+function mmRinged(P) {                   // the station edge around outline P: dark ring outside, white band inside it
+  ctx.save(); ctx.lineJoin = 'round';
+  mmPoly(P, true); ctx.lineWidth = (MM_RING.band + MM_RING.ring) * 2; ctx.strokeStyle = MM.ink; ctx.stroke();
+  mmPoly(P, true); ctx.lineWidth = MM_RING.band * 2; ctx.strokeStyle = MM.white; ctx.stroke();
+  ctx.restore();
+}
+const STYLE = {
+  name: 'metro-map',
+  paper: MM.ground,
+  backdrop() { fillAll(MM.ground); },   // flat, always: no mid-tone blends on a printed diagram
+  // the era seen through outline P: a hard mask inside the station double ring. Shrinking, a flat white veil closes
+  // over the last third so the window lands on the white bridge disc; growing, the hole opens from the centre.
+  window(P, key, src, o = {}) {
+    const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+    const hole = o.phase === 'grow' ? EZ.o3((o.u ?? 1) / 0.4) : 1, veil = o.phase === 'shrink' ? EZ.io(seg(o.u ?? 0, 0.72, 1)) : 0;
+    mmRinged(P);
+    ctx.save(); mmPoly(P, true); ctx.fillStyle = MM.white; ctx.fill(); ctx.restore();
+    if (hole > 0) { ctx.save(); mmPoly(hole < 1 ? P.map(([x, y]) => [c[0] + (x - c[0]) * hole, c[1] + (y - c[1]) * hole]) : P, true); ctx.clip(); ctx.drawImage(src, 0, 0); ctx.restore(); }
+    if (veil > 0) { ctx.save(); ctx.globalAlpha = veil; mmPoly(P, true); ctx.fillStyle = MM.white; ctx.fill(); ctx.restore(); }
+  },
+  blob(P, c) { mmRinged(P); ctx.save(); mmPoly(P, true); ctx.fillStyle = c; ctx.fill(); ctx.restore(); },
+  hero(x, y, r, o = {}) { mmHero(x, y, r * 0.9, { key: o.key, ang: 0 }); },
+  heroColor: MM.red,
+  heroPts(x, y, r) { return mmCapsulePts(x, y, r * 1.8, r * 0.67); },
+  post() {},
+  ones: true,
+};
+// =====================================================================
+//  SCENES — metro-map demo. World units = px at zoom 1; time TT on 1s. What matters stays inside x 60-940, y 250-1500.
+//  Era 1 is a close ride down the red line (camera at 1.15, following the train); era 2 is the whole map at zoom 1.
+// =====================================================================
+const cu = TIMELINE.cues;
+
+// ---- era 1 geometry (its own world): the red line snakes down through three stations, then goes on as "planned"
+const RIDE = mmPath([400, 620], 'S 160', 'SE 100', 'S 200', 'SW 100', 'S 160', 'S 240', 'SE 90', 'S 500');
+const F_PRO = mmFracAt(RIDE, [400, 1340]), F_LAT = F_PRO / 2;      // Proyek; Latihan is halfway along (500, 980)
+const F_NEXT = mmFracAt(RIDE, [400, 1520]);                         // the next stop, not built yet
+const RIDE_LINE = { t0: cu.line, d: cu.st3 - cu.line, to: F_PRO };  // the head passes Latihan at st2, Proyek at st3
+const RIVER1 = mmRoute([[-200, 850], [240, 850], [360, 730], [1300, 730]], { r: 120 });
+const CROSS = mmPath([-200, 1210], 'E 840', 'NE 120', 'E 700');     // a yellow line crossing behind
+const HALO = { x: 400, y: 1340, r: 96 };                            // the station that swells under the train: bridge shape A
+const rideNow = () => mmRide([[0, 0], [cu.arr1, F_LAT, cu.arr1 - cu.dep1], [cu.arr2, F_PRO, cu.arr2 - cu.dep2]]);
+
+function sceneRide() {
+  mmView(428, 1340);
+  mmGround();
+  mmZone(150, 120, 630, 320, { label: 'ZONA PEMULA', at: 'br' });
+  mmWater(RIVER1, 90, { label: 'Sungai Ragu', at: 0.56 });                       // background life 1: the dashes drift
+  mmPark(80, 930, 210, 190, { label: 'Taman Ide', at: 'bl' });
+  mmLine(CROSS, MM.yellow);
+  mmTrain(CROSS, lerp(0.04, 0.8, TT / 3), { color: MM.yellow, bg: true, key: 'cross', len: 104 });   // life 2: a train passes on the other line
+  mmSign(400, 500, 'Belajar mandiri', MM.red, { bullet: 'A' });
+  mmLine(RIDE, MM.plan);                                                         // the planned route
+  mmLine(RIDE, MM.red, RIDE_LINE);
+  // stations: Dasar is there from the start; the others pop as the line's head passes them
+  const out = 1 - ev(cu.halo, 0.125);                                              // Proyek's label makes room for the swelling station
+  const pL = mmAt(RIDE, F_LAT), pP = mmAt(RIDE, F_PRO), pN = mmAt(RIDE, F_NEXT);
+  mmStation(pN[0], pN[1], { future: true, name: 'Karier', side: 'right' });
+  mmStation(400, 620, { terminus: true, name: 'Dasar', sub: 'kenal bentuk & warna', side: 'right' });
+  mmYearTag(400, 620, 'BULAN 1', { side: 'left', gap: 58 });
+  mmStation(pL[0], pL[1], { t0: mmArrive(RIDE, F_LAT, RIDE_LINE), name: 'Latihan', sub: '30 menit tiap hari', side: 'right', visited: TT > cu.dep2 });
+  mmYearTag(pL[0], pL[1], 'BULAN 3', { side: 'left', t0: cu.arr1 });
+  ctx.save(); ctx.globalAlpha = out;
+  mmStation(pP[0], pP[1], { t0: mmArrive(RIDE, F_PRO, RIDE_LINE), name: 'Proyek', sub: 'karya pertama', side: 'right' });
+  mmYearTag(pP[0], pP[1], 'BULAN 6', { side: 'left', t0: cu.arr2 });
+  ctx.restore();
+  // the station under the train swells into a big station disc (the morph starts from it)
+  if (TT > cu.halo) {
+    const z = 1.15, r = HALO.r * springEase(TT - cu.halo, 220, 24);
+    mmDisc(HALO.x, HALO.y, r + (MM_RING.band + MM_RING.ring) / z, MM.ink); mmDisc(HALO.x, HALO.y, r + MM_RING.band / z, MM.white);
+  }
+  // the hero: waits at each station on the beat, eases out and into the next
+  const ride = rideNow();
+  mmTrain(RIDE, ride.frac, { squash: ride.squash, key: 'hero' });
+  mmTitle('JALUR A', 'Rute belajar desain', { bullet: [MM.red, 'A'] });
+  mmCaption('Belajar itu *perjalanan*', { at: 0.5 });
+}
+
+// ---- era 2 geometry: the whole map. Red and blue share a corridor (side by side, 4px apart) below the interchange.
+const RED2 = mmPath([300, 500], 'S 160', 'SE 126', 'S 214', 'SW 100', 'S 180');
+const BLUE2 = mmPath([1160, 600], 'W 520', 'SW 184', 'S 276', 'SE 120', 'S 100');
+const XA = [426, 900], XB = [456, 900];                              // the interchange joins these two points
+const F_XR = mmFracAt(RED2, XA), F_XB = mmFracAt(BLUE2, XB), F_KELAS = mmFracAt(BLUE2, [800, 600]);
+const RIVER2 = mmRoute([[-100, 1192], [690, 1192], [790, 1092], [1300, 1092]], { r: 100 });
+const XCH = { x: 441, y: 900, w: 250, h: 150 };                      // bridge shape B: a big interchange capsule
+const BLUE_IN = { t0: cu.blue, d: cu.join - cu.blue, to: F_XB };     // the blue line comes in and reaches the interchange at join
+const mapRide = () => mmRide([[3.0, F_XR], [cu.arr3, 1, cu.arr3 - cu.dep3]]);
+
+function sceneMap() {
+  mmView(428, 1500);
+  mmGround();
+  mmZone(560, 470, 480, 240, { label: 'ZONA B', at: 'tl' });
+  mmWater(RIVER2, 64, { label: 'Sungai Ragu', at: 0.17 });                       // life 1: drifting dashes
+  mmPark(70, 690, 190, 170, { label: 'Taman Ide', at: 'bl' });
+  mmLine(RED2, MM.plan); mmLine(BLUE2, MM.plan);                                 // the planned network
+  mmLine(BLUE2, MM.blue, BLUE_IN);
+  mmLine(BLUE2, MM.blue, { t0: cu.ext, d: cu.term - cu.ext, from: F_XB });
+  mmLine(RED2, MM.red, { to: F_XR });                                            // the part already travelled
+  mmLine(RED2, MM.red, { t0: cu.ext, d: cu.term - cu.ext, from: F_XR });
+  mmTrain(BLUE2, lerp(0, 0.52, seg(TT, 3.6, 6.0)), { color: MM.blue, bg: true, key: 'blue', len: 104 });   // life 2: the blue line's train
+  // stations
+  mmStation(300, 500, { terminus: true, name: 'Dasar', side: 'right' });
+  mmStation(300, 592, { visited: true, name: 'Latihan', side: 'right' });
+  const pk = mmAt(BLUE2, F_KELAS);
+  mmStation(pk[0], pk[1], { t0: mmArrive(BLUE2, F_KELAS, BLUE_IN), name: 'Kelas', side: 'top' });
+  mmInterchange(XA, XB, { seed: true, t0: cu.join, name: 'Proyek', sub: 'ganti jalur', side: 'left', dx: -14 });
+  const endR = mmAt(RED2, 1), endB = mmAt(BLUE2, 1);
+  mmStation(endR[0], endR[1], { terminus: true, t0: cu.term, name: 'Karier', side: 'right', dx: 26 });
+  mmStation(endB[0], endB[1], { terminus: true, t0: cu.term, name: 'Freelance', side: 'right' });
+  mmLegend(606, 800, [{ c: MM.red, ch: 'A', label: 'Belajar mandiri' }, { c: MM.blue, ch: 'B', label: 'Bareng mentor' }], { title: 'JALUR', t0: cu.legend });   // life 3: its bullets tick
+  // the hero leaves the interchange and stops with its nose on the terminus; "you are here" lands with it
+  const ride = mapRide();
+  mmTrain(RED2, ride.frac, { squash: ride.squash, key: 'hero' });
+  mmHere(endR[0], endR[1], { t0: cu.arr3, color: MM.red, label: 'DI SINI', side: 'left', spread: 1.6 });   // life 4: it pulses
+  mmTitle('PETA JALUR', 'Tujuan: karier', { bullet: [MM.red, 'A'], at: 0.5 });
+  mmCaption('Dua jalur, satu *tujuan*', { at: 0.75 });
+}
+// =====================================================================
+//  ERAS, CAMERAS, BRIDGES — metro-map demo (read by kit/morph.js)
+// =====================================================================
+const ERA_BG = [MM.ground, MM.ground];
+function pieceCam(era, t) {
+  // era 1: the camera glides with the train, looking a little ahead; half of the sideways jogs are followed
+  if (era === 0) return mmFollow(RIDE, rideNow().frac, 1.15, { to: [CX, 1000], xk: 0.5, x0: 450 });
+  // era 2: the whole map, a very slow push towards the terminus
+  const u = EZ.io(seg(t, 3.4, 6.0));
+  return camOf({ z: lerp(1, 1.04, u), p: [500, 900], to: [500, 900] });
+}
+const BRIDGES = [
+  // the swollen station under the train (a disc) -> the interchange (a capsule): similar proportions, different
+  // silhouettes. Both white, so the blob is one flat station-white shape inside its double ring.
+  { tc: 3.0, d: 0.5, m: 0.2,
+    A: () => ({ P: mmDiscPts(HALO.x, HALO.y, HALO.r), c: MM.white }),
+    B: () => ({ P: mmCapsulePts(XCH.x, XCH.y, XCH.w, XCH.h), c: MM.white }) },
+];
+
+// =====================================================================
+//  kit/morph.js — the renderer for pieces built from ERAS (scenes) joined by SHAPE MORPHS.
+//
+//  At each bridge time tc:
+//    shrink [tc-d, tc-m]      the old era is seen through a window shaped like the bridge object (STYLE.window),
+//                             shrinking onto the object while the backdrop fades to blank paper
+//    morph  [tc-m, tc+m]      on blank paper, the object's outline blends into its counterpart's
+//                             (both resampled by angle around their centroids; colour lerped). Hero-to-hero
+//                             bridges draw the hero itself with blended position, size and ray count.
+//    grow   [tc+m, tc+d]      the new era opens out of a window shaped like the counterpart
+//    d = the bridge's half-length (default 0.6s, so a bridge costs 1.2s), m = the morph's half (default 0.2s, or d/3 when d is set).
+//    Short pieces: { tc, d: 0.4 } (0.8s) or fewer bridges — see craft.md -> Transitions.
+//  Era boundaries WITHOUT a bridge are hard cuts (keep at most one: the slam).
+//
+//  The piece defines (in its head / src):
+//    ERA_LIST = [[t0, t1, () => drawScene()], ...]      scenes draw in world coords, call yearTag()/capStrip()
+//    ERA_BG   = ['#hex', ...]                          each era's dominant colour (for the fade to paper)
+//    BRIDGES  = [{ tc, A: () => shape, B: () => shape, d?, m? }]   shape = { P: points, c: '#hex' } or SP(x, y, r, rays)
+//    function pieceCam(era, t) { return null | CAM }   optional; use push() / bump() below
+//  Shapes are in each era's world coords; the bridge object must be in frame at tc (pull push-ins back first).
+//  The look comes from the style kit's STYLE hooks (paper, backdrop, window, blob, hero, post, ones):
+//  this file draws nothing itself, so the same piece structure works in any style.
+// =====================================================================
+// ---- cameras: CAM = { z, tx, ty }; camOf({ z, p, to }) puts world point p on screen point to
+const CAM0 = { z: 1, tx: 0, ty: 0 };
+const camOf = (c) => ({ z: c.z, tx: c.to[0] - c.z * c.p[0], ty: c.to[1] - c.z * c.p[1] });
+const camMix = (a, b, u) => ({ z: lerp(a.z, b.z, u), tx: lerp(a.tx, b.tx, u), ty: lerp(a.ty, b.ty, u) });
+// an eased push-in over [a, b] to cam, optionally pulled back over [oa, ob]
+function push(t, a, b, cam, oa, ob) { let u = EZ.io(seg(t, a, b)); if (oa != null) u *= 1 - EZ.io(seg(t, oa, ob)); return u > 0 ? camMix(CAM0, camOf(cam), u) : null; }
+// a zoom bump on every beat from t0, centred on point p (the hero keeps its screen spot)
+function bump(t, t0, p, amt = 0.3, every = 0.5) { return camOf({ z: 1 + amt * Math.exp(-mod(t - t0, every) * 7), p, to: p }); }
+function camAt(era, t) { return (typeof pieceCam === 'function' && pieceCam(era, t)) || CAM0; }
+const camPts = (P, c) => P.map(([x, y]) => [c.z * x + c.tx, c.z * y + c.ty]);
+// ---- bridge shapes
+function starPts(x, y, r, n, r0 = -Math.PI / 2, m = 96) {
+  const P = []; for (let i = 0; i < m; i++) { const a = i / m * TAU, k = 0.42 + 0.58 * (0.5 + 0.5 * Math.cos(n * (a - r0))) ** 3; P.push([x + Math.cos(a) * r * k, y + Math.sin(a) * r * k]); }
+  return P;
+}
+const SP = (x, y, r, n) => ({ spark: [x, y, r, n] });
+const shapeOf = (s) => (s.spark ? { P: (STYLE.heroPts || starPts)(...s.spark), c: STYLE.heroColor, spark: s.spark } : s);
+function byAngle(P, m = 96) {   // resample a closed outline to m points by angle around its centroid
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]), Q = resample(P, true, 4), out = [];
+  for (let i = 0; i < m; i++) {
+    const a = -Math.PI + i / m * TAU; let best = null, bd = 1e9;
+    for (const q of Q) { let d = Math.atan2(q[1] - c[1], q[0] - c[0]) - a; d = Math.abs(Math.atan2(Math.sin(d), Math.cos(d))); const r = Math.hypot(q[0] - c[0], q[1] - c[1]); if (d < bd - 1e-4 || (Math.abs(d - bd) < 1e-4 && r > best[2])) { bd = d; best = [q[0], q[1], r]; } }
+    out.push([best[0], best[1]]);
+  }
+  return { P: out, c };
+}
+const mixHex = (a, b, u) => { const p = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)); const x = p(a), y = p(b); return `rgb(${x.map((v, i) => Math.round(lerp(v, y[i], u))).join(',')})`; };
+function maskK(P) {   // how far the window must scale about its centroid to cover the frame
+  const c = P.reduce((a, p) => [a[0] + p[0] / P.length, a[1] + p[1] / P.length], [0, 0]);
+  const rmin = Math.max(8, Math.min(...byAngle(P, 48).P.map((p) => Math.hypot(p[0] - c[0], p[1] - c[1]))));
+  const far = Math.max(...[[0, 0], [W, 0], [0, H], [W, H]].map((q) => Math.hypot(q[0] - c[0], q[1] - c[1])));
+  return { c, kmax: far / rmin * 1.1 };
+}
+const scaled = (P, c, k) => P.map(([x, y]) => [c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k]);
+// ---- layers and windows
+const LAYER = [];
+function layer(i) { if (!LAYER[i]) { const c = document.createElement('canvas'); c.width = W; c.height = H; LAYER[i] = c; } return LAYER[i]; }
+function renderEra(e, target) {   // draws era e into target; returns its overlay queue (year tag, caption)
+  const saved = ctx; ctx = target.getContext('2d');
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none'; ctx.setLineDash([]);
+  ctx.fillStyle = STYLE.paper; ctx.fillRect(0, 0, W, H);   // a clean sheet every frame: nothing carries over between frames
+  const cam = camAt(e, TT); ctx.setTransform(cam.z, 0, 0, cam.z, cam.tx, cam.ty);
+  DEFER = []; ERA_LIST[e][2](); const q = DEFER; DEFER = null;
+  ctx.restore(); ctx = saved;
+  return q;
+}
+function flush(q, e) { const keep = E0; E0 = ERA_LIST[e][0]; ctx.setTransform(1, 0, 0, 1, 0, 0); q.forEach((f) => f()); E0 = keep; }
+function shotAtFrame(fr) {
+  for (const s of TIMELINE.shots) if (fr >= Math.round(s.t0 * FPS) && fr < Math.round(s.t1 * FPS)) return s;
+  return TIMELINE.shots[TIMELINE.shots.length - 1];
+}
+const eraAt = (t) => ERA_LIST.findIndex(([a, b]) => t >= a - 1e-6 && t < b - 1e-6);
+// renderFrame(t, canvas, sub): sub = true draws the exact time t between frames (motion blur sub-frames, styles on 1s)
+function renderFrame(t, canvas, sub) {
+  const cv = canvas || document.getElementById('c');
+  ctx = cv.getContext('2d');
+  F = ((Math.floor(sub ? t * FPS + 1e-6 : Math.round(t * FPS)) % NFRAMES) + NFRAMES) % NFRAMES;
+  B = Math.floor(F / 2);
+  TT = (STYLE.ones ? (sub ? F + (t * FPS - Math.floor(t * FPS + 1e-6)) : F) : B * 2) / FPS;
+  // the era is picked by the real frame, so a cut on an odd frame (a 16th at 24fps) lands on that frame;
+  // on its first frame the new era is drawn at its own start time (motion stays on 2s inside it)
+  const s = shotAtFrame(F), e = Math.max(0, eraAt(F / FPS));
+  E0 = ERA_LIST[e][0];
+  if (TT < E0 - 1e-6) TT = E0;
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.setLineDash([]); ctx.filter = 'none';
+  SPARK_AT = null;
+  const bd = (r) => r.d ?? 0.6, bm = (r) => r.m ?? (r.d != null ? r.d / 3 : 0.2);
+  const tr = BRIDGES.find((r) => TT >= r.tc - bd(r) - 1e-6 && TT < r.tc + bd(r) - 1e-6);
+  if (!tr) {
+    const q = renderEra(e, layer(0)); ctx.drawImage(layer(0), 0, 0); flush(q, e);
+  } else {
+    const ea = eraAt(tr.tc - 0.01), eb = eraAt(tr.tc + 0.01);
+    const sa = shapeOf(tr.A()), sb = shapeOf(tr.B());
+    const PA = camPts(sa.P, camAt(ea, TT)), PB = camPts(sb.P, camAt(eb, TT));
+    const D = bd(tr), M = bm(tr);
+    if (TT < tr.tc - M) {
+      const u = EZ.i2(seg(TT, tr.tc - D, tr.tc - M)), { c, kmax } = maskK(PA), k = Math.exp(lerp(Math.log(kmax), 0, u));
+      STYLE.backdrop(mixHex(ERA_BG[ea], STYLE.paper, 0.5 + u * 0.5), { eraA: ea, eraB: eb, u, phase: 'shrink' });
+      const q = renderEra(ea, layer(0));
+      STYLE.window(scaled(PA, c, k), 'mA' + tr.tc, layer(0), { c: sa.c, u, phase: 'shrink', eraA: ea, eraB: eb });
+      flush(q, ea);
+    } else if (TT < tr.tc + M) {
+      const u = EZ.io(seg(TT, tr.tc - M, tr.tc + M));
+      STYLE.backdrop(STYLE.paper, { eraA: ea, eraB: eb, u, phase: 'morph' });
+      if (sa.spark && sb.spark) {
+        const ca = camAt(ea, TT), cb = camAt(eb, TT), [ax, ay] = camPts([sa.spark.slice(0, 2)], ca)[0], [bx, by] = camPts([sb.spark.slice(0, 2)], cb)[0];
+        STYLE.hero(lerp(ax, bx, u), lerp(ay, by, u), lerp(sa.spark[2] * ca.z, sb.spark[2] * cb.z, u), { rays: Math.round(lerp(sa.spark[3], sb.spark[3], u)), mood: 'wow', key: 'morphspark' });
+      } else {
+        const A2 = byAngle(PA), B2 = byAngle(PB), M = A2.P.map((p, i) => [lerp(p[0], B2.P[i][0], u), lerp(p[1], B2.P[i][1], u)]);
+        STYLE.blob(M, mixHex(sa.c, sb.c, u), 'morph' + tr.tc, u, { eraA: ea, eraB: eb, phase: 'morph' });
+        if (sb.spark && u > 0.6) STYLE.hero(...camPts([sb.spark.slice(0, 2)], camAt(eb, TT))[0], sb.spark[2] * clamp((u - 0.6) / 0.4), { rays: sb.spark[3], mood: 'wow', key: 'morphspark2' });
+      }
+    } else {
+      const u = EZ.o2(seg(TT, tr.tc + M, tr.tc + D)), { c, kmax } = maskK(PB), k = Math.exp(lerp(0, Math.log(kmax), u));
+      STYLE.backdrop(mixHex(STYLE.paper, ERA_BG[eb], u * 0.5), { eraA: ea, eraB: eb, u, phase: 'grow' });
+      const q = renderEra(eb, layer(0));
+      STYLE.window(scaled(PB, c, k), 'mB' + tr.tc, layer(0), { c: sb.c, u, phase: 'grow', eraA: ea, eraB: eb });
+      flush(q, eb);
+    }
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (STYLE.post) STYLE.post();
+  ctx.restore();
+  return s.id;
+}
+window.renderFrame = renderFrame;
+window.anchorAt = () => (SPARK_AT ? { x: SPARK_AT[0], y: SPARK_AT[1] } : null);
+
+// =====================================================================
+//  kit/board.js — the storyboard: every beat in TIMELINE.board drawn as a 9:16 key frame with its notes.
+//  The panels ARE the piece: each one is renderFrame(t) at the beat's key time, so an approved board
+//  carries straight into the video.  TIMELINE.board = [{ t, title, sound, next }]
+//  Render: node tools/storyboard.mjs <piece dir> [out.png] [panel numbers...]
+// =====================================================================
+function drawPanel(k) { renderFrame(TIMELINE.board[k].t, ctx.canvas); }
+function renderBoard() {
+  const BD = TIMELINE.board || [], COLS = 5, PW = 360, PH = Math.round(PW * H / W), GAP = 30, NOTE = 130, HEAD = 150;
+  const rows = Math.ceil(BD.length / COLS), bc = document.createElement('canvas');
+  bc.width = GAP + COLS * (PW + GAP); bc.height = HEAD + rows * (PH + NOTE + GAP);
+  const g = bc.getContext('2d'), SANS = '"Segoe UI", Arial, sans-serif';
+  g.fillStyle = '#2a211b'; g.fillRect(0, 0, bc.width, bc.height);
+  g.fillStyle = '#efe5cf'; g.font = `400 60px ${HAND}`; g.fillText(`${document.title}: storyboard`, GAP, 80);
+  g.font = `600 22px ${SANS}`; g.fillStyle = '#d9c9a8';
+  g.fillText(`${TIMELINE.duration}s · ${W}×${H} · ${TIMELINE.bpm} BPM · ${BD.length} beats. Thumbs up or down by panel number.`, GAP, 122);
+  const wrap = (str, x, y, maxW, lh) => { let line = ''; for (const w of str.split(' ')) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > maxW && line) { g.fillText(line, x, y); y += lh; line = w; } else line = t; } if (line) g.fillText(line, x, y); return y + lh; };
+  const pc = document.createElement('canvas'); pc.width = W; pc.height = H;
+  BD.forEach((b, k) => {
+    renderFrame(b.t, pc);
+    const x = GAP + (k % COLS) * (PW + GAP), y = HEAD + Math.floor(k / COLS) * (PH + NOTE + GAP);
+    g.drawImage(pc, x, y, PW, PH);
+    g.fillStyle = '#f0b27c'; g.font = `700 26px ${SANS}`; g.fillText(`${k + 1}`, x, y + PH + 32);
+    g.fillStyle = '#efe5cf'; g.font = `600 20px ${SANS}`;
+    let ttl = `${b.t.toFixed(1)}s · ${b.title || ''}`; while (ttl.length > 4 && g.measureText(ttl).width > PW - 44) ttl = ttl.slice(0, -2) + '…';   // fits the panel
+    g.fillText(ttl, x + 40, y + PH + 30);
+    g.font = `400 18px ${SANS}`; g.fillStyle = '#cdbd9c';
+    const yy = b.sound ? wrap('sound: ' + b.sound, x, y + PH + 58, PW, 22) : y + PH + 58;
+    if (b.next) { g.fillStyle = '#a8977a'; wrap('→ ' + b.next, x, yy + 2, PW, 22); }
+  });
+  return bc;
+}
+window.renderBoard = renderBoard; window.drawPanel = drawPanel;
+// =====================================================================
+//  kit/score-head.js — live preview (click to hear), noise/impulse/WAV helpers, and the synth.
+//  buildScore() opens here; the piece's score body follows (src/score.js), then kit/score-tail.js closes it.
+//  Helpers inside buildScore: pluck, noiseHit, sub, sweep, riser, chime, bass, blip, pad, drone, out, osc, env.
+//  Set `to = 'm'` (music bus) or `to = 's'` (sfx bus) before calling them. Notes: nz('D4').
+// =====================================================================
+// live preview: rAF on the 24fps grid; click to hear the score (?t=1.5 freezes a frame)
+const QS = new URLSearchParams(location.search);
+const LIVE = { audio: null, t0: 0, start: performance.now() };
+if (!QS.has('export')) {
+  const cv = document.getElementById('c');
+  if (QS.has('t')) renderFrame(parseFloat(QS.get('t')));
+  else {
+    const tick = () => {
+      const sec = LIVE.audio ? LIVE.audio.currentTime - LIVE.t0 : (performance.now() - LIVE.start) / 1000;
+      const t = ((sec % LOOP_T) + LOOP_T) % LOOP_T;
+      renderFrame(Math.floor(t * FPS) / FPS);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  cv.addEventListener('click', async () => {
+    if (LIVE.audio || typeof buildScore !== 'function') return;
+    const ac = new AudioContext(), score = await buildScore(ac.sampleRate);
+    const buf = ac.createBuffer(2, score.left.length, score.sampleRate);
+    buf.copyToChannel(score.left, 0); buf.copyToChannel(score.right, 1);
+    const src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    LIVE.t0 = ac.currentTime + 0.05; src.start(LIVE.t0); LIVE.audio = ac;
+  });
+}
+
+const HZ = {
+  A1: 55.0, D2: 73.42, F2: 87.31, A2: 110.0, D3: 146.83, F3: 174.61, A3: 220.0, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23,
+  Fs4: 369.99, A4: 440.0, B4: 493.88, C5: 523.25, D5: 587.33, E5: 659.25, Fs5: 739.99, A5: 880.0, D6: 1174.66, A6: 1760.0,
+};
+function makeNoise(ac, sec) {
+  const b = ac.createBuffer(1, Math.floor(sec * ac.sampleRate), ac.sampleRate), d = b.getChannelData(0), R = RNG('noise');
+  for (let i = 0; i < d.length; i++) d[i] = R.f() * 2 - 1;
+  return b;
+}
+function makeImpulse(ac, sec, decay) {
+  const n = Math.floor(sec * ac.sampleRate), b = ac.createBuffer(2, n, ac.sampleRate);
+  for (let c = 0; c < 2; c++) { const d = b.getChannelData(c), R = RNG('ir', c); for (let i = 0; i < n; i++) d[i] = (R.f() * 2 - 1) * Math.pow(1 - i / n, decay); }
+  return b;
+}
+function encodeWav(left, right, sr) {
+  const n = left.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'da' + 'ta'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) { v.setInt16(o, Math.round(clamp(left[i], -1, 1) * 32767), true); v.setInt16(o + 2, Math.round(clamp(right[i], -1, 1) * 32767), true); o += 4; }
+  return new Uint8Array(buf);
+}
+
+
+const MIDI = (m) => 440 * 2 ** ((m - 69) / 12);
+const NOTE = { D2: 38, A2: 45, D3: 50, E3: 52, Fs3: 54, A3: 57, D4: 62, E4: 64, Fs4: 66, G4: 67, A4: 69, B4: 71, Cs5: 73, D5: 74, E5: 76, Fs5: 78, A5: 81, B5: 83, D6: 86, E6: 88, Fs6: 90, A6: 93 };
+// any note name: 'D4', 'Fs4' / 'F#4' (sharp), 'Bb3' (flat); the table above is the fast path
+function noteNum(n) {
+  if (NOTE[n] != null) return NOTE[n];
+  const m = /^([A-G])(s|#|b)?(-?\d)$/.exec(n); if (!m) throw new Error(`unknown note "${n}"`);
+  return 12 * (Number(m[3]) + 1) + { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 }[m[1]] + (m[2] === 'b' ? -1 : m[2] ? 1 : 0);
+}
+const nz = (n) => MIDI(noteNum(n));
+async function buildScore(sampleRate = 48000, part = 'mix', normIn = null) {
+  const TAIL = 3.0, len = Math.ceil((LOOP_T + TAIL) * sampleRate);
+  const ac = new OfflineAudioContext(2, len, sampleRate);
+  const master = ac.createGain(); master.gain.value = 0.8;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 3.5; comp.attack.value = 0.004; comp.release.value = 0.2;
+  master.connect(comp); comp.connect(ac.destination);
+  const musicBus = ac.createGain(), sfxBus = ac.createGain();
+  musicBus.gain.value = part === 'sfx' ? 0 : 1; sfxBus.gain.value = part === 'music' ? 0 : 1;
+  musicBus.connect(master); sfxBus.connect(master);
+  // ducking + presence dip, driven by the narration (lines closer than 0.29s are merged)
+  const duck = ac.createGain(), dip = ac.createBiquadFilter();
+  dip.type = 'peaking'; dip.frequency.value = 2500; dip.Q.value = 1;
+  duck.connect(dip); dip.connect(musicBus);
+  const lines = [];
+  for (const n of TIMELINE.narration) { const L = lines[lines.length - 1]; if (L && n.t0 - L.t1 < 0.29) L.t1 = n.t1; else lines.push({ t0: n.t0, t1: n.t1 }); }
+  const DUCK = 10 ** (-3 / 20);
+  duck.gain.setValueAtTime(1, 0); dip.gain.setValueAtTime(0, 0);
+  for (const L of lines) {
+    duck.gain.setValueAtTime(1, Math.max(0, L.t0 - 0.1)); duck.gain.linearRampToValueAtTime(DUCK, L.t0);
+    duck.gain.setValueAtTime(DUCK, L.t1 + 0.03); duck.gain.linearRampToValueAtTime(1, L.t1 + 0.18);
+    dip.gain.setValueAtTime(0, Math.max(0, L.t0 - 0.1)); dip.gain.linearRampToValueAtTime(-6, L.t0);
+    dip.gain.setValueAtTime(-6, L.t1 + 0.03); dip.gain.linearRampToValueAtTime(0, L.t1 + 0.18);
+  }
+  const mkVerb = (dest, sec = 1.6, decay = 2.8, level = 0.3) => { const v = ac.createConvolver(); v.buffer = makeImpulse(ac, sec, decay); const g = ac.createGain(); g.gain.value = level; v.connect(g); g.connect(dest); return v; };
+  const verbs = { m: mkVerb(duck), s: mkVerb(sfxBus) }, shortVerb = verbs.m, longVerb = mkVerb(duck, 3.6, 1.6, 0.55);
+  const noise = makeNoise(ac, 3.0);
+  let to = 'm';   // which bus the helpers below write to
+
+  // the gain is silent until the envelope starts (a GainNode defaults to 1: a note whose oscillator starts first would click)
+  const env = (g, t, a, peak, d) => { g.gain.value = 0.0001; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  const out = (node, pan = 0, send = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); node.connect(p); p.connect(to === 'm' ? duck : sfxBus);
+    if (send) { const s = ac.createGain(); s.gain.value = send; node.connect(s); s.connect(verbs[to]); }
+  };
+  const osc = (type, f, t, stop) => { const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(f, t); o.start(t); o.stop(stop); return o; };
+  function pluck(t, f, vel, pan = 0, dur = 0.32, bright = 3200, send = 0.25) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(bright, t); lp.frequency.exponentialRampToValueAtTime(380, t + dur);
+    const g = ac.createGain(); env(g, t, 0.003, vel, dur);
+    const g2 = ac.createGain(); g2.gain.value = 0.3;
+    osc('triangle', f, t, t + dur + 0.05).connect(lp);
+    osc('sine', f * 2.004, t, t + dur + 0.05).connect(g2); g2.connect(lp);
+    lp.connect(g); out(g, pan, send);
+  }
+  function noiseHit(t, dur, type, freq, q, vel, pan = 0, send = 0, sweepTo = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = q; f.frequency.setValueAtTime(freq, t);
+    if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t + dur);
+    const g = ac.createGain(); env(g, t, Math.min(0.004, dur * 0.3), vel, dur);
+    src.connect(f); f.connect(g); out(g, pan, send);
+    src.start(t, (t * 7.31) % 2.0); src.stop(t + dur + 0.05);
+  }
+  function sub(t, vel) {
+    const o = osc('sine', 120, t, t + 0.8); o.frequency.exponentialRampToValueAtTime(36, t + 0.3);
+    const g = ac.createGain(); env(g, t, 0.004, vel, 0.6); o.connect(g); out(g);
+    noiseHit(t, 0.07, 'lowpass', 1100, 0.7, vel * 0.45);
+  }
+  function sweep(t0, t1, vel, f0, f1, pan = 0) {
+    const src = ac.createBufferSource(); src.buffer = noise; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.1;
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.03); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.005);
+    src.connect(f); f.connect(g); out(g, pan, 0.2); src.start(t0, (t0 * 3.1) % 1.0); src.stop(t1 + 0.05);
+  }
+  function riser(t0, t1, vel) {
+    const o = osc('sawtooth', 110, t0, t1 + 0.02); o.frequency.exponentialRampToValueAtTime(1320, t1);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 6; lp.frequency.setValueAtTime(300, t0); lp.frequency.exponentialRampToValueAtTime(5000, t1);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(vel, t1 - 0.01); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.01);
+    o.connect(lp); lp.connect(g); out(g, 0, 0.3);
+    sweep(t0, t1, vel * 0.9, 400, 7000);
+  }
+  function chime(t, freqs, vel, pan = 0) {
+    freqs.forEach((f, i) => { const g = ac.createGain(), ti = t + i * 0.012; env(g, ti, 0.002, vel / (1 + i * 0.4), 1.3); osc('sine', f, ti, ti + 1.5).connect(g); out(g, pan + (i - 1) * 0.25, 0.6); });
+  }
+  function bass(t, f, vel) { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; const g = ac.createGain(); env(g, t, 0.006, vel, 0.28); osc('triangle', f, t, t + 0.35).connect(lp); lp.connect(g); out(g); }
+  function blip(t, f0, f1, dur, vel, pan = 0) { const o = osc('sine', f0, t, t + dur + 0.05); o.frequency.exponentialRampToValueAtTime(f1, t + dur); const g = ac.createGain(); env(g, t, 0.002, vel, dur); o.connect(g); out(g, pan, 0.2); }
+
+  // ---- v2 instruments built from the helpers above
+  function pad(t0, t1, notes, peak, o = {}) {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = o.cut ?? 1200; lp.Q.value = 0.7;
+    const g = ac.createGain(), hold = o.swellTo ?? peak;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.4));
+    if (o.swellTo) g.gain.linearRampToValueAtTime(o.swellTo, o.swellAt);
+    g.gain.setValueAtTime(hold, t1 - (o.rel ?? 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    notes.forEach((n, i) => { for (const det of [-7, 7]) { const oo = osc(o.type ?? 'sawtooth', nz(n), t0, t1 + 0.05); oo.detune.value = det + i; oo.connect(lp); } });
+    lp.connect(g); out(g, o.pan ?? 0, o.send ?? 0.4);
+  }
+  function drone(t0, t1, f, peak, o = {}) {
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(peak, t0 + (o.att ?? 0.5));
+    g.gain.setValueAtTime(peak, t1 - (o.rel ?? 0.4)); g.gain.exponentialRampToValueAtTime(0.0001, t1);
+    osc('sine', f, t0, t1 + 0.05).connect(g); out(g, 0, 0);
+  }
+  const claudeMotif = (t, notes, vel) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, -0.15 + i * 0.1, 0.6, 1300, 0.35));
+  const childMotif = (t, notes, vel, bright = 5200, send = 0.3) => notes.forEach(([n, dt], i) => pluck(t + dt, nz(n), vel, 0.2 - i * 0.1, 0.32, bright, send));
+  // SCORE BODY — metro-map demo (inside buildScore(); see kit/score-head.js). Steady like a train: a soft kick on the
+  // beat, rail clicks in pairs on the 8ths, a warm pad per era, a ding at each stop, a two-tone chime on arrival.
+  const T = TIMELINE, q = T.cues;
+  to = 'm';
+  for (let i = 0; i < 12; i++) { sub(i * BEAT, i === 6 ? 0.34 : 0.25); bass(i * BEAT + E8, nz(i < 6 ? 'D2' : 'G1') * 2, 0.06); }
+  for (let i = 0; i < 24; i++) { noiseHit(i * E8, 0.03, 'highpass', 6500, 0.8, i % 2 ? 0.04 : 0.022, i % 4 < 2 ? -0.25 : 0.25); if (i % 2) noiseHit(i * E8 + 0.07, 0.025, 'highpass', 5200, 0.8, 0.02, i % 4 < 2 ? -0.25 : 0.25); }
+  pad(0.0, 3.0, ['D2', 'A2', 'Fs3'], 0.016, { type: 'triangle', cut: 1100, att: 0.3, rel: 0.3, send: 0.3 });
+  pad(3.0, 6.05, ['G2', 'D3', 'B3'], 0.018, { type: 'triangle', cut: 1300, att: 0.4, rel: 0.3, send: 0.4 });
+  chime(q.arr3, [nz('G5'), nz('B5'), nz('D6')], 0.06, 0.1);
+  to = 's';
+  sweep(q.line, q.st3, 0.008, 300, 900, -0.2);                             // the line being laid
+  for (const t of [q.st2, q.st3]) blip(t, 1500, 1100, 0.04, 0.04, 0.25);   // a station pops as the head passes
+  for (const t of [q.arr1, q.arr2]) { blip(t, nz('A5'), nz('A5'), 0.16, 0.05, 0.1); noiseHit(t - 0.1, 0.12, 'bandpass', 1800, 1.0, 0.018, 0, 0.1, 700); }   // the train stops: brake hiss, ding
+  blip(q.halo, 260, 620, 0.22, 0.045, 0);                                  // the station swells
+  sweep(2.5, 3.0, 0.012, 500, 3000, 0);
+  noiseHit(3.0, 0.3, 'bandpass', 1400, 1.0, 0.02, 0, 0.3, 500);
+  sweep(q.blue, q.join, 0.008, 400, 1100, 0.3);                            // the blue line comes in
+  blip(q.join, 700, 1400, 0.09, 0.05, 0.2);                                // the interchange opens
+  blip(q.legend, 1800, 1500, 0.03, 0.03, 0.4); blip(q.legend + 0.125, 2000, 1700, 0.03, 0.03, 0.4);
+  blip(q.term, 1500, 1100, 0.04, 0.04, -0.2);                              // the terminus bar
+  blip(q.arr3, nz('D5'), nz('D5'), 0.14, 0.05, 0); blip(q.arr3 + 0.25, nz('G5'), nz('G5'), 0.2, 0.05, 0);   // arrival: two tones
+  // =====================================================================
+  //  kit/score-tail.js — render, fold the tail over the loop point, loudness stage
+  //  (RMS-normalise to -17 dBFS, look-ahead limiter at -1 dBFS; stems share the mix gain curve)
+  // =====================================================================
+  const buf = await ac.startRendering();
+  // fold the tail over the loop point so the loop is seamless
+  const N = Math.round(LOOP_T * sampleRate), L = new Float32Array(N), Rr = new Float32Array(N);
+  const c0 = buf.getChannelData(0), c1 = buf.getChannelData(1);
+  for (let i = 0; i < N; i++) { L[i] = c0[i] + (i + N < len ? c0[i + N] : 0); Rr[i] = c1[i] + (i + N < len ? c1[i + N] : 0); }
+  // loudness for a phone (subagents-short): RMS-normalise to -17 dBFS, then a look-ahead limiter at -1 dBFS.
+  // Stems reuse the mix's gain and gain curve, so they sum back to the mix.
+  let k = normIn?.k, g = normIn?.g;
+  if (!g) {
+    let sum = 0; for (let i = 0; i < N; i++) sum += (L[i] * L[i] + Rr[i] * Rr[i]) / 2;
+    k = 10 ** (-17 / 20) / Math.sqrt(sum / N || 1e-12);
+    const ceil = 0.89; g = new Float32Array(N);
+    for (let i = 0; i < N; i++) { const p = Math.max(Math.abs(L[i]), Math.abs(Rr[i])) * k; g[i] = p > ceil ? ceil / p : 1; }
+    const att = Math.exp(-1 / (0.0015 * sampleRate)), rel = Math.exp(-1 / (0.09 * sampleRate));
+    for (let i = N - 2; i >= 0; i--) g[i] = Math.min(g[i], 1 - (1 - g[i + 1]) * att);
+    let r = 1; for (let i = 0; i < N; i++) { r = Math.min(g[i], 1 - (1 - r) * rel); g[i] = r; }
+  }
+  for (let i = 0; i < N; i++) { L[i] *= k * g[i]; Rr[i] *= k * g[i]; }
+  return { left: L, right: Rr, sampleRate, norm: { k, g } };
+}
+function wavB64(s) {
+  const bytes = encodeWav(s.left, s.right, s.sampleRate);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function renderAudioWav() { return wavB64(await buildScore(48000, 'mix')); }
+async function renderAudioStems() {
+  const mix = await buildScore(48000, 'mix');
+  const music = await buildScore(48000, 'music', mix.norm), sfx = await buildScore(48000, 'sfx', mix.norm);
+  return { music: wavB64(music), sfx: wavB64(sfx) };
+}
+window.renderAudioWav = renderAudioWav;
+window.renderAudioStems = renderAudioStems;
+</script>
+</body>
+</html>

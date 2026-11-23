@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metro map demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2330; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  METRO MAP DEMO — 9:16, 6.0s @ 120 BPM, 24fps. "Rute belajar desain": an invented personal roadmap as a transit map.
+//  Era 1 (a close ride): the red line grows down the frame through Dasar -> Latihan -> Proyek, the train hero
+//  riding behind its head and stopping on the beats, a river and a yellow cross line behind. The station under the
+//  train swells into a big station disc, which morphs at 3.0s into an interchange capsule (disc -> capsule) that
+//  opens onto era 2 (the whole map): a blue line joins at the interchange, both run on to their termini, the train
+//  arrives at Karier and the "you are here" marker lands on it; a legend, a second train on the blue line.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/metro-map/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+
+const ERA_LIST = [[0, 3, () => sceneRide()], [3, 6, () => sceneMap()]];
+const SHOTS = [
+  ['ride', 0, 0.0, 3.0, 'the red line grows through Dasar, Latihan, Proyek; the train rides it stop by stop'],
+  ['map', 1, 3.0, 6.0, 'the whole map: a blue line joins at the interchange, the train reaches Karier, "you are here"'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s).
+  //   era 1: line = the red line starts growing; st2 / st3 = its head passes Latihan / Proyek (the stations pop);
+  //          dep1 / arr1 / dep2 / arr2 = the train leaves and arrives; halo = the station swells for the morph
+  //   era 2: legend, blue (the blue line starts), join (it reaches the interchange: the capsule opens), ext (the red
+  //          line goes on), dep3 / term (the red line reaches Karier) / arr3 (the train arrives: "you are here")
+  cues: { line: 0.0, dep1: 0.5, st2: 0.75, arr1: 1.0, dep2: 1.5, st3: 1.5, arr2: 2.0, halo: 2.25,
+    legend: 3.5, blue: 3.25, join: 4.0, ext: 4.0, dep3: 4.25, bluend: 4.5, term: 4.75, arr3: 5.0 },
+  acts: [
+    { name: '1 Perjalanan', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Peta', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.8, title: 'the ride: one station per beat', sound: 'rail clicks, a ding per stop', next: 'the station swells' },
+    { t: 5.0, title: 'the whole map: you are here', sound: 'two-tone arrival chime', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;

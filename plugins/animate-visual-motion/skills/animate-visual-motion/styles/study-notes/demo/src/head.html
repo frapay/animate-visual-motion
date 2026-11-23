@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Study notes demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2a2622; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { height: min(100vh, calc(100vw * 16 / 9)); width: auto; aspect-ratio: 9 / 16; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// =====================================================================
+//  STUDY NOTES DEMO — 9:16, 6.0s @ 120 BPM, 24fps. A notebook page writes itself: the heading "3 CARA BELAJAR LEBIH
+//  FOKUS" in a box, two numbered tips written by the pencil hero with one word highlighted each, a brain card taped
+//  in and a lightbulb doodle that lights; its yellow glow morphs at 3.0s (a round highlighter blob -> a squarish
+//  sticky note) into tip 3: a sticky "istirahat 5 menit", a clock doodle and a checklist the pencil ticks on the beat.
+//  Proves the style kit renders, morphs and stays deterministic.
+//  Build: node <skill>/tools/build.mjs <skill>/styles/study-notes/demo
+// =====================================================================
+const FPS = 24, W = 1080, H = 1920;
+const BPM = 120, BEAT = 60 / BPM, E8 = BEAT / 2, E16 = BEAT / 4;
+const DURATION = 6.0;
+const NFRAMES = Math.round(DURATION * FPS);
+const LOOP_T = NFRAMES / FPS;
+const SAFE = { top: 240, bottom: 420, right: 140 };
+const CX = 500;
+const HAND = '"Bradley Hand", "Segoe Print", "Chalkboard SE", "Comic Sans MS", "Comic Neue", cursive';   // the kit has its own stacks (SN_HAND, SN_LETTER)
+
+const ERA_LIST = [[0, 3, () => sceneTips()], [3, 6, () => sceneBreak()]];
+const SHOTS = [
+  ['tips', 0, 0.0, 3.0, 'the heading in a box, two tips written by the pencil with a highlighted word each, a lightbulb that lights'],
+  ['break', 1, 3.0, 6.0, 'tip 3 on a sticky note, a clock doodle, a checklist the pencil ticks on the beat'],
+];
+const TIMELINE = {
+  width: W, height: H, fps: FPS, bpm: BPM, duration: DURATION, frames: NFRAMES, loop: LOOP_T, safe: SAFE,
+  format: 'morph-chain',
+  shots: SHOTS.map(([key, era, t0, t1, title], i) => ({ id: i + 1, key, era, t0, t1, title })),
+  cuts: [],
+  morphs: [3.0],
+  // every cue sits on the 8th grid (0.25s). Era 1: the box and FOKUS's highlighter, tip 1 and tip 2 (written over
+  // 0.75s each, the highlighter a beat after), the card, the bulb and its glow. Era 2: the note's two lines, the
+  // wavy underline, the list, the clock, three ticks on consecutive 8ths.
+  cues: { box: 0.0, headHi: 0.5, b1: 0.25, hi1: 1.25, b2: 1.25, hi2: 2.25, card: 0.5, bulb: 1.0, glow: 2.0,
+    note: 3.5, note2: 4.0, wavy: 4.25, list: 3.5, clock: 3.5, tab: 4.5, tick1: 4.75, tick2: 5.0, tick3: 5.25, rest: 5.5 },
+  acts: [
+    { name: '1 Dua cara', role: 'build', t0: 0.0, t1: 3.0 },
+    { name: '2 Cara ketiga', role: 'gift', t0: 3.0, t1: 6.0 },
+  ],
+  board: [
+    { t: 1.8, title: 'two tips, written and highlighted', sound: 'pencil scratches, a soft pluck per highlight', next: 'the bulb lights' },
+    { t: 5.0, title: 'tip 3: take a break', sound: 'a slap for the note, ticks on the beat', next: 'loops' },
+  ],
+  narration: [],
+};
+window.TIMELINE = TIMELINE;
